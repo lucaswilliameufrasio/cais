@@ -4,9 +4,9 @@ use url::{Host, Url, form_urlencoded::byte_serialize};
 
 use crate::crypto;
 use crate::models::{
-    ActiveQuery, BackupMetadata, BackupOutcome, ExtraUserProvisionOutcome,
-    ExtraUserProvisionRequest, ParsedDatabaseUrl, PgToolBackend, ProvisionFullOutcome,
-    ProvisionFullRequest, ProvisionOutcome, ProvisionRequest,
+    ActiveQuery, BackupConfig, BackupMetadata, BackupOutcome, DiscoveredDatabase,
+    ExtraUserProvisionOutcome, ExtraUserProvisionRequest, ParsedDatabaseUrl, PgToolBackend,
+    ProvisionFullOutcome, ProvisionFullRequest, ProvisionOutcome, ProvisionRequest, TablespaceMode,
 };
 use crate::validation::{normalize_application_name, validate_database_name};
 
@@ -587,6 +587,32 @@ pub fn detect_source_version(source_cs: &str) -> Result<String> {
     Ok(version)
 }
 
+/// Lists ordinary, connectable databases in a PostgreSQL instance. Template
+/// databases are excluded because they are cluster implementation details,
+/// not application databases.
+pub fn discover_databases(instance_cs: &str) -> Result<Vec<DiscoveredDatabase>> {
+    let mut client = Client::connect(instance_cs, NoTls)
+        .context("failed to connect while discovering databases")?;
+    let rows = client.query(
+        "SELECT datname, pg_get_userbyid(datdba), pg_encoding_to_char(encoding), \
+                dattablespace::regclass::text, datconnlimit \
+         FROM pg_database \
+         WHERE datallowconn AND NOT datistemplate \
+         ORDER BY datname",
+        &[],
+    )?;
+    Ok(rows
+        .into_iter()
+        .map(|row| DiscoveredDatabase {
+            name: row.get(0),
+            owner: row.get(1),
+            encoding: row.get(2),
+            tablespace: row.get(3),
+            connection_limit: row.get(4),
+        })
+        .collect())
+}
+
 pub fn resolve_docker_image(backend: &PgToolBackend, source_cs: Option<&str>) -> String {
     match backend {
         PgToolBackend::Docker { image } => {
@@ -665,6 +691,128 @@ fn docker_pull_silent(image: &str) -> Result<()> {
     if !pull.status.success() {
         let stderr = String::from_utf8_lossy(&pull.stderr);
         anyhow::bail!("failed to pull Docker image '{}': {}", image, stderr.trim());
+    }
+    Ok(())
+}
+
+fn dump_globals(
+    source_cs: &str,
+    include_role_passwords: bool,
+    backend: &PgToolBackend,
+) -> Result<Vec<u8>> {
+    let mut args = vec!["--globals-only"];
+    if !include_role_passwords {
+        args.push("--no-role-passwords");
+    }
+    args.push("-d");
+    args.push(source_cs);
+    match backend {
+        PgToolBackend::Native { .. } => {
+            let output = std::process::Command::new("pg_dumpall")
+                .args(&args)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output()
+                .context("failed to execute pg_dumpall")?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "pg_dumpall failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )
+            }
+            Ok(output.stdout)
+        }
+        PgToolBackend::Docker { image } => {
+            docker_pull_silent(image)?;
+            let mut docker_args = vec![
+                "run",
+                "--rm",
+                "-i",
+                "--network",
+                "host",
+                image.as_str(),
+                "pg_dumpall",
+            ];
+            docker_args.push("--globals-only");
+            if !include_role_passwords {
+                docker_args.push("--no-role-passwords");
+            }
+            docker_args.push("-d");
+            docker_args.push(source_cs);
+            let output = std::process::Command::new("docker")
+                .args(&docker_args)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output()
+                .context("failed to execute Docker pg_dumpall")?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "pg_dumpall failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )
+            }
+            Ok(output.stdout)
+        }
+        PgToolBackend::NotFound => anyhow::bail!("PostgreSQL tools are unavailable"),
+    }
+}
+
+fn restore_globals(dest_cs: &str, globals: &[u8], backend: &PgToolBackend) -> Result<()> {
+    if globals.is_empty() {
+        return Ok(());
+    }
+    let mut command = match backend {
+        PgToolBackend::Native { .. } => {
+            let mut command = std::process::Command::new("psql");
+            command.args(["-X", "-d", dest_cs]);
+            command
+        }
+        PgToolBackend::Docker { image } => {
+            docker_pull_silent(image)?;
+            let mut command = std::process::Command::new("docker");
+            command.args([
+                "run",
+                "--rm",
+                "-i",
+                "--network",
+                "host",
+                image.as_str(),
+                "psql",
+                "-X",
+                "-d",
+                dest_cs,
+            ]);
+            command
+        }
+        PgToolBackend::NotFound => anyhow::bail!("PostgreSQL tools are unavailable"),
+    };
+    let mut child = command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("failed to execute psql for cluster globals")?;
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .context("failed to open psql stdin")?
+        .write_all(globals)
+        .context("failed to send cluster globals to psql")?;
+    let output = child
+        .wait_with_output()
+        .context("failed waiting for psql cluster globals restore")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("already exists") {
+            // Role / tablespace already exists — benign during migration
+            eprintln!(
+                "  [warn] globals restore completed with messages:\n{}",
+                stderr.trim()
+            );
+        } else {
+            anyhow::bail!("restoring cluster globals failed: {}", stderr.trim())
+        }
     }
     Ok(())
 }
@@ -1129,8 +1277,239 @@ where
 
     Ok(BackupOutcome {
         file_path: output_path.to_string_lossy().to_string(),
-        database_name: parsed.database,
+        database_name: parsed.database.clone(),
+        database_names: vec![parsed.database],
     })
+}
+
+const INSTANCE_BACKUP_MAGIC: [u8; 4] = *b"DBP2";
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct InstanceBackupManifest {
+    format: String,
+    source_instance: String,
+    source_version: String,
+    created_at: String,
+    databases: Vec<String>,
+    includes_globals: bool,
+    include_role_passwords: bool,
+    tablespace_mode: String,
+}
+
+pub struct InstanceBackupContext<'a> {
+    pub instance_name: &'a str,
+    pub machine_id: &'a str,
+    pub hostname: &'a str,
+}
+
+pub struct InstanceBackupContents {
+    pub databases: Vec<String>,
+    pub dumps: Vec<(String, Vec<u8>)>,
+    pub globals: Vec<u8>,
+}
+
+/// Creates one encrypted bundle containing one custom-format dump per
+/// connectable, non-template database in the instance.
+#[allow(clippy::too_many_arguments)]
+pub fn backup_instance_with_progress<F>(
+    source_cs: &str,
+    encrypt_key: &[u8],
+    output_dir: &std::path::Path,
+    backend: &PgToolBackend,
+    context: InstanceBackupContext<'_>,
+    selected_database_names: &[String],
+    config: &BackupConfig,
+    emit: &mut F,
+) -> Result<BackupOutcome>
+where
+    F: FnMut(String),
+{
+    let discovered = discover_databases(source_cs)?;
+    let databases: Vec<DiscoveredDatabase> = discovered
+        .into_iter()
+        .filter(|database| {
+            selected_database_names
+                .iter()
+                .any(|name| name == &database.name)
+        })
+        .collect();
+    if databases.is_empty() {
+        anyhow::bail!("instance contains no connectable non-template databases")
+    }
+
+    let source_version = detect_source_version(source_cs).unwrap_or_else(|_| "unknown".to_owned());
+
+    let staging =
+        tempfile::tempdir().context("failed to create instance backup staging directory")?;
+    let globals = if config.include_globals {
+        emit("Backing up cluster roles and memberships...".to_owned());
+        dump_globals(source_cs, config.include_role_passwords, backend)?
+    } else {
+        Vec::new()
+    };
+    let mut dumps = Vec::with_capacity(databases.len());
+    for (index, database) in databases.iter().enumerate() {
+        emit(format!(
+            "Backing up database {}/{}: {}",
+            index + 1,
+            databases.len(),
+            database.name
+        ));
+        let source_db_url = target_url(source_cs, &database.name)?;
+        let metadata = BackupMetadata {
+            machine_id: context.machine_id.to_owned(),
+            hostname: context.hostname.to_owned(),
+            instance_name: context.instance_name.to_owned(),
+            database_name: database.name.clone(),
+            application_name: String::new(),
+            engine: "postgresql".to_owned(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+        };
+        let outcome = backup_database_with_progress(
+            &source_db_url,
+            encrypt_key,
+            staging.path(),
+            backend,
+            Some(&metadata),
+            emit,
+        )?;
+        let (_, dump) = read_encrypted_dump(std::path::Path::new(&outcome.file_path), encrypt_key)?;
+        dumps.push((database.name.clone(), dump));
+    }
+
+    let tspace_mode = match config.tablespace_mode {
+        TablespaceMode::Flatten => "flatten",
+        TablespaceMode::Preserve => "preserve",
+    };
+    let manifest = InstanceBackupManifest {
+        format: "DBP2".to_owned(),
+        source_instance: context.instance_name.to_owned(),
+        source_version,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        databases: databases
+            .iter()
+            .map(|database| database.name.clone())
+            .collect(),
+        includes_globals: config.include_globals,
+        include_role_passwords: config.include_role_passwords,
+        tablespace_mode: tspace_mode.to_owned(),
+    };
+    let manifest_json =
+        serde_json::to_vec(&manifest).context("failed to serialize instance backup manifest")?;
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&INSTANCE_BACKUP_MAGIC);
+    payload.extend_from_slice(&(manifest_json.len() as u32).to_le_bytes());
+    payload.extend_from_slice(&manifest_json);
+    payload.extend_from_slice(&(dumps.len() as u32).to_le_bytes());
+    for (name, dump) in &dumps {
+        payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        payload.extend_from_slice(name.as_bytes());
+        payload.extend_from_slice(&(dump.len() as u64).to_le_bytes());
+        payload.extend_from_slice(dump);
+    }
+    payload.extend_from_slice(&(globals.len() as u64).to_le_bytes());
+    payload.extend_from_slice(&globals);
+
+    std::fs::create_dir_all(output_dir).context("failed to create output directory")?;
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%f");
+    let filename = format!(
+        "{}_{}_{}_{}.cluster.pgdump.enc",
+        safe_filename_component(context.hostname),
+        safe_filename_component(context.instance_name),
+        dumps.len(),
+        timestamp
+    );
+    let output_path = output_dir.join(filename);
+    create_encrypted_dump(&payload, None, encrypt_key, &output_path)?;
+    emit(format!(
+        "Encrypted instance backup saved to {}",
+        output_path.display()
+    ));
+    Ok(BackupOutcome {
+        file_path: output_path.to_string_lossy().to_string(),
+        database_name: context.instance_name.to_owned(),
+        database_names: manifest.databases,
+    })
+}
+
+pub fn read_instance_backup(
+    input_path: &std::path::Path,
+    decrypt_key: &[u8],
+) -> Result<InstanceBackupContents> {
+    let (_, payload) = read_encrypted_dump(input_path, decrypt_key)?;
+    if payload.len() < 8 || payload[..4] != INSTANCE_BACKUP_MAGIC {
+        anyhow::bail!("backup is not a DBP2 instance bundle")
+    }
+    let manifest_len = u32::from_le_bytes(payload[4..8].try_into().unwrap()) as usize;
+    let manifest_end = 8usize
+        .checked_add(manifest_len)
+        .context("instance backup manifest length overflow")?;
+    if payload.len() < manifest_end + 4 {
+        anyhow::bail!("instance backup manifest is truncated")
+    }
+    let manifest: InstanceBackupManifest = serde_json::from_slice(&payload[8..manifest_end])
+        .context("failed to parse instance backup manifest")?;
+    let mut cursor = manifest_end;
+    let count = u32::from_le_bytes(payload[cursor..cursor + 4].try_into().unwrap()) as usize;
+    cursor += 4;
+    let mut dumps = Vec::with_capacity(count);
+    for _ in 0..count {
+        if payload.len() < cursor + 4 {
+            anyhow::bail!("instance backup database name is truncated")
+        }
+        let name_len = u32::from_le_bytes(payload[cursor..cursor + 4].try_into().unwrap()) as usize;
+        cursor += 4;
+        if payload.len() < cursor + name_len + 8 {
+            anyhow::bail!("instance backup database entry is truncated")
+        }
+        let name = String::from_utf8(payload[cursor..cursor + name_len].to_vec())
+            .context("instance backup contains an invalid database name")?;
+        cursor += name_len;
+        let dump_len = u64::from_le_bytes(payload[cursor..cursor + 8].try_into().unwrap()) as usize;
+        cursor += 8;
+        let end = cursor
+            .checked_add(dump_len)
+            .context("instance dump length overflow")?;
+        if payload.len() < end {
+            anyhow::bail!("instance backup dump is truncated")
+        }
+        dumps.push((name, payload[cursor..end].to_vec()));
+        cursor = end;
+    }
+    if payload.len() < cursor + 8 {
+        anyhow::bail!("instance backup globals artifact is truncated")
+    }
+    let globals_len = u64::from_le_bytes(payload[cursor..cursor + 8].try_into().unwrap()) as usize;
+    cursor += 8;
+    let globals_end = cursor
+        .checked_add(globals_len)
+        .context("instance globals length overflow")?;
+    if payload.len() < globals_end {
+        anyhow::bail!("instance backup globals artifact is truncated")
+    }
+    let globals = payload[cursor..globals_end].to_vec();
+    if manifest.includes_globals == globals.is_empty() {
+        anyhow::bail!("instance backup globals metadata does not match its artifact")
+    }
+    if manifest.databases
+        != dumps
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>()
+    {
+        anyhow::bail!("instance backup manifest does not match its database entries")
+    }
+    Ok(InstanceBackupContents {
+        databases: manifest.databases,
+        dumps,
+        globals,
+    })
+}
+
+pub fn is_instance_backup(input_path: &std::path::Path, decrypt_key: &[u8]) -> Result<bool> {
+    let (_, payload) = read_encrypted_dump(input_path, decrypt_key)?;
+    Ok(payload.starts_with(&INSTANCE_BACKUP_MAGIC))
 }
 
 pub fn restore_database_with_progress<F>(
@@ -1302,6 +1681,60 @@ where
     })
 }
 
+pub fn restore_instance_with_progress<F>(
+    input_path: &std::path::Path,
+    decrypt_key: &[u8],
+    dest_base_url: &str,
+    backend: &PgToolBackend,
+    emit: &mut F,
+) -> Result<Vec<ProvisionFullOutcome>>
+where
+    F: FnMut(String),
+{
+    let contents = read_instance_backup(input_path, decrypt_key)?;
+    let dumps = contents.dumps;
+    let globals = contents.globals;
+    emit("Restoring cluster roles and memberships...".to_owned());
+    restore_globals(dest_base_url, &globals, backend)?;
+    let staging = tempfile::tempdir().context("failed to create restore staging directory")?;
+    let mut outcomes = Vec::with_capacity(dumps.len());
+    for (index, (database_name, dump)) in dumps.into_iter().enumerate() {
+        emit(format!(
+            "Restoring database {}/{}: {}",
+            index + 1,
+            outcomes.capacity(),
+            database_name
+        ));
+        let result = (|| -> Result<ProvisionFullOutcome> {
+            let encrypted_path = staging.path().join(format!("{index}.pgdump.enc"));
+            create_encrypted_dump(&dump, None, decrypt_key, &encrypted_path)?;
+            restore_database_with_progress(
+                &encrypted_path,
+                decrypt_key,
+                dest_base_url,
+                &database_name,
+                backend,
+                emit,
+            )
+        })();
+        match result {
+            Ok(outcome) => outcomes.push(outcome),
+            Err(error) => {
+                let cleanup = (|| -> Result<()> {
+                    let mut admin = Client::connect(dest_base_url, NoTls)
+                        .context("failed to connect for batch restore cleanup")?;
+                    for outcome in &outcomes {
+                        drop_database(&mut admin, &outcome.database_name)?;
+                    }
+                    Ok(())
+                })();
+                return Err(combine_restore_cleanup_error(error, cleanup));
+            }
+        }
+    }
+    Ok(outcomes)
+}
+
 fn run_tool(name: &str, args: impl IntoIterator<Item = &'static str>) -> Result<String> {
     let output = std::process::Command::new(name)
         .args(args)
@@ -1387,8 +1820,8 @@ pub fn check_connection_health(url: &str) -> Result<(u64, String)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        PgToolBackend, docker_pull_silent, extract_pg_major_version, mask_connection_string,
-        parse_database_url, resolve_docker_image,
+        INSTANCE_BACKUP_MAGIC, PgToolBackend, docker_pull_silent, extract_pg_major_version,
+        mask_connection_string, parse_database_url, read_instance_backup, resolve_docker_image,
     };
 
     #[test]
@@ -1697,6 +2130,47 @@ mod tests {
             err.contains("too small"),
             "expected 'too small' error, got: {err}"
         );
+    }
+
+    #[test]
+    fn instance_backup_round_trip_preserves_database_entries() {
+        let key = b"01234567890123456789012345678901";
+        let manifest = serde_json::json!({
+            "format": "DBP2",
+            "source_instance": "source",
+            "source_version": "PostgreSQL 17.0",
+            "created_at": "2026-01-01T00:00:00Z",
+            "databases": ["accounts", "billing"],
+            "includes_globals": true,
+            "include_role_passwords": false,
+            "tablespace_mode": "flatten"
+        });
+        let manifest = serde_json::to_vec(&manifest).unwrap();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&INSTANCE_BACKUP_MAGIC);
+        payload.extend_from_slice(&(manifest.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&manifest);
+        payload.extend_from_slice(&2u32.to_le_bytes());
+        for (name, dump) in [
+            ("accounts", b"accounts dump".as_slice()),
+            ("billing", b"billing dump".as_slice()),
+        ] {
+            payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            payload.extend_from_slice(name.as_bytes());
+            payload.extend_from_slice(&(dump.len() as u64).to_le_bytes());
+            payload.extend_from_slice(dump);
+        }
+        payload.extend_from_slice(&4u64.to_le_bytes());
+        payload.extend_from_slice(b"role");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("instance.cluster.pgdump.enc");
+        super::create_encrypted_dump(&payload, None, key, &path).unwrap();
+
+        let contents = read_instance_backup(&path, key).unwrap();
+        assert_eq!(contents.databases, ["accounts", "billing"]);
+        assert_eq!(contents.dumps[0].1, b"accounts dump");
+        assert_eq!(contents.dumps[1].1, b"billing dump");
+        assert_eq!(contents.globals, b"role");
     }
 
     #[test]

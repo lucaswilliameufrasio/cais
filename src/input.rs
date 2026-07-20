@@ -80,6 +80,8 @@ fn handle_home(app: &mut App, key: KeyEvent) -> Result<()> {
                 app.screen = Screen::BackupDatabase;
                 app.backup_phase = BackupPhase::SelectSource;
                 app.backup_source_record = None;
+                app.backup_databases.clear();
+                app.backup_selected_databases.clear();
                 app.sync_backup_source_selection()?;
             }
             HomeItem::RestoreDatabase => {
@@ -259,7 +261,14 @@ fn handle_backup_database(app: &mut App, key: KeyEvent) -> Result<()> {
                         .and_then(|idx| records.get(idx).cloned());
                     if let Some(record) = selected {
                         app.backup_source_record = Some(record);
-                        app.start_backup_database()?;
+                        if matches!(
+                            &app.backup_source_record,
+                            Some(SavedConnectionRecord::Instance { .. })
+                        ) {
+                            app.prepare_backup_database_selection()?;
+                        } else {
+                            app.start_backup_database()?;
+                        }
                     } else {
                         app.set_status("No source connection selected.");
                     }
@@ -267,6 +276,67 @@ fn handle_backup_database(app: &mut App, key: KeyEvent) -> Result<()> {
                 _ => {}
             }
         }
+        BackupPhase::SelectDatabases => {
+            let len = app.backup_databases.len();
+            match key.code {
+                KeyCode::Esc => {
+                    app.backup_phase = BackupPhase::SelectSource;
+                    app.backup_source_record = None;
+                    app.backup_databases.clear();
+                    app.backup_selected_databases.clear();
+                }
+                KeyCode::Down => move_selection(&mut app.backup_database_list_state, len, 1),
+                KeyCode::Up => move_selection(&mut app.backup_database_list_state, len, -1),
+                KeyCode::Char(' ') => {
+                    if let Some(index) = app.backup_database_list_state.selected()
+                        && let Some(selected) = app.backup_selected_databases.get_mut(index)
+                    {
+                        *selected = !*selected;
+                    }
+                }
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    app.backup_selected_databases.fill(true);
+                }
+                KeyCode::Enter => {
+                    if app
+                        .backup_selected_databases
+                        .iter()
+                        .any(|selected| *selected)
+                    {
+                        app.backup_phase = BackupPhase::ConfigureBackup;
+                    } else {
+                        app.set_status("Select at least one database.");
+                    }
+                }
+                _ => {}
+            }
+        }
+        BackupPhase::ConfigureBackup => match key.code {
+            KeyCode::Esc => {
+                app.backup_phase = BackupPhase::SelectDatabases;
+            }
+            KeyCode::Char('g') | KeyCode::Char('G') => {
+                app.backup_config.include_globals = !app.backup_config.include_globals;
+            }
+            KeyCode::Char('p') | KeyCode::Char('P') => {
+                app.backup_config.include_role_passwords =
+                    !app.backup_config.include_role_passwords;
+            }
+            KeyCode::Char('t') | KeyCode::Char('T') => {
+                app.backup_config.tablespace_mode = match app.backup_config.tablespace_mode {
+                    crate::models::TablespaceMode::Flatten => {
+                        crate::models::TablespaceMode::Preserve
+                    }
+                    crate::models::TablespaceMode::Preserve => {
+                        crate::models::TablespaceMode::Flatten
+                    }
+                };
+            }
+            KeyCode::Enter => {
+                app.start_backup_database()?;
+            }
+            _ => {}
+        },
         BackupPhase::Running => {
             if let KeyCode::Esc = key.code {
                 app.screen = Screen::Home;

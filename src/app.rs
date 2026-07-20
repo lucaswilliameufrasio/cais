@@ -8,15 +8,16 @@ use zeroize::Zeroizing;
 
 use crate::crypto;
 use crate::models::{
-    ActiveQuery, BackupFile, BackupMetadata, BackupOutcome, ExtraUserProvisionOutcome,
-    PgToolBackend, ProvisionFullOutcome, ProvisionFullRequest, ProvisionOutcome,
-    SavedConnectionRecord,
+    ActiveQuery, BackupConfig, BackupFile, BackupMetadata, BackupOutcome, DiscoveredDatabase,
+    ExtraUserProvisionOutcome, PgToolBackend, ProvisionFullOutcome, ProvisionFullRequest,
+    ProvisionOutcome, SavedConnectionRecord,
 };
 use crate::postgres::{
-    backup_database_with_progress, check_connection_health, check_pg_tools, check_version_warning,
-    fetch_active_queries, kill_query, mask_connection_string, migrate_database_with_progress,
+    InstanceBackupContext, backup_database_with_progress, backup_instance_with_progress,
+    check_connection_health, check_pg_tools, check_version_warning, fetch_active_queries,
+    is_instance_backup, kill_query, mask_connection_string, migrate_database_with_progress,
     parse_database_url, provision_full_with_progress, resolve_docker_image,
-    restore_database_with_progress,
+    restore_database_with_progress, restore_instance_with_progress,
 };
 use crate::storage::{Storage, backup_directory, display_database_path};
 use crate::validation::{normalize_application_name, validate_database_name};
@@ -157,6 +158,8 @@ pub struct TextField {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackupPhase {
     SelectSource,
+    SelectDatabases,
+    ConfigureBackup,
     Running,
 }
 
@@ -267,6 +270,11 @@ pub struct App {
     pub backup_phase: BackupPhase,
     pub backup_source_list_state: ListState,
     pub backup_source_record: Option<SavedConnectionRecord>,
+    pub backup_database_list_state: ListState,
+    pub backup_databases: Vec<DiscoveredDatabase>,
+    pub backup_selected_databases: Vec<bool>,
+    pub backup_config: BackupConfig,
+    pub backup_source_version: String,
     pub restore_phase: RestorePhase,
     pub restore_file_path: TextField,
     pub restore_dest_idx: usize,
@@ -327,6 +335,7 @@ enum WorkerEvent {
 enum OperationResult {
     Full(Result<ProvisionFullOutcome, String>),
     Backup(Result<BackupOutcome, String>),
+    Batch(Result<Vec<ProvisionFullOutcome>, String>),
 }
 
 impl App {
@@ -383,6 +392,11 @@ impl App {
             backup_phase: BackupPhase::SelectSource,
             backup_source_list_state: ListState::default(),
             backup_source_record: None,
+            backup_database_list_state: ListState::default(),
+            backup_databases: Vec::new(),
+            backup_selected_databases: Vec::new(),
+            backup_config: BackupConfig::default(),
+            backup_source_version: String::new(),
             restore_phase: RestorePhase::EnterFilePath,
             restore_file_path: TextField::new("Backup file path", false),
             restore_dest_idx: 0,
@@ -757,6 +771,9 @@ impl App {
                         OperationResult::Full(result) => {
                             self.finish_full_operation(instance_name, result)?;
                         }
+                        OperationResult::Batch(result) => {
+                            self.finish_batch_operation(instance_name, result)?;
+                        }
                         OperationResult::Backup(result) => match result {
                             Ok(outcome) => {
                                 self.push_log(format!("Backup saved to {}", outcome.file_path));
@@ -780,6 +797,9 @@ impl App {
                         Screen::BackupDatabase => {
                             self.backup_phase = BackupPhase::SelectSource;
                             self.backup_source_record = None;
+                            self.backup_databases.clear();
+                            self.backup_selected_databases.clear();
+                            self.backup_config = BackupConfig::default();
                         }
                         Screen::RestoreDatabase => {
                             self.restore_phase = RestorePhase::EnterFilePath;
@@ -870,6 +890,27 @@ impl App {
             Err(error) => {
                 self.push_log(format!("Provisioning failed: {error}"));
                 self.set_status(format!("Provisioning failed: {error}"));
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_batch_operation(
+        &mut self,
+        instance_name: String,
+        result: Result<Vec<ProvisionFullOutcome>, String>,
+    ) -> Result<()> {
+        match result {
+            Ok(outcomes) => {
+                let count = outcomes.len();
+                for outcome in outcomes {
+                    self.finish_full_operation(instance_name.clone(), Ok(outcome))?;
+                }
+                self.set_status(format!("Restored {count} databases in {instance_name}"));
+            }
+            Err(error) => {
+                self.push_log(format!("Restore failed: {error}"));
+                self.set_status(format!("Restore failed: {error}"));
             }
         }
         Ok(())
@@ -1087,6 +1128,29 @@ impl App {
         Ok(())
     }
 
+    pub fn prepare_backup_database_selection(&mut self) -> Result<()> {
+        let key = self.session_key()?;
+        let Some(SavedConnectionRecord::Instance { encrypted, .. }) =
+            self.backup_source_record.as_ref()
+        else {
+            anyhow::bail!("database selection requires an instance source")
+        };
+        let plaintext = crypto::decrypt(key, encrypted)?;
+        let source_cs = String::from_utf8(plaintext.to_vec())
+            .context("source connection string is not valid UTF-8")?;
+        self.backup_databases = crate::postgres::discover_databases(&source_cs)?;
+        if self.backup_databases.is_empty() {
+            anyhow::bail!("instance contains no connectable non-template databases")
+        }
+        self.backup_selected_databases = vec![true; self.backup_databases.len()];
+        self.backup_database_list_state.select(Some(0));
+        self.backup_config = BackupConfig::default();
+        self.backup_source_version =
+            crate::postgres::detect_source_version(&source_cs).unwrap_or_else(|_| String::new());
+        self.backup_phase = BackupPhase::SelectDatabases;
+        Ok(())
+    }
+
     pub fn start_backup_database(&mut self) -> Result<()> {
         if self.pending_operation {
             anyhow::bail!("an operation is already running")
@@ -1123,6 +1187,14 @@ impl App {
                 (name.clone(), parsed.database, String::new())
             }
         };
+        let instance_scope = matches!(source_record, SavedConnectionRecord::Instance { .. });
+        let selected_database_names: Vec<String> = self
+            .backup_databases
+            .iter()
+            .zip(&self.backup_selected_databases)
+            .filter(|(_, selected)| **selected)
+            .map(|(database, _)| database.name.clone())
+            .collect();
 
         let metadata = BackupMetadata {
             machine_id: self.machine_id.clone(),
@@ -1138,6 +1210,7 @@ impl App {
         let encrypt_key = key.to_vec();
         let src_cs = source_cs.clone();
         let backend = self.resolved_backend(Some(&src_cs));
+        let backup_config = self.backup_config.clone();
 
         self.backup_phase = BackupPhase::Running;
         let start_msg = format!("Starting backup of '{db_name}'");
@@ -1156,16 +1229,35 @@ impl App {
                     return;
                 }
             };
-            let result = backup_database_with_progress(
-                &source_cs,
-                &encrypt_key,
-                &output_dir,
-                &backend,
-                Some(&metadata),
-                &mut |step| {
-                    let _ = tx.send(WorkerEvent::Log(step.to_owned()));
-                },
-            )
+            let result = if instance_scope {
+                backup_instance_with_progress(
+                    &source_cs,
+                    &encrypt_key,
+                    &output_dir,
+                    &backend,
+                    InstanceBackupContext {
+                        instance_name: &instance_name,
+                        machine_id: &metadata.machine_id,
+                        hostname: &metadata.hostname,
+                    },
+                    &selected_database_names,
+                    &backup_config,
+                    &mut |step| {
+                        let _ = tx.send(WorkerEvent::Log(step.to_owned()));
+                    },
+                )
+            } else {
+                backup_database_with_progress(
+                    &source_cs,
+                    &encrypt_key,
+                    &output_dir,
+                    &backend,
+                    Some(&metadata),
+                    &mut |step| {
+                        let _ = tx.send(WorkerEvent::Log(step.to_owned()));
+                    },
+                )
+            }
             .map_err(|error| error.to_string());
             let _ = tx.send(WorkerEvent::Finished(
                 db_name,
@@ -1193,17 +1285,19 @@ impl App {
             .context("destination base URI is not valid UTF-8")?;
 
         let dest_db_name = self.restore_dest_db_name.value.trim().to_owned();
-        if dest_db_name.is_empty() {
-            anyhow::bail!("destination database name cannot be empty");
-        }
-        validate_database_name(&dest_db_name)?;
-
         let input_path = std::path::PathBuf::from(self.restore_file_path.value.trim());
         if !input_path.is_file() {
             anyhow::bail!(
                 "backup file does not exist or is not a regular file: {}",
                 input_path.display()
             );
+        }
+        let instance_bundle = is_instance_backup(&input_path, key)?;
+        if !instance_bundle {
+            if dest_db_name.is_empty() {
+                anyhow::bail!("destination database name cannot be empty");
+            }
+            validate_database_name(&dest_db_name)?;
         }
 
         let backend = self.resolved_backend(Some(&dest_base_url));
@@ -1217,21 +1311,38 @@ impl App {
         );
 
         self.start_worker(instance_name.clone(), start_msg, move |tx| {
-            let result = restore_database_with_progress(
-                &input_path,
-                &decrypt_key,
-                &dest_base_url,
-                &dest_db_name,
-                &backend,
-                &mut |step| {
-                    let _ = tx.send(WorkerEvent::Log(step.to_owned()));
-                },
-            )
-            .map_err(|error| error.to_string());
-            let _ = tx.send(WorkerEvent::Finished(
-                instance_name,
-                OperationResult::Full(result),
-            ));
+            if instance_bundle {
+                let result = restore_instance_with_progress(
+                    &input_path,
+                    &decrypt_key,
+                    &dest_base_url,
+                    &backend,
+                    &mut |step| {
+                        let _ = tx.send(WorkerEvent::Log(step.to_owned()));
+                    },
+                )
+                .map_err(|error| error.to_string());
+                let _ = tx.send(WorkerEvent::Finished(
+                    instance_name,
+                    OperationResult::Batch(result),
+                ));
+            } else {
+                let result = restore_database_with_progress(
+                    &input_path,
+                    &decrypt_key,
+                    &dest_base_url,
+                    &dest_db_name,
+                    &backend,
+                    &mut |step| {
+                        let _ = tx.send(WorkerEvent::Log(step.to_owned()));
+                    },
+                )
+                .map_err(|error| error.to_string());
+                let _ = tx.send(WorkerEvent::Finished(
+                    instance_name,
+                    OperationResult::Full(result),
+                ));
+            }
         })
     }
 

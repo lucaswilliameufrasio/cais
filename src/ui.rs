@@ -1189,6 +1189,92 @@ fn draw_backup_database(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
                 "Backup in progress. You can keep navigating the TUI.",
             );
         }
+        BackupPhase::SelectDatabases => {
+            let layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(8), Constraint::Length(5)])
+                .split(frame.area());
+            let items: Vec<ListItem<'_>> = app
+                .backup_databases
+                .iter()
+                .enumerate()
+                .map(|(index, database)| {
+                    let marker = if app.backup_selected_databases[index] {
+                        "[x]"
+                    } else {
+                        "[ ]"
+                    };
+                    ListItem::new(format!(
+                        "{marker} {} | owner: {} | encoding: {} | tablespace: {}",
+                        database.name, database.owner, database.encoding, database.tablespace
+                    ))
+                })
+                .collect();
+            let list = List::new(items)
+                .block(
+                    Block::default()
+                        .title("Select databases for instance backup")
+                        .borders(Borders::ALL),
+                )
+                .highlight_style(Style::default().add_modifier(Modifier::BOLD))
+                .highlight_symbol(">> ");
+            frame.render_stateful_widget(list, layout[0], &mut app.backup_database_list_state);
+            draw_footer(
+                frame,
+                layout[1],
+                app,
+                "Up/Down: navigate  Space: toggle  A: all  Enter: continue  Esc: back",
+            );
+        }
+        BackupPhase::ConfigureBackup => {
+            let layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(8), Constraint::Length(5)])
+                .split(frame.area());
+            let selected_db_count = app.backup_selected_databases.iter().filter(|s| **s).count();
+            let globals_label = if app.backup_config.include_globals {
+                "[x]"
+            } else {
+                "[ ]"
+            };
+            let passwords_label = if app.backup_config.include_role_passwords {
+                "[x]"
+            } else {
+                "[ ]"
+            };
+            let tspace_label = match app.backup_config.tablespace_mode {
+                crate::models::TablespaceMode::Flatten => "Flatten",
+                crate::models::TablespaceMode::Preserve => "Preserve",
+            };
+            let items = vec![
+                ListItem::new(format!(
+                    "Databases: {selected_db_count} selected (Enter to start backup)"
+                )),
+                ListItem::new(format!(
+                    "{globals_label} G: Include cluster roles and memberships"
+                )),
+                ListItem::new(format!("{passwords_label} P: Include role password hashes")),
+                ListItem::new(format!("     T: Tablespace mode: {tspace_label}")),
+                ListItem::new(format!(
+                    "     Source version: {}",
+                    app.backup_source_version
+                )),
+            ];
+            let list = List::new(items)
+                .block(
+                    Block::default()
+                        .title("Instance backup summary")
+                        .borders(Borders::ALL),
+                )
+                .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+            frame.render_widget(list, layout[0]);
+            draw_footer(
+                frame,
+                layout[1],
+                app,
+                "G: toggle globals  P: toggle passwords  T: toggle tablespaces  Enter: start  Esc: back",
+            );
+        }
     }
     Ok(())
 }

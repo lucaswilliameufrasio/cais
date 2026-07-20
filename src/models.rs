@@ -131,6 +131,40 @@ pub enum PgToolBackend {
 pub struct BackupOutcome {
     pub file_path: String,
     pub database_name: String,
+    pub database_names: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiscoveredDatabase {
+    pub name: String,
+    pub owner: String,
+    pub encoding: String,
+    pub tablespace: String,
+    pub connection_limit: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TablespaceMode {
+    #[default]
+    Flatten,
+    Preserve,
+}
+
+#[derive(Debug, Clone)]
+pub struct BackupConfig {
+    pub include_globals: bool,
+    pub include_role_passwords: bool,
+    pub tablespace_mode: TablespaceMode,
+}
+
+impl Default for BackupConfig {
+    fn default() -> Self {
+        Self {
+            include_globals: true,
+            include_role_passwords: false,
+            tablespace_mode: TablespaceMode::Flatten,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
