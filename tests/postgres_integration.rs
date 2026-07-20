@@ -1,10 +1,13 @@
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use db_provisioner_tui::models::{ExtraUserProvisionRequest, PgToolBackend, ProvisionRequest};
+use db_provisioner_tui::models::{
+    BackupConfig, ConflictPolicy, ExtraUserProvisionRequest, PgToolBackend, ProvisionRequest,
+};
 use db_provisioner_tui::postgres::{
-    check_pg_tools, migrate_database_with_progress, provision_database_with_progress,
-    provision_extra_user_with_progress,
+    InstanceBackupContext, backup_instance_with_progress, check_pg_tools,
+    migrate_database_with_progress, provision_database_with_progress,
+    provision_extra_user_with_progress, restore_instance_with_progress,
 };
 use postgres::{Client, NoTls};
 
@@ -561,5 +564,106 @@ fn migrate_database_dest_already_exists() {
     assert!(
         err.to_string().contains("already exists"),
         "expected 'already exists' error, got: {err}"
+    );
+}
+
+#[test]
+fn backup_and_restore_instance_via_docker() {
+    if std::env::var("RUN_DOCKER_TESTS").ok().as_deref() != Some("1") {
+        return;
+    }
+
+    let source = DockerPostgres::start();
+    let dest = DockerPostgres::start();
+
+    let db_names = ["analytics", "metrics"];
+
+    // Create databases and populate with data on source
+    for db_name in &db_names {
+        {
+            let mut client = Client::connect(&source.url(), NoTls).expect("connect source");
+            client
+                .batch_execute(&format!("CREATE DATABASE \"{db_name}\""))
+                .expect("create source db");
+        }
+        let db_url = source.db_url(db_name);
+        let mut client = Client::connect(&db_url, NoTls).expect("connect source db");
+        client
+            .batch_execute("CREATE TABLE items (id SERIAL PRIMARY KEY, value TEXT)")
+            .expect("create table");
+        client
+            .execute(
+                "INSERT INTO items (value) VALUES ($1)",
+                &[&format!("data_{db_name}")],
+            )
+            .expect("insert");
+    }
+
+    // Back up the entire instance
+    let key = b"01234567890123456789012345678901";
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source_version =
+        db_provisioner_tui::postgres::detect_source_version(&source.url()).unwrap_or_default();
+    let major = db_provisioner_tui::postgres::extract_pg_major_version(&source_version);
+    let backend = PgToolBackend::Docker {
+        image: format!("postgres:{major}-alpine"),
+    };
+    let outcome = backup_instance_with_progress(
+        &source.url(),
+        key,
+        dir.path(),
+        &backend,
+        InstanceBackupContext {
+            instance_name: "test-instance",
+            machine_id: "test-machine",
+            hostname: "test-host",
+        },
+        &db_names.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        &BackupConfig::default(),
+        &mut |_| {},
+    )
+    .expect("instance backup");
+    assert_eq!(outcome.database_names.len(), 2);
+    assert!(outcome.database_names.contains(&"analytics".to_owned()));
+    assert!(outcome.database_names.contains(&"metrics".to_owned()));
+
+    // Restore to destination instance
+    let restored = restore_instance_with_progress(
+        std::path::Path::new(&outcome.file_path),
+        key,
+        &dest.url(),
+        &backend,
+        ConflictPolicy::Skip,
+        &mut |_| {},
+    )
+    .expect("instance restore");
+    assert_eq!(restored.len(), 2);
+
+    // Verify data in each restored database
+    for db_name in &db_names {
+        let db_url = dest.db_url(db_name);
+        let mut client = Client::connect(&db_url, NoTls).expect("connect dest db");
+        let rows: Vec<String> = client
+            .query("SELECT value FROM items ORDER BY id", &[])
+            .expect("query")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(rows, vec![format!("data_{db_name}")]);
+    }
+
+    // Verify skip policy: restoring again skips existing databases
+    let restored2 = restore_instance_with_progress(
+        std::path::Path::new(&outcome.file_path),
+        key,
+        &dest.url(),
+        &backend,
+        ConflictPolicy::Skip,
+        &mut |_| {},
+    )
+    .expect("second restore should not fail");
+    assert!(
+        restored2.is_empty(),
+        "skip policy should yield no new restores"
     );
 }

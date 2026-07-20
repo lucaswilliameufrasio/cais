@@ -4,7 +4,7 @@ use url::{Host, Url, form_urlencoded::byte_serialize};
 
 use crate::crypto;
 use crate::models::{
-    ActiveQuery, BackupConfig, BackupMetadata, BackupOutcome, DiscoveredDatabase,
+    ActiveQuery, BackupConfig, BackupMetadata, BackupOutcome, ConflictPolicy, DiscoveredDatabase,
     ExtraUserProvisionOutcome, ExtraUserProvisionRequest, ParsedDatabaseUrl, PgToolBackend,
     ProvisionFullOutcome, ProvisionFullRequest, ProvisionOutcome, ProvisionRequest, TablespaceMode,
 };
@@ -1128,6 +1128,12 @@ fn combine_restore_cleanup_error(
     }
 }
 
+fn error_string_database_exists(error: &anyhow::Error) -> bool {
+    error
+        .to_string()
+        .contains("already exists on the target cluster")
+}
+
 /// Reads an encrypted dump file, returns (optional metadata, decrypted dump bytes).
 ///
 /// Detects the `BACKUP_MAGIC` marker to differentiate new-format files
@@ -1686,6 +1692,7 @@ pub fn restore_instance_with_progress<F>(
     decrypt_key: &[u8],
     dest_base_url: &str,
     backend: &PgToolBackend,
+    on_conflict: ConflictPolicy,
     emit: &mut F,
 ) -> Result<Vec<ProvisionFullOutcome>>
 where
@@ -1696,13 +1703,14 @@ where
     let globals = contents.globals;
     emit("Restoring cluster roles and memberships...".to_owned());
     restore_globals(dest_base_url, &globals, backend)?;
+    let total = dumps.len();
     let staging = tempfile::tempdir().context("failed to create restore staging directory")?;
-    let mut outcomes = Vec::with_capacity(dumps.len());
+    let mut outcomes = Vec::with_capacity(total);
     for (index, (database_name, dump)) in dumps.into_iter().enumerate() {
         emit(format!(
             "Restoring database {}/{}: {}",
             index + 1,
-            outcomes.capacity(),
+            total,
             database_name
         ));
         let result = (|| -> Result<ProvisionFullOutcome> {
@@ -1719,6 +1727,14 @@ where
         })();
         match result {
             Ok(outcome) => outcomes.push(outcome),
+            Err(error)
+                if on_conflict == ConflictPolicy::Skip && error_string_database_exists(&error) =>
+            {
+                emit(format!(
+                    "  [skip] '{}' already exists — leaving untouched",
+                    database_name
+                ));
+            }
             Err(error) => {
                 let cleanup = (|| -> Result<()> {
                     let mut admin = Client::connect(dest_base_url, NoTls)

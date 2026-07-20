@@ -150,6 +150,13 @@ pub enum TablespaceMode {
     Preserve,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConflictPolicy {
+    Fail,
+    #[default]
+    Skip,
+}
+
 #[derive(Debug, Clone)]
 pub struct BackupConfig {
     pub include_globals: bool,

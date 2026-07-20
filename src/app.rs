@@ -8,9 +8,9 @@ use zeroize::Zeroizing;
 
 use crate::crypto;
 use crate::models::{
-    ActiveQuery, BackupConfig, BackupFile, BackupMetadata, BackupOutcome, DiscoveredDatabase,
-    ExtraUserProvisionOutcome, PgToolBackend, ProvisionFullOutcome, ProvisionFullRequest,
-    ProvisionOutcome, SavedConnectionRecord,
+    ActiveQuery, BackupConfig, BackupFile, BackupMetadata, BackupOutcome, ConflictPolicy,
+    DiscoveredDatabase, ExtraUserProvisionOutcome, PgToolBackend, ProvisionFullOutcome,
+    ProvisionFullRequest, ProvisionOutcome, SavedConnectionRecord,
 };
 use crate::postgres::{
     InstanceBackupContext, backup_database_with_progress, backup_instance_with_progress,
@@ -1317,6 +1317,7 @@ impl App {
                     &decrypt_key,
                     &dest_base_url,
                     &backend,
+                    ConflictPolicy::Skip,
                     &mut |step| {
                         let _ = tx.send(WorkerEvent::Log(step.to_owned()));
                     },
