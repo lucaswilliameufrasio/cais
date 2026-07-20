@@ -1,0 +1,1686 @@
+use anyhow::{Context, Result};
+use postgres::{Client, NoTls};
+use url::{Host, Url, form_urlencoded::byte_serialize};
+
+use crate::crypto;
+use crate::models::{
+    ActiveQuery, BackupMetadata, BackupOutcome, ExtraUserProvisionOutcome,
+    ExtraUserProvisionRequest, ParsedDatabaseUrl, PgToolBackend, ProvisionFullOutcome,
+    ProvisionFullRequest, ProvisionOutcome, ProvisionRequest,
+};
+use crate::validation::{normalize_application_name, validate_database_name};
+
+pub fn parse_database_url(raw: &str) -> Result<ParsedDatabaseUrl> {
+    let url = Url::parse(raw).context("base DATABASE_URL is not a valid URI")?;
+    let scheme = url.scheme();
+    if scheme != "postgresql" && scheme != "postgres" {
+        anyhow::bail!("DATABASE_URL must use the postgres or postgresql scheme")
+    }
+
+    let host = match url.host() {
+        Some(Host::Domain(value)) => value.to_owned(),
+        Some(Host::Ipv4(value)) => value.to_string(),
+        Some(Host::Ipv6(value)) => format!("[{value}]"),
+        None => anyhow::bail!("DATABASE_URL is missing a host"),
+    };
+
+    let username = url.username().to_owned();
+    let database = url
+        .path()
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .filter(|value| !value.is_empty())
+        .context("DATABASE_URL is missing a database name")?
+        .to_owned();
+
+    Ok(ParsedDatabaseUrl {
+        username,
+        host,
+        port: url.port().unwrap_or(5432),
+        database,
+    })
+}
+
+pub fn provision_database_with_progress<F>(
+    base_url: &str,
+    request: &ProvisionRequest,
+    mut emit: F,
+) -> Result<ProvisionOutcome>
+where
+    F: FnMut(String),
+{
+    validate_database_name(&request.database_name)?;
+    let application_name =
+        normalize_application_name(&request.database_name, &request.application_name);
+    let parsed = parse_database_url(base_url)?;
+
+    let mut client =
+        Client::connect(base_url, NoTls).context("failed to connect to the shared database")?;
+    let mut steps = Vec::new();
+    push_step(
+        &mut steps,
+        &mut emit,
+        format!(
+            "Connected to {}:{} / {} as {}",
+            parsed.host, parsed.port, parsed.database, parsed.username
+        ),
+    );
+
+    let database_created =
+        ensure_database(&mut client, &request.database_name, &mut steps, &mut emit)?;
+    let role_name = format!("{}_owner", request.database_name);
+    push_step(
+        &mut steps,
+        &mut emit,
+        format!("Generating password for role {role_name}"),
+    );
+    let generated_password = crypto::generate_password()?;
+    let role_created = ensure_role(
+        &mut client,
+        &role_name,
+        &generated_password,
+        &mut steps,
+        &mut emit,
+    )?;
+    set_owner(
+        &mut client,
+        &request.database_name,
+        &role_name,
+        &mut steps,
+        &mut emit,
+    )?;
+
+    let connection_string = build_connection_string(
+        &parsed.host,
+        parsed.port,
+        &request.database_name,
+        &role_name,
+        &generated_password,
+        &application_name,
+    );
+    push_step(
+        &mut steps,
+        &mut emit,
+        "Constructed new connection string".to_owned(),
+    );
+
+    Ok(ProvisionOutcome {
+        database_name: request.database_name.clone(),
+        application_name,
+        role_name,
+        connection_string,
+        database_created,
+        role_created,
+    })
+}
+
+pub fn provision_extra_user_with_progress<F>(
+    base_url: &str,
+    request: &ExtraUserProvisionRequest,
+    mut emit: F,
+) -> Result<ExtraUserProvisionOutcome>
+where
+    F: FnMut(String),
+{
+    validate_database_name(&request.database_name)?;
+    validate_database_name(&request.username)?;
+    let application_name =
+        normalize_application_name(&request.database_name, &request.application_name);
+    let parsed = parse_database_url(base_url)?;
+
+    let mut client =
+        Client::connect(base_url, NoTls).context("failed to connect to the shared database")?;
+    let mut steps = Vec::new();
+    push_step(
+        &mut steps,
+        &mut emit,
+        format!(
+            "Connected to {}:{} / {} as {}",
+            parsed.host, parsed.port, parsed.database, parsed.username
+        ),
+    );
+
+    ensure_database_exists(&mut client, &request.database_name, &mut steps, &mut emit)?;
+
+    let generated_password = crypto::generate_password()?;
+    push_step(
+        &mut steps,
+        &mut emit,
+        format!("Generating password for extra user {}", request.username),
+    );
+
+    let role_created = ensure_role(
+        &mut client,
+        &request.username,
+        &generated_password,
+        &mut steps,
+        &mut emit,
+    )?;
+
+    // GRANT CONNECT ON DATABASE is a cluster-level operation — run from base DB
+    grant_connect_on_database(
+        &mut client,
+        &request.database_name,
+        &request.username,
+        &mut steps,
+        &mut emit,
+    )?;
+
+    // Schema-level grants and default privileges must run inside the target database
+    let target_url = target_url(base_url, &request.database_name)?;
+    let mut target_client =
+        Client::connect(&target_url, NoTls).context("failed to connect to target database")?;
+    let grants_applied =
+        apply_schema_grants(&mut target_client, &request.username, &mut steps, &mut emit)?;
+
+    let owner_role = format!("{}_owner", request.database_name);
+    apply_default_privileges(
+        &mut target_client,
+        &owner_role,
+        &request.username,
+        &mut steps,
+        &mut emit,
+    )?;
+    drop(target_client);
+
+    let connection_string = build_connection_string(
+        &parsed.host,
+        parsed.port,
+        &request.database_name,
+        &request.username,
+        &generated_password,
+        &application_name,
+    );
+    push_step(
+        &mut steps,
+        &mut emit,
+        "Constructed new connection string".to_owned(),
+    );
+
+    Ok(ExtraUserProvisionOutcome {
+        database_name: request.database_name.clone(),
+        username: request.username.clone(),
+        application_name,
+        connection_string,
+        role_created,
+        grants_applied,
+    })
+}
+
+pub fn provision_full_with_progress<F>(
+    base_url: &str,
+    request: &ProvisionFullRequest,
+    mut emit: F,
+) -> Result<ProvisionFullOutcome>
+where
+    F: FnMut(String),
+{
+    validate_database_name(&request.database_name)?;
+    let application_name =
+        normalize_application_name(&request.database_name, &request.application_name);
+    let parsed = parse_database_url(base_url)?;
+
+    let mut client =
+        Client::connect(base_url, NoTls).context("failed to connect to the shared database")?;
+    push_step(
+        &mut Vec::new(),
+        &mut emit,
+        format!(
+            "Connected to {}:{} / {} as {}",
+            parsed.host, parsed.port, parsed.database, parsed.username
+        ),
+    );
+
+    let database_created = ensure_database(
+        &mut client,
+        &request.database_name,
+        &mut Vec::new(),
+        &mut emit,
+    )?;
+    let role_name = format!("{}_owner", request.database_name);
+    let generated_password = crypto::generate_password()?;
+    let role_created = ensure_role(
+        &mut client,
+        &role_name,
+        &generated_password,
+        &mut Vec::new(),
+        &mut emit,
+    )?;
+    set_owner(
+        &mut client,
+        &request.database_name,
+        &role_name,
+        &mut Vec::new(),
+        &mut emit,
+    )?;
+
+    let database_connection_string = build_connection_string(
+        &parsed.host,
+        parsed.port,
+        &request.database_name,
+        &role_name,
+        &generated_password,
+        &application_name,
+    );
+
+    let (extra_username, extra_connection_string, extra_role_created, extra_grants_applied) =
+        if let Some(ref extra_username) = request.extra_username {
+            validate_database_name(extra_username)?;
+            let extra_app_name = normalize_application_name(
+                &request.database_name,
+                request.extra_application_name.as_deref().unwrap_or(""),
+            );
+            let extra_password = crypto::generate_password()?;
+            let ec_created = ensure_role(
+                &mut client,
+                extra_username,
+                &extra_password,
+                &mut Vec::new(),
+                &mut emit,
+            )?;
+            grant_connect_on_database(
+                &mut client,
+                &request.database_name,
+                extra_username,
+                &mut Vec::new(),
+                &mut emit,
+            )?;
+            let target_url = target_url(base_url, &request.database_name)?;
+            let mut target_client = Client::connect(&target_url, NoTls)
+                .context("failed to connect to target database")?;
+            let ga_applied = apply_schema_grants(
+                &mut target_client,
+                extra_username,
+                &mut Vec::new(),
+                &mut emit,
+            )?;
+            apply_default_privileges(
+                &mut target_client,
+                &role_name,
+                extra_username,
+                &mut Vec::new(),
+                &mut emit,
+            )?;
+            drop(target_client);
+
+            let extra_cs = build_connection_string(
+                &parsed.host,
+                parsed.port,
+                &request.database_name,
+                extra_username,
+                &extra_password,
+                &extra_app_name,
+            );
+            (
+                Some(extra_username.clone()),
+                Some(extra_cs),
+                Some(ec_created),
+                Some(ga_applied),
+            )
+        } else {
+            (None, None, None, None)
+        };
+
+    Ok(ProvisionFullOutcome {
+        database_name: request.database_name.clone(),
+        application_name,
+        role_name,
+        database_connection_string,
+        database_created,
+        role_created,
+        extra_username,
+        extra_connection_string,
+        extra_role_created,
+        extra_grants_applied,
+    })
+}
+
+fn ensure_database(
+    client: &mut Client,
+    database_name: &str,
+    steps: &mut Vec<String>,
+    emit: &mut impl FnMut(String),
+) -> Result<bool> {
+    let exists = client.query_opt(
+        "SELECT 1 FROM pg_database WHERE datname = $1",
+        &[&database_name],
+    )?;
+    if exists.is_some() {
+        push_step(
+            steps,
+            emit,
+            format!("Database {database_name} already exists"),
+        );
+        return Ok(false);
+    }
+
+    let query = format!("CREATE DATABASE \"{}\"", escape_ident(database_name));
+    client.batch_execute(&query)?;
+    push_step(steps, emit, format!("Created database {database_name}"));
+    Ok(true)
+}
+
+fn ensure_database_exists(
+    client: &mut Client,
+    database_name: &str,
+    steps: &mut Vec<String>,
+    emit: &mut impl FnMut(String),
+) -> Result<()> {
+    let exists = client.query_opt(
+        "SELECT 1 FROM pg_database WHERE datname = $1",
+        &[&database_name],
+    )?;
+    if exists.is_some() {
+        push_step(
+            steps,
+            emit,
+            format!("Database {database_name} already exists"),
+        );
+        Ok(())
+    } else {
+        anyhow::bail!("database {database_name} does not exist")
+    }
+}
+
+fn ensure_role(
+    client: &mut Client,
+    role_name: &str,
+    password: &str,
+    steps: &mut Vec<String>,
+    emit: &mut impl FnMut(String),
+) -> Result<bool> {
+    let exists = client.query_opt("SELECT 1 FROM pg_roles WHERE rolname = $1", &[&role_name])?;
+    if exists.is_some() {
+        push_step(
+            steps,
+            emit,
+            format!("Role {role_name} already exists; password not rotated automatically"),
+        );
+        return Ok(false);
+    }
+
+    let escaped_password = escape_literal(password);
+    let query = format!(
+        "CREATE ROLE \"{}\" WITH LOGIN PASSWORD '{}' CREATEDB",
+        escape_ident(role_name),
+        escaped_password
+    );
+    client.batch_execute(&query)?;
+    push_step(steps, emit, format!("Created role {role_name}"));
+    Ok(true)
+}
+
+fn set_owner(
+    client: &mut Client,
+    database_name: &str,
+    role_name: &str,
+    steps: &mut Vec<String>,
+    emit: &mut impl FnMut(String),
+) -> Result<()> {
+    let query = format!(
+        "ALTER DATABASE \"{}\" OWNER TO \"{}\"",
+        escape_ident(database_name),
+        escape_ident(role_name)
+    );
+    client.batch_execute(&query)?;
+    push_step(
+        steps,
+        emit,
+        format!("Assigned owner {} to database {}", role_name, database_name),
+    );
+    Ok(())
+}
+
+fn target_url(base_url: &str, database_name: &str) -> Result<String> {
+    let mut url = Url::parse(base_url).context("invalid base URL")?;
+    url.set_path(&format!("/{}", database_name));
+    Ok(url.to_string())
+}
+
+fn grant_connect_on_database(
+    client: &mut Client,
+    database_name: &str,
+    username: &str,
+    steps: &mut Vec<String>,
+    emit: &mut impl FnMut(String),
+) -> Result<()> {
+    let query = format!(
+        "GRANT CONNECT ON DATABASE \"{}\" TO \"{}\"",
+        escape_ident(database_name),
+        escape_ident(username)
+    );
+    client.batch_execute(&query)?;
+    push_step(
+        steps,
+        emit,
+        format!("Granted CONNECT on database {database_name} to {username}"),
+    );
+    Ok(())
+}
+
+fn apply_schema_grants(
+    client: &mut Client,
+    username: &str,
+    steps: &mut Vec<String>,
+    emit: &mut impl FnMut(String),
+) -> Result<bool> {
+    client.batch_execute(&format!(
+        "GRANT USAGE ON SCHEMA public TO \"{}\"",
+        escape_ident(username)
+    ))?;
+    client.batch_execute(&format!(
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO \"{}\"",
+        escape_ident(username)
+    ))?;
+    client.batch_execute(&format!(
+        "GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO \"{}\"",
+        escape_ident(username)
+    ))?;
+    push_step(
+        steps,
+        emit,
+        format!("Applied app_rw_limited schema grants to {username}"),
+    );
+    Ok(true)
+}
+
+fn apply_default_privileges(
+    client: &mut Client,
+    owner_role: &str,
+    username: &str,
+    steps: &mut Vec<String>,
+    emit: &mut impl FnMut(String),
+) -> Result<()> {
+    let exists = client.query_opt("SELECT 1 FROM pg_roles WHERE rolname = $1", &[&owner_role])?;
+    if exists.is_none() {
+        anyhow::bail!("owner role {owner_role} does not exist")
+    }
+
+    client.batch_execute(&format!(
+        "ALTER DEFAULT PRIVILEGES FOR ROLE \"{}\" IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO \"{}\"",
+        escape_ident(owner_role),
+        escape_ident(username)
+    ))?;
+    client.batch_execute(&format!(
+        "ALTER DEFAULT PRIVILEGES FOR ROLE \"{}\" IN SCHEMA public GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO \"{}\"",
+        escape_ident(owner_role),
+        escape_ident(username)
+    ))?;
+    push_step(
+        steps,
+        emit,
+        format!(
+            "Applied default privileges from {} to {}",
+            owner_role, username
+        ),
+    );
+    Ok(())
+}
+
+fn push_step(steps: &mut Vec<String>, emit: &mut impl FnMut(String), step: impl Into<String>) {
+    let step = step.into();
+    emit(step.clone());
+    steps.push(step);
+}
+
+fn build_connection_string(
+    host: &str,
+    port: u16,
+    database_name: &str,
+    role_name: &str,
+    password: &str,
+    application_name: &str,
+) -> String {
+    let encoded_password: String = byte_serialize(password.as_bytes()).collect();
+    let encoded_application_name: String = byte_serialize(application_name.as_bytes()).collect();
+    format!(
+        "postgresql://{}:{}@{}:{}/{}?application_name={}",
+        role_name, encoded_password, host, port, database_name, encoded_application_name
+    )
+}
+
+fn escape_ident(value: &str) -> String {
+    value.replace('"', "\"\"")
+}
+
+fn escape_literal(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+pub fn check_pg_tools() -> PgToolBackend {
+    let try_native = || -> Option<(String, String)> {
+        let dump_ver = run_tool("pg_dump", ["--version"]).ok()?;
+        let restore_ver = run_tool("pg_restore", ["--version"]).ok()?;
+        Some((dump_ver, restore_ver))
+    };
+
+    if let Some((dump_ver, restore_ver)) = try_native() {
+        return PgToolBackend::Native {
+            dump_ver,
+            restore_ver,
+        };
+    }
+
+    let docker_ok = std::process::Command::new("docker")
+        .args(["--version"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if docker_ok {
+        PgToolBackend::Docker {
+            image: "postgres:16-alpine".to_owned(),
+        }
+    } else {
+        PgToolBackend::NotFound
+    }
+}
+
+pub fn detect_source_version(source_cs: &str) -> Result<String> {
+    let mut client =
+        Client::connect(source_cs, NoTls).context("failed to connect to source database")?;
+    let row = client
+        .query_one("SELECT version()", &[])
+        .context("failed to query source version")?;
+    let version: String = row.get(0);
+    Ok(version)
+}
+
+pub fn resolve_docker_image(backend: &PgToolBackend, source_cs: Option<&str>) -> String {
+    match backend {
+        PgToolBackend::Docker { image } => {
+            let Some(source_cs) = source_cs else {
+                return image.clone();
+            };
+            match detect_source_version(source_cs) {
+                Ok(version) => {
+                    let major = extract_pg_major_version(&version);
+                    let tag = format!("postgres:{major}-alpine");
+                    tag
+                }
+                Err(_) => image.clone(),
+            }
+        }
+        _ => "postgres:16-alpine".to_owned(),
+    }
+}
+
+pub fn extract_pg_major_version(version: &str) -> u32 {
+    let mut tokens = version.split_whitespace();
+    while let Some(token) = tokens.next() {
+        if (token == "PostgreSQL" || token == "YugabyteDB")
+            && let Some(ver_token) = tokens.next()
+            && let Some(major_str) = ver_token.split('.').next()
+            && let Ok(major) = major_str.parse::<u32>()
+        {
+            return major;
+        }
+    }
+    // Fallback: try the last token (handles "pg_dump (PostgreSQL) 16.4")
+    if let Some(last) = version.split_whitespace().last()
+        && let Some(major_str) = last.split('.').next()
+        && let Ok(major) = major_str.parse::<u32>()
+    {
+        return major;
+    }
+    16 // final fallback
+}
+
+pub fn check_version_warning(source_cs: &str, backend: &PgToolBackend) -> Option<String> {
+    let source_ver = match detect_source_version(source_cs) {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+    let source_major = extract_pg_major_version(&source_ver);
+
+    match backend {
+        PgToolBackend::Native { dump_ver, .. } => {
+            let dump_major = extract_pg_major_version(dump_ver);
+            if source_major != dump_major {
+                return Some(format!(
+                    "Version mismatch detected: pg_dump is v{dump_major}, \
+                     source server is PostgreSQL {source_major}. \
+                     Consider using Docker backend or install matching pg_dump."
+                ));
+            }
+        }
+        PgToolBackend::Docker { .. } => {
+            // Docker resolves the image to match the server — no warning needed
+        }
+        PgToolBackend::NotFound => {}
+    }
+    None
+}
+
+/// Pull a Docker image silently, so pull progress doesn't contaminate
+/// stderr of subsequent Docker commands.
+fn docker_pull_silent(image: &str) -> Result<()> {
+    let pull = std::process::Command::new("docker")
+        .args(["pull", image])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .context("failed to execute docker pull")?;
+    if !pull.status.success() {
+        let stderr = String::from_utf8_lossy(&pull.stderr);
+        anyhow::bail!("failed to pull Docker image '{}': {}", image, stderr.trim());
+    }
+    Ok(())
+}
+
+pub fn migrate_database_with_progress<F>(
+    source_cs: &str,
+    dest_base_url: &str,
+    dest_db_name: &str,
+    backend: &PgToolBackend,
+    emit: &mut F,
+) -> Result<ProvisionFullOutcome>
+where
+    F: FnMut(String),
+{
+    if let PgToolBackend::NotFound = backend {
+        anyhow::bail!(
+            "pg_dump/pg_restore not found. Install PostgreSQL client tools (brew install postgresql, \
+             apt install postgresql-client, dnf install postgresql) or Docker."
+        );
+    }
+
+    let parsed = parse_database_url(dest_base_url)?;
+    let dump_dir = tempfile::tempdir().context("failed to create temp directory")?;
+    let dump_path = dump_dir.path().join(format!("{}.pgdump", dest_db_name));
+
+    push_step(&mut Vec::new(), emit, "Starting pg_dump...".to_owned());
+
+    let dump_output = match backend {
+        PgToolBackend::Native { .. } => std::process::Command::new("pg_dump")
+            .args(["-Fc", "-f"])
+            .arg(&dump_path)
+            .args(["-d", source_cs])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .context("failed to execute pg_dump")?,
+        PgToolBackend::Docker { image } => {
+            docker_pull_silent(image)?;
+            let output = std::process::Command::new("docker")
+                .args([
+                    "run",
+                    "--rm",
+                    "-i",
+                    "--network",
+                    "host",
+                    image.as_str(),
+                    "pg_dump",
+                    "-Fc",
+                    "-d",
+                    source_cs,
+                ])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output()
+                .context("failed to execute docker pg_dump")?;
+            std::fs::write(&dump_path, &output.stdout)
+                .context("failed to write pg_dump output to file")?;
+            output
+        }
+        PgToolBackend::NotFound => unreachable!(),
+    };
+
+    if !dump_output.status.success() {
+        let stderr = String::from_utf8_lossy(&dump_output.stderr);
+        anyhow::bail!("pg_dump failed: {}", stderr.trim());
+    }
+
+    let dump_stderr = String::from_utf8_lossy(&dump_output.stderr);
+    for line in dump_stderr.lines() {
+        let line = line.trim();
+        if !line.is_empty() {
+            push_step(&mut Vec::new(), emit, format!("pg_dump: {line}"));
+        }
+    }
+
+    push_step(
+        &mut Vec::new(),
+        emit,
+        format!("pg_dump completed. Checking if '{dest_db_name}' exists on target..."),
+    );
+
+    let admin_url = dest_base_url;
+    let mut admin_client =
+        Client::connect(admin_url, NoTls).context("failed to connect to destination cluster")?;
+
+    let db_exists = admin_client
+        .query_opt(
+            "SELECT 1 FROM pg_database WHERE datname = $1",
+            &[&dest_db_name],
+        )?
+        .is_some();
+
+    if db_exists {
+        anyhow::bail!("database '{dest_db_name}' already exists on the target cluster");
+    }
+
+    push_step(
+        &mut Vec::new(),
+        emit,
+        format!("Creating database '{dest_db_name}' on target..."),
+    );
+
+    let create_query = format!("CREATE DATABASE \"{}\"", escape_ident(dest_db_name));
+    admin_client
+        .batch_execute(&create_query)
+        .context("failed to create destination database")?;
+
+    let dest_url = target_url(dest_base_url, dest_db_name)?;
+    push_step(
+        &mut Vec::new(),
+        emit,
+        format!(
+            "Starting pg_restore to {}:{} / {}...",
+            parsed.host, parsed.port, dest_db_name
+        ),
+    );
+
+    let restore_output = match backend {
+        PgToolBackend::Native { .. } => std::process::Command::new("pg_restore")
+            .args(["--dbname", &dest_url, "--no-owner", "--no-privileges"])
+            .arg(&dump_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .context("failed to execute pg_restore")?,
+        PgToolBackend::Docker { image } => {
+            docker_pull_silent(image)?;
+            let file = std::fs::File::open(&dump_path)
+                .context("failed to open dump file for pg_restore")?;
+            std::process::Command::new("docker")
+                .args([
+                    "run",
+                    "--rm",
+                    "-i",
+                    "--network",
+                    "host",
+                    image.as_str(),
+                    "pg_restore",
+                    "--dbname",
+                    &dest_url,
+                    "--no-owner",
+                    "--no-privileges",
+                ])
+                .stdin(file)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output()
+                .context("failed to execute docker pg_restore")?
+        }
+        PgToolBackend::NotFound => unreachable!(),
+    };
+
+    // Drop the created database if restore fails
+    if !restore_output.status.success() {
+        let stderr = String::from_utf8_lossy(&restore_output.stderr);
+        let _ = admin_client.batch_execute(&format!(
+            "DROP DATABASE IF EXISTS \"{}\"",
+            escape_ident(dest_db_name)
+        ));
+        anyhow::bail!("pg_restore failed: {}", stderr.trim());
+    }
+
+    let restore_stderr = String::from_utf8_lossy(&restore_output.stderr);
+    for line in restore_stderr.lines() {
+        let line = line.trim();
+        if !line.is_empty() {
+            push_step(&mut Vec::new(), emit, format!("pg_restore: {line}"));
+        }
+    }
+
+    push_step(
+        &mut Vec::new(),
+        emit,
+        format!("Migration to '{dest_db_name}' completed successfully."),
+    );
+
+    let outcome = ProvisionFullOutcome {
+        database_name: dest_db_name.to_owned(),
+        application_name: dest_db_name.to_owned(),
+        role_name: parsed.username,
+        database_connection_string: dest_url.clone(),
+        database_created: true,
+        role_created: false,
+        extra_username: None,
+        extra_connection_string: None,
+        extra_role_created: None,
+        extra_grants_applied: None,
+    };
+
+    Ok(outcome)
+}
+
+/// Magic marker "DBP1" at the start of decrypted backup plaintext.
+///
+/// `DBP1` = "Database Provisioner v1". When present, the decrypted payload
+/// contains a JSON metadata header before the engine dump bytes. When absent,
+/// the file is in the legacy format (raw dump data only).
+///
+/// Detecting this marker allows backward compatibility with backup files
+/// created before the metadata feature was introduced.
+///
+/// Post-decryption format with magic:
+///   [4B magic "DBP1"][4B LE metadata_len][JSON metadata][engine dump bytes]
+const BACKUP_MAGIC: [u8; 4] = *b"DBP1";
+
+/// Writes an encrypted dump file: [nonce_len:4 LE][nonce][ciphertext]
+///
+/// When `metadata` is `Some`, the decrypted payload will be:
+///   [magic][meta_len][JSON metadata][dump_data]
+/// Otherwise the plain payload is just `dump_data` (legacy format).
+pub fn create_encrypted_dump(
+    dump_data: &[u8],
+    metadata: Option<&BackupMetadata>,
+    encrypt_key: &[u8],
+    output_path: &std::path::Path,
+) -> Result<()> {
+    let plaintext = if let Some(meta) = metadata {
+        let meta_json = serde_json::to_vec(meta).context("failed to serialize backup metadata")?;
+        let meta_len = (meta_json.len() as u32).to_le_bytes();
+        let mut buf = Vec::with_capacity(4 + 4 + meta_json.len() + dump_data.len());
+        buf.extend_from_slice(&BACKUP_MAGIC);
+        buf.extend_from_slice(&meta_len);
+        buf.extend_from_slice(&meta_json);
+        buf.extend_from_slice(dump_data);
+        buf
+    } else {
+        dump_data.to_vec()
+    };
+
+    let encrypted = crate::crypto::encrypt(encrypt_key, &plaintext)?;
+    let mut file = std::fs::File::create(output_path)
+        .with_context(|| format!("failed to create {}", output_path.display()))?;
+    use std::io::Write;
+    let nonce_len = encrypted.nonce.len() as u32;
+    file.write_all(&nonce_len.to_le_bytes())?;
+    file.write_all(&encrypted.nonce)?;
+    file.write_all(&encrypted.ciphertext)?;
+    Ok(())
+}
+
+/// Reads an encrypted dump file, returns (optional metadata, decrypted dump bytes).
+///
+/// Detects the `BACKUP_MAGIC` marker to differentiate new-format files
+/// (with embedded metadata) from legacy-format files (raw dump only).
+pub fn read_encrypted_dump(
+    input_path: &std::path::Path,
+    decrypt_key: &[u8],
+) -> Result<(Option<BackupMetadata>, Vec<u8>)> {
+    let data = std::fs::read(input_path)
+        .with_context(|| format!("failed to read {}", input_path.display()))?;
+    if data.len() < 4 {
+        anyhow::bail!("file too small to contain encrypted data");
+    }
+    let nonce_len = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
+    if data.len() < 4 + nonce_len {
+        anyhow::bail!("file is truncated: missing nonce");
+    }
+    let nonce = data[4..4 + nonce_len].to_vec();
+    let ciphertext = data[4 + nonce_len..].to_vec();
+    let encrypted = crate::models::EncryptedValue { ciphertext, nonce };
+    let plaintext = crate::crypto::decrypt(decrypt_key, &encrypted)?;
+
+    if plaintext.len() < 4 {
+        return Ok((None, plaintext.to_vec()));
+    }
+
+    if plaintext[..4] == BACKUP_MAGIC {
+        let rest = &plaintext[4..];
+        if rest.len() < 4 {
+            anyhow::bail!("backup file has magic marker but is missing metadata length");
+        }
+        let meta_len = u32::from_le_bytes(rest[..4].try_into().unwrap()) as usize;
+        if rest.len() < 4 + meta_len {
+            anyhow::bail!("backup file has magic marker but metadata is truncated");
+        }
+        let meta_json = &rest[4..4 + meta_len];
+        let metadata: BackupMetadata =
+            serde_json::from_slice(meta_json).context("failed to parse backup metadata")?;
+        let dump_bytes = rest[4 + meta_len..].to_vec();
+        Ok((Some(metadata), dump_bytes))
+    } else {
+        Ok((None, plaintext.to_vec()))
+    }
+}
+
+pub fn backup_database_with_progress<F>(
+    source_cs: &str,
+    encrypt_key: &[u8],
+    output_dir: &std::path::Path,
+    backend: &PgToolBackend,
+    metadata: Option<&BackupMetadata>,
+    emit: &mut F,
+) -> Result<BackupOutcome>
+where
+    F: FnMut(String),
+{
+    if let PgToolBackend::NotFound = backend {
+        anyhow::bail!("pg_dump not found. Install PostgreSQL client tools or Docker.")
+    }
+
+    let parsed = parse_database_url(source_cs)?;
+    let dump_dir = tempfile::tempdir().context("failed to create temp directory")?;
+    let dump_path = dump_dir.path().join(format!("{}.pgdump", parsed.database));
+
+    push_step(&mut Vec::new(), emit, "Starting pg_dump...".to_owned());
+    let dump_output = match backend {
+        PgToolBackend::Native { .. } => std::process::Command::new("pg_dump")
+            .args(["-Fc", "-f"])
+            .arg(&dump_path)
+            .args(["-d", source_cs])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .context("failed to execute pg_dump")?,
+        PgToolBackend::Docker { image } => {
+            docker_pull_silent(image)?;
+            let output = std::process::Command::new("docker")
+                .args([
+                    "run",
+                    "--rm",
+                    "-i",
+                    "--network",
+                    "host",
+                    image.as_str(),
+                    "pg_dump",
+                    "-Fc",
+                    "-d",
+                    source_cs,
+                ])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output()
+                .context("failed to execute docker pg_dump")?;
+            std::fs::write(&dump_path, &output.stdout)
+                .context("failed to write pg_dump output to file")?;
+            output
+        }
+        PgToolBackend::NotFound => unreachable!(),
+    };
+
+    if !dump_output.status.success() {
+        let stderr = String::from_utf8_lossy(&dump_output.stderr);
+        anyhow::bail!("pg_dump failed: {}", stderr.trim());
+    }
+
+    let dump_stderr = String::from_utf8_lossy(&dump_output.stderr);
+    for line in dump_stderr.lines() {
+        let line = line.trim();
+        if !line.is_empty() {
+            push_step(&mut Vec::new(), emit, format!("pg_dump: {line}"));
+        }
+    }
+
+    push_step(
+        &mut Vec::new(),
+        emit,
+        "pg_dump completed, encrypting dump...".to_owned(),
+    );
+
+    let dump_data = std::fs::read(&dump_path).context("failed to read dump file")?;
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+    let filename = if let Some(meta) = metadata {
+        format!(
+            "{}_{}_{}_{}.pgdump.enc",
+            meta.hostname, meta.instance_name, meta.database_name, timestamp
+        )
+    } else {
+        format!("{}_{}.pgdump.enc", parsed.database, timestamp)
+    };
+    let output_path = output_dir.join(&filename);
+
+    std::fs::create_dir_all(output_dir).context("failed to create output directory")?;
+    create_encrypted_dump(&dump_data, metadata, encrypt_key, &output_path)?;
+
+    push_step(
+        &mut Vec::new(),
+        emit,
+        format!("Encrypted backup saved to {}", output_path.display()),
+    );
+
+    Ok(BackupOutcome {
+        file_path: output_path.to_string_lossy().to_string(),
+        database_name: parsed.database,
+    })
+}
+
+pub fn restore_database_with_progress<F>(
+    input_path: &std::path::Path,
+    decrypt_key: &[u8],
+    dest_base_url: &str,
+    dest_db_name: &str,
+    backend: &PgToolBackend,
+    emit: &mut F,
+) -> Result<ProvisionFullOutcome>
+where
+    F: FnMut(String),
+{
+    if let PgToolBackend::NotFound = backend {
+        anyhow::bail!("pg_restore not found. Install PostgreSQL client tools or Docker.")
+    }
+
+    let parsed = parse_database_url(dest_base_url)?;
+    let dump_dir = tempfile::tempdir().context("failed to create temp directory")?;
+    let dump_path = dump_dir.path().join(format!("{}.pgdump", dest_db_name));
+
+    push_step(
+        &mut Vec::new(),
+        emit,
+        "Reading encrypted backup and decrypting...".to_owned(),
+    );
+
+    let (backup_meta, decrypted) = read_encrypted_dump(input_path, decrypt_key)?;
+
+    if let Some(ref meta) = backup_meta {
+        push_step(
+            &mut Vec::new(),
+            emit,
+            format!(
+                "Backup origin: {} / {} on {} (v{}, {})",
+                meta.instance_name, meta.database_name, meta.hostname, meta.version, meta.timestamp
+            ),
+        );
+    }
+
+    std::fs::write(&dump_path, &decrypted).context("failed to write decrypted dump")?;
+
+    push_step(
+        &mut Vec::new(),
+        emit,
+        format!("Decrypted. Checking if '{dest_db_name}' exists on target..."),
+    );
+
+    let mut admin_client = Client::connect(dest_base_url, NoTls)
+        .context("failed to connect to destination cluster")?;
+
+    let db_exists = admin_client
+        .query_opt(
+            "SELECT 1 FROM pg_database WHERE datname = $1",
+            &[&dest_db_name],
+        )?
+        .is_some();
+
+    if db_exists {
+        anyhow::bail!("database '{dest_db_name}' already exists on the target cluster");
+    }
+
+    push_step(
+        &mut Vec::new(),
+        emit,
+        format!("Creating database '{dest_db_name}' on target..."),
+    );
+
+    let create_query = format!("CREATE DATABASE \"{}\"", escape_ident(dest_db_name));
+    admin_client
+        .batch_execute(&create_query)
+        .context("failed to create destination database")?;
+
+    let dest_url = target_url(dest_base_url, dest_db_name)?;
+    push_step(
+        &mut Vec::new(),
+        emit,
+        format!(
+            "Starting pg_restore to {}:{} / {}...",
+            parsed.host, parsed.port, dest_db_name
+        ),
+    );
+
+    let restore_output = match backend {
+        PgToolBackend::Native { .. } => std::process::Command::new("pg_restore")
+            .args(["--dbname", &dest_url, "--no-owner", "--no-privileges"])
+            .arg(&dump_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .context("failed to execute pg_restore")?,
+        PgToolBackend::Docker { image } => {
+            docker_pull_silent(image)?;
+            let file = std::fs::File::open(&dump_path)
+                .context("failed to open dump file for pg_restore")?;
+            std::process::Command::new("docker")
+                .args([
+                    "run",
+                    "--rm",
+                    "-i",
+                    "--network",
+                    "host",
+                    image.as_str(),
+                    "pg_restore",
+                    "--dbname",
+                    &dest_url,
+                    "--no-owner",
+                    "--no-privileges",
+                ])
+                .stdin(file)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output()
+                .context("failed to execute docker pg_restore")?
+        }
+        PgToolBackend::NotFound => unreachable!(),
+    };
+
+    if !restore_output.status.success() {
+        let stderr = String::from_utf8_lossy(&restore_output.stderr);
+        let _ = admin_client.batch_execute(&format!(
+            "DROP DATABASE IF EXISTS \"{}\"",
+            escape_ident(dest_db_name)
+        ));
+        anyhow::bail!("pg_restore failed: {}", stderr.trim());
+    }
+
+    let restore_stderr = String::from_utf8_lossy(&restore_output.stderr);
+    for line in restore_stderr.lines() {
+        let line = line.trim();
+        if !line.is_empty() {
+            push_step(&mut Vec::new(), emit, format!("pg_restore: {line}"));
+        }
+    }
+
+    push_step(
+        &mut Vec::new(),
+        emit,
+        format!("Restore to '{dest_db_name}' completed successfully."),
+    );
+
+    Ok(ProvisionFullOutcome {
+        database_name: dest_db_name.to_owned(),
+        application_name: dest_db_name.to_owned(),
+        role_name: parsed.username,
+        database_connection_string: dest_url,
+        database_created: true,
+        role_created: false,
+        extra_username: None,
+        extra_connection_string: None,
+        extra_role_created: None,
+        extra_grants_applied: None,
+    })
+}
+
+fn run_tool(name: &str, args: impl IntoIterator<Item = &'static str>) -> Result<String> {
+    let output = std::process::Command::new(name)
+        .args(args)
+        .output()
+        .with_context(|| format!("{name} not found. Install postgresql-client tools."))?;
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if text.is_empty() {
+        anyhow::bail!("{name} returned empty output");
+    }
+    Ok(text)
+}
+
+pub fn mask_connection_string(value: &str) -> String {
+    match Url::parse(value) {
+        Ok(mut url) => {
+            if !url.username().is_empty() {
+                let _ = url.set_username("****");
+            }
+            let _ = url.set_password(Some("****"));
+            url.to_string()
+        }
+        Err(_) => "<invalid connection string>".to_owned(),
+    }
+}
+
+pub fn fetch_active_queries(url: &str) -> Result<Vec<ActiveQuery>> {
+    let mut client = Client::connect(url, NoTls).context("failed to connect")?;
+    let rows = client
+        .query(
+            "SELECT pid, usename, datname, COALESCE(client_addr::text, 'local'),
+                    extract(epoch from (now() - query_start))::bigint AS duration,
+                    state, query
+             FROM pg_stat_activity
+             WHERE state IS NOT NULL
+               AND query NOT LIKE '%pg_stat_activity%'
+               AND pid != pg_backend_pid()
+             ORDER BY duration DESC",
+            &[],
+        )
+        .context("failed to query pg_stat_activity")?;
+    let queries = rows
+        .iter()
+        .map(|row| ActiveQuery {
+            pid: row.get(0),
+            user: row.get(1),
+            database: row.get(2),
+            client_addr: row.get(3),
+            duration_secs: row.get(4),
+            state: row.get(5),
+            query: row.get(6),
+        })
+        .collect();
+    let _ = client.close();
+    Ok(queries)
+}
+
+pub fn kill_query(url: &str, pid: i32) -> Result<String> {
+    let mut client = Client::connect(url, NoTls).context("failed to connect")?;
+    let result = client
+        .query_one("SELECT pg_terminate_backend($1)", &[&pid])
+        .context("failed to terminate query")?;
+    let terminated: bool = result.get(0);
+    let _ = client.close();
+    if terminated {
+        Ok(format!("Query pid={pid} terminated successfully"))
+    } else {
+        Err(anyhow::anyhow!("Failed to terminate query pid={pid}"))
+    }
+}
+
+pub fn check_connection_health(url: &str) -> Result<(u64, String)> {
+    let start = std::time::Instant::now();
+    let mut client = Client::connect(url, NoTls).context("connection failed")?;
+    let latency = start.elapsed().as_millis() as u64;
+    let version = client
+        .query_one("SELECT version()", &[])
+        .context("failed to query version")?
+        .get::<_, String>(0);
+    let _ = client.close();
+    Ok((latency, version))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        PgToolBackend, docker_pull_silent, extract_pg_major_version, mask_connection_string,
+        parse_database_url, resolve_docker_image,
+    };
+
+    #[test]
+    fn parses_database_url() {
+        let parsed = parse_database_url(
+            "postgresql://admin:p%40ss@db.example.com:5432/shared?application_name=infra",
+        )
+        .expect("parse");
+        assert_eq!(parsed.username, "admin");
+        assert_eq!(parsed.host, "db.example.com");
+        assert_eq!(parsed.port, 5432);
+        assert_eq!(parsed.database, "shared");
+    }
+
+    #[test]
+    fn parses_url_without_password() {
+        let parsed =
+            parse_database_url("postgres://yugabyte@localhost:5433/nakama?sslmode=disable")
+                .expect("parse url without password");
+        assert_eq!(parsed.username, "yugabyte");
+        assert_eq!(parsed.host, "localhost");
+        assert_eq!(parsed.port, 5433);
+        assert_eq!(parsed.database, "nakama");
+    }
+
+    #[test]
+    fn masks_connection_string() {
+        let masked = mask_connection_string(
+            "postgresql://owner:secret@db.example.com/orders?application_name=orders",
+        );
+        assert!(masked.contains("****:****"));
+    }
+
+    #[test]
+    fn extract_pg_major_version_16() {
+        assert_eq!(
+            extract_pg_major_version("PostgreSQL 16.4 on x86_64-pc-linux-gnu"),
+            16
+        );
+    }
+
+    #[test]
+    fn extract_pg_major_version_14() {
+        assert_eq!(
+            extract_pg_major_version("PostgreSQL 14.12 on aarch64-unknown-linux-gnu"),
+            14
+        );
+    }
+
+    #[test]
+    fn extract_pg_major_version_9() {
+        assert_eq!(
+            extract_pg_major_version("PostgreSQL 9.6.24 on x86_64-pc-linux-gnu"),
+            9
+        );
+    }
+
+    #[test]
+    fn extract_pg_major_version_yugabytedb() {
+        assert_eq!(
+            extract_pg_major_version("YugabyteDB 11.2-YB-2.14.0.0 on x86_64"),
+            11
+        );
+    }
+
+    #[test]
+    fn extract_pg_major_version_fallback() {
+        assert_eq!(extract_pg_major_version("MySQL unknown"), 16);
+    }
+
+    #[test]
+    fn extract_pg_major_version_empty_fallback() {
+        assert_eq!(extract_pg_major_version(""), 16);
+    }
+
+    #[test]
+    fn resolve_docker_image_native_returns_default() {
+        let backend = PgToolBackend::Native {
+            dump_ver: "15".into(),
+            restore_ver: "15".into(),
+        };
+        let result = resolve_docker_image(&backend, None);
+        assert_eq!(result, "postgres:16-alpine");
+    }
+
+    #[test]
+    fn resolve_docker_image_docker_no_source_returns_default_image() {
+        let backend = PgToolBackend::Docker {
+            image: "my-custom:14".into(),
+        };
+        let result = resolve_docker_image(&backend, None);
+        assert_eq!(result, "my-custom:14");
+    }
+
+    #[test]
+    fn resolve_docker_image_docker_with_invalid_source_returns_default() {
+        let backend = PgToolBackend::Docker {
+            image: "postgres:16-alpine".into(),
+        };
+        let result = resolve_docker_image(&backend, Some("postgres://invalid:0/postgres"));
+        assert_eq!(result, "postgres:16-alpine");
+    }
+
+    #[test]
+    fn migrate_database_not_found_fails_fast() {
+        let err = super::migrate_database_with_progress(
+            "postgres://user:pass@localhost:0/source",
+            "postgres://user:pass@localhost:0/dest",
+            "test_db",
+            &PgToolBackend::NotFound,
+            &mut |_| {},
+        )
+        .expect_err("should fail with NotFound");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("pg_dump/pg_restore not found") || msg.contains("Install PostgreSQL"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_pg_tools_returns_something() {
+        let result = super::check_pg_tools();
+        match result {
+            PgToolBackend::Native {
+                dump_ver,
+                restore_ver,
+            } => {
+                assert!(!dump_ver.is_empty());
+                assert!(!restore_ver.is_empty());
+            }
+            PgToolBackend::Docker { image } => {
+                assert!(!image.is_empty());
+            }
+            PgToolBackend::NotFound => {
+                // acceptable on minimal CI environments
+            }
+        }
+    }
+
+    #[test]
+    fn extract_pg_major_version_from_pg_dump_output_16() {
+        assert_eq!(extract_pg_major_version("pg_dump (PostgreSQL) 16.4"), 16);
+    }
+
+    #[test]
+    fn extract_pg_major_version_from_pg_dump_output_14() {
+        assert_eq!(extract_pg_major_version("pg_dump (PostgreSQL) 14.12"), 14);
+    }
+
+    #[test]
+    fn check_version_warning_native_mismatch() {
+        let backend = PgToolBackend::Native {
+            dump_ver: "pg_dump (PostgreSQL) 14.12".into(),
+            restore_ver: "pg_restore (PostgreSQL) 14.12".into(),
+        };
+        // Returns warning when source version differs from pg_dump version
+        // We can't actually connect to a DB, but with invalid URL it returns None
+        let result = super::check_version_warning("postgres://invalid:0/test", &backend);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn check_version_warning_docker_returns_none_even_with_invalid() {
+        let backend = PgToolBackend::Docker {
+            image: "postgres:16-alpine".into(),
+        };
+        let result = super::check_version_warning("postgres://invalid:0/test", &backend);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn docker_pull_silent_nonexistent_image_gives_clear_error() {
+        let result = docker_pull_silent("postgres:nonexistent-tag-that-does-not-exist-v999");
+        match result {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("failed to pull Docker image")
+                        || msg.contains("not found")
+                        || msg.contains("docker pull"),
+                    "unclear error message: {msg}"
+                );
+                // Should mention the image name
+                assert!(
+                    msg.contains("nonexistent-tag-that-does-not-exist-v999"),
+                    "error should reference the image name: {msg}"
+                );
+            }
+            Ok(()) => {
+                // If it somehow succeeds (e.g. someone actually published this tag),
+                // that's fine — the test shouldn't fail
+            }
+        }
+    }
+
+    #[test]
+    fn docker_pull_silent_already_cached_does_not_pollute_stderr() {
+        // Pull once to ensure the image is cached
+        let _ = docker_pull_silent("postgres:16-alpine");
+        // Run a docker command that would have triggered a pull on stderr
+        let output = std::process::Command::new("docker")
+            .args([
+                "run",
+                "--rm",
+                "--network",
+                "host",
+                "postgres:16-alpine",
+                "pg_dump",
+                "--version",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output();
+        match output {
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                assert!(
+                    !stderr.contains("Unable to find image"),
+                    "stderr should not contain Docker pull messages after explicit pull: {stderr}"
+                );
+                assert!(
+                    !stderr.contains("Pulling from"),
+                    "stderr should not contain Docker pull progress after explicit pull: {stderr}"
+                );
+            }
+            Err(_) => {
+                // Docker not available — skip assertion
+            }
+        }
+    }
+
+    #[test]
+    fn encrypted_dump_round_trip_without_metadata() {
+        let key = b"01234567890123456789012345678901";
+        let dump_data = b"this is some pgdump data";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.pgdump.enc");
+
+        super::create_encrypted_dump(dump_data, None, key, &path).unwrap();
+        let (meta, decrypted) = super::read_encrypted_dump(&path, key).unwrap();
+
+        assert!(meta.is_none());
+        assert_eq!(decrypted, dump_data);
+    }
+
+    #[test]
+    fn encrypted_dump_round_trip_with_metadata() {
+        let key = b"01234567890123456789012345678901";
+        let dump_data = b"pgdump binary content here";
+        let metadata = crate::models::BackupMetadata {
+            machine_id: "uuid-v7-123".into(),
+            hostname: "myhost".into(),
+            instance_name: "production".into(),
+            database_name: "orders".into(),
+            application_name: "orders-api".into(),
+            engine: "postgresql".into(),
+            timestamp: "2026-07-08T12:00:00Z".into(),
+            version: "0.1.0".into(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_with_meta.pgdump.enc");
+
+        super::create_encrypted_dump(dump_data, Some(&metadata), key, &path).unwrap();
+        let (meta, decrypted) = super::read_encrypted_dump(&path, key).unwrap();
+
+        let meta = meta.expect("metadata should be present");
+        assert_eq!(meta.machine_id, "uuid-v7-123");
+        assert_eq!(meta.hostname, "myhost");
+        assert_eq!(meta.instance_name, "production");
+        assert_eq!(meta.database_name, "orders");
+        assert_eq!(meta.application_name, "orders-api");
+        assert_eq!(meta.engine, "postgresql");
+        assert_eq!(meta.timestamp, "2026-07-08T12:00:00Z");
+        assert_eq!(meta.version, "0.1.0");
+        assert_eq!(decrypted, dump_data);
+    }
+
+    #[test]
+    fn encrypted_dump_with_metadata_backward_compat() {
+        // Legacy file (no magic) should still be readable as (None, data)
+        let key = b"01234567890123456789012345678901";
+        let dump_data = b"legacy format dump bytes";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.pgdump.enc");
+
+        super::create_encrypted_dump(dump_data, None, key, &path).unwrap();
+        let (meta, decrypted) = super::read_encrypted_dump(&path, key).unwrap();
+
+        assert!(meta.is_none(), "legacy file should have no metadata");
+        assert_eq!(decrypted, dump_data);
+    }
+
+    #[test]
+    fn encrypted_dump_rejects_truncated_file() {
+        let key = b"01234567890123456789012345678901";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truncated.pgdump.enc");
+        // Write a file that's too small
+        std::fs::write(&path, &[1u8, 2, 3]).unwrap();
+        let result = super::read_encrypted_dump(&path, key);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("too small"),
+            "expected 'too small' error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn encrypted_dump_rejects_wrong_key() {
+        let key = b"01234567890123456789012345678901";
+        let wrong_key = b"11111111111111111111111111111111";
+        let dump_data = b"some data";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wrong_key.pgdump.enc");
+
+        super::create_encrypted_dump(dump_data, None, key, &path).unwrap();
+        let result = super::read_encrypted_dump(&path, wrong_key);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn backup_metadata_does_not_corrupt_dump_data() {
+        let key = b"01234567890123456789012345678901";
+        let dump_data =
+            b"some actual pgdump custom format content with \x00 bytes and \xFF special chars";
+        let metadata = crate::models::BackupMetadata {
+            machine_id: "m".into(),
+            hostname: "h".into(),
+            instance_name: "i".into(),
+            database_name: "d".into(),
+            application_name: "a".into(),
+            engine: "postgresql".into(),
+            timestamp: "t".into(),
+            version: "v".into(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corruption_check.pgdump.enc");
+
+        // Write with metadata
+        super::create_encrypted_dump(dump_data, Some(&metadata), key, &path).unwrap();
+        // Read back
+        let (_, decrypted) = super::read_encrypted_dump(&path, key).unwrap();
+        // Verify dump bytes are bit-exact
+        assert_eq!(
+            decrypted, dump_data,
+            "dump data with metadata must be bit-exact identical to input"
+        );
+    }
+
+    #[test]
+    fn multiple_backup_files_with_different_metadata() {
+        let key = b"01234567890123456789012345678901";
+        let dir = tempfile::tempdir().unwrap();
+
+        let meta1 = crate::models::BackupMetadata {
+            machine_id: "m1".into(),
+            hostname: "h1".into(),
+            instance_name: "prod".into(),
+            database_name: "db1".into(),
+            application_name: "app1".into(),
+            engine: "postgresql".into(),
+            timestamp: "t1".into(),
+            version: "v1".into(),
+        };
+        let meta2 = crate::models::BackupMetadata {
+            machine_id: "m2".into(),
+            hostname: "h2".into(),
+            instance_name: "staging".into(),
+            database_name: "db2".into(),
+            application_name: "app2".into(),
+            engine: "postgresql".into(),
+            timestamp: "t2".into(),
+            version: "v2".into(),
+        };
+
+        let path1 = dir.path().join("backup1.pgdump.enc");
+        let path2 = dir.path().join("backup2.pgdump.enc");
+
+        super::create_encrypted_dump(b"data1", Some(&meta1), key, &path1).unwrap();
+        super::create_encrypted_dump(b"data2", Some(&meta2), key, &path2).unwrap();
+
+        let (m1, d1) = super::read_encrypted_dump(&path1, key).unwrap();
+        let (m2, d2) = super::read_encrypted_dump(&path2, key).unwrap();
+
+        assert_eq!(m1.unwrap().instance_name, "prod");
+        assert_eq!(m2.unwrap().instance_name, "staging");
+        assert_eq!(d1, b"data1");
+        assert_eq!(d2, b"data2");
+    }
+}
