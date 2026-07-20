@@ -18,7 +18,7 @@ use crate::postgres::{
     parse_database_url, provision_full_with_progress, resolve_docker_image,
     restore_database_with_progress,
 };
-use crate::storage::{Storage, display_database_path};
+use crate::storage::{Storage, backup_directory, display_database_path};
 use crate::validation::{normalize_application_name, validate_database_name};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1146,11 +1146,20 @@ impl App {
             if let Some(warning) = check_version_warning(&src_cs, &backend) {
                 let _ = tx.send(WorkerEvent::Log(warning));
             }
-            let output_dir = std::path::Path::new("backups");
+            let output_dir = match backup_directory() {
+                Ok(path) => path,
+                Err(error) => {
+                    let _ = tx.send(WorkerEvent::Finished(
+                        db_name,
+                        OperationResult::Backup(Err(error.to_string())),
+                    ));
+                    return;
+                }
+            };
             let result = backup_database_with_progress(
                 &source_cs,
                 &encrypt_key,
-                output_dir,
+                &output_dir,
                 &backend,
                 Some(&metadata),
                 &mut |step| {
@@ -1190,8 +1199,14 @@ impl App {
         validate_database_name(&dest_db_name)?;
 
         let input_path = std::path::PathBuf::from(self.restore_file_path.value.trim());
+        if !input_path.is_file() {
+            anyhow::bail!(
+                "backup file does not exist or is not a regular file: {}",
+                input_path.display()
+            );
+        }
 
-        let backend = self.resolved_backend(None);
+        let backend = self.resolved_backend(Some(&dest_base_url));
         let decrypt_key = key.to_vec();
         let instance_name = dest_instance.clone();
 
@@ -1451,7 +1466,9 @@ impl App {
     }
 
     fn list_backup_files() -> Vec<BackupFile> {
-        let dir = std::path::Path::new("backups");
+        let Ok(dir) = backup_directory() else {
+            return Vec::new();
+        };
         if !dir.exists() {
             return Vec::new();
         }

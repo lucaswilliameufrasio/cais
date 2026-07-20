@@ -85,6 +85,7 @@ fn handle_home(app: &mut App, key: KeyEvent) -> Result<()> {
             HomeItem::RestoreDatabase => {
                 app.screen = Screen::RestoreDatabase;
                 app.restore_phase = RestorePhase::EnterFilePath;
+                app.focused_input = InputTarget::RestoreFilePath;
                 app.restore_file_path.clear();
                 app.restore_dest_instance = None;
                 app.restore_dest_db_name.clear();
@@ -695,10 +696,16 @@ fn handle_manage_backups(app: &mut App, key: KeyEvent) -> Result<()> {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 app.confirming_delete_backup = false;
                 if let Some(file) = app.selected_backup_file() {
-                    let _ = std::fs::remove_file(&file.path);
-                    app.refresh_backups_list();
-                    app.sync_backup_selection();
-                    app.set_status(format!("Deleted backup {}", file.filename));
+                    match std::fs::remove_file(&file.path) {
+                        Ok(()) => {
+                            app.refresh_backups_list();
+                            app.sync_backup_selection();
+                            app.set_status(format!("Deleted backup {}", file.filename));
+                        }
+                        Err(error) => {
+                            app.set_status(format!("Failed to delete {}: {error}", file.filename));
+                        }
+                    }
                 }
             }
             _ => {
@@ -725,6 +732,7 @@ fn handle_manage_backups(app: &mut App, key: KeyEvent) -> Result<()> {
             if let Some(file) = app.selected_backup_file() {
                 app.restore_file_path.value = file.path.to_string_lossy().to_string();
                 app.restore_phase = RestorePhase::EnterFilePath;
+                app.focused_input = InputTarget::RestoreFilePath;
                 app.restore_dest_instance = None;
                 app.restore_dest_db_name.clear();
                 app.screen = Screen::RestoreDatabase;

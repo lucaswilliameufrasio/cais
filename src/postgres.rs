@@ -570,7 +570,7 @@ pub fn check_pg_tools() -> PgToolBackend {
 
     if docker_ok {
         PgToolBackend::Docker {
-            image: "postgres:16-alpine".to_owned(),
+            image: "postgres:18-alpine".to_owned(),
         }
     } else {
         PgToolBackend::NotFound
@@ -602,7 +602,7 @@ pub fn resolve_docker_image(backend: &PgToolBackend, source_cs: Option<&str>) ->
                 Err(_) => image.clone(),
             }
         }
-        _ => "postgres:16-alpine".to_owned(),
+        _ => "postgres:18-alpine".to_owned(),
     }
 }
 
@@ -624,7 +624,7 @@ pub fn extract_pg_major_version(version: &str) -> u32 {
     {
         return major;
     }
-    16 // final fallback
+    0 // unknown; callers must not treat an unparseable version as compatible
 }
 
 pub fn check_version_warning(source_cs: &str, backend: &PgToolBackend) -> Option<String> {
@@ -637,11 +637,11 @@ pub fn check_version_warning(source_cs: &str, backend: &PgToolBackend) -> Option
     match backend {
         PgToolBackend::Native { dump_ver, .. } => {
             let dump_major = extract_pg_major_version(dump_ver);
-            if source_major != dump_major {
+            if source_major == 0 || dump_major == 0 || source_major < dump_major {
                 return Some(format!(
-                    "Version mismatch detected: pg_dump is v{dump_major}, \
-                     source server is PostgreSQL {source_major}. \
-                     Consider using Docker backend or install matching pg_dump."
+                    "Incompatible PostgreSQL tools: pg_dump is v{dump_major}, \
+                     source server is PostgreSQL {source_major}. Use a pg_dump version \
+                     at least as new as the source server."
                 ));
             }
         }
@@ -767,7 +767,10 @@ where
         format!("Creating database '{dest_db_name}' on target..."),
     );
 
-    let create_query = format!("CREATE DATABASE \"{}\"", escape_ident(dest_db_name));
+    let create_query = format!(
+        "CREATE DATABASE \"{}\" TEMPLATE template0",
+        escape_ident(dest_db_name)
+    );
     admin_client
         .batch_execute(&create_query)
         .context("failed to create destination database")?;
@@ -782,15 +785,21 @@ where
         ),
     );
 
-    let restore_output = match backend {
+    let restore_result = match backend {
         PgToolBackend::Native { .. } => std::process::Command::new("pg_restore")
-            .args(["--dbname", &dest_url, "--no-owner", "--no-privileges"])
+            .args([
+                "--dbname",
+                &dest_url,
+                "--no-owner",
+                "--no-privileges",
+                "--exit-on-error",
+            ])
             .arg(&dump_path)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .output()
-            .context("failed to execute pg_restore")?,
-        PgToolBackend::Docker { image } => {
+            .context("failed to execute pg_restore"),
+        PgToolBackend::Docker { image } => (|| -> Result<std::process::Output> {
             docker_pull_silent(image)?;
             let file = std::fs::File::open(&dump_path)
                 .context("failed to open dump file for pg_restore")?;
@@ -807,24 +816,31 @@ where
                     &dest_url,
                     "--no-owner",
                     "--no-privileges",
+                    "--exit-on-error",
                 ])
                 .stdin(file)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .output()
-                .context("failed to execute docker pg_restore")?
-        }
+                .context("failed to execute docker pg_restore")
+        })(),
         PgToolBackend::NotFound => unreachable!(),
+    };
+
+    let restore_output = match restore_result {
+        Ok(output) => output,
+        Err(error) => {
+            let cleanup = drop_database(&mut admin_client, dest_db_name);
+            return Err(combine_restore_cleanup_error(error, cleanup));
+        }
     };
 
     // Drop the created database if restore fails
     if !restore_output.status.success() {
         let stderr = String::from_utf8_lossy(&restore_output.stderr);
-        let _ = admin_client.batch_execute(&format!(
-            "DROP DATABASE IF EXISTS \"{}\"",
-            escape_ident(dest_db_name)
-        ));
-        anyhow::bail!("pg_restore failed: {}", stderr.trim());
+        let error = anyhow::anyhow!("pg_restore failed: {}", stderr.trim());
+        let cleanup = drop_database(&mut admin_client, dest_db_name);
+        return Err(combine_restore_cleanup_error(error, cleanup));
     }
 
     let restore_stderr = String::from_utf8_lossy(&restore_output.stderr);
@@ -895,14 +911,73 @@ pub fn create_encrypted_dump(
     };
 
     let encrypted = crate::crypto::encrypt(encrypt_key, &plaintext)?;
-    let mut file = std::fs::File::create(output_path)
-        .with_context(|| format!("failed to create {}", output_path.display()))?;
+    let partial_path = output_path.with_extension("enc.partial");
+    let mut file = std::fs::File::create(&partial_path)
+        .with_context(|| format!("failed to create {}", partial_path.display()))?;
     use std::io::Write;
     let nonce_len = encrypted.nonce.len() as u32;
-    file.write_all(&nonce_len.to_le_bytes())?;
-    file.write_all(&encrypted.nonce)?;
-    file.write_all(&encrypted.ciphertext)?;
+    let result = (|| -> Result<()> {
+        file.write_all(&nonce_len.to_le_bytes())?;
+        file.write_all(&encrypted.nonce)?;
+        file.write_all(&encrypted.ciphertext)?;
+        file.sync_all()
+            .context("failed to flush encrypted backup")?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&partial_path);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&partial_path, output_path) {
+        let _ = std::fs::remove_file(&partial_path);
+        return Err(error).with_context(|| {
+            format!(
+                "failed to publish encrypted backup to {}",
+                output_path.display()
+            )
+        });
+    }
     Ok(())
+}
+
+fn safe_filename_component(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "unnamed".to_owned()
+    } else {
+        sanitized
+    }
+}
+
+fn drop_database(client: &mut Client, database_name: &str) -> Result<()> {
+    let query = format!(
+        "DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)",
+        escape_ident(database_name)
+    );
+    client
+        .batch_execute(&query)
+        .context("failed to clean up partially restored database")
+}
+
+fn combine_restore_cleanup_error(
+    restore_error: anyhow::Error,
+    cleanup: Result<()>,
+) -> anyhow::Error {
+    match cleanup {
+        Ok(()) => restore_error,
+        Err(cleanup_error) => {
+            anyhow::anyhow!("{restore_error}; cleanup also failed: {cleanup_error}")
+        }
+    }
 }
 
 /// Reads an encrypted dump file, returns (optional metadata, decrypted dump bytes).
@@ -1029,10 +1104,17 @@ where
     let filename = if let Some(meta) = metadata {
         format!(
             "{}_{}_{}_{}.pgdump.enc",
-            meta.hostname, meta.instance_name, meta.database_name, timestamp
+            safe_filename_component(&meta.hostname),
+            safe_filename_component(&meta.instance_name),
+            safe_filename_component(&meta.database_name),
+            timestamp
         )
     } else {
-        format!("{}_{}.pgdump.enc", parsed.database, timestamp)
+        format!(
+            "{}_{}.pgdump.enc",
+            safe_filename_component(&parsed.database),
+            timestamp
+        )
     };
     let output_path = output_dir.join(&filename);
 
@@ -1117,7 +1199,10 @@ where
         format!("Creating database '{dest_db_name}' on target..."),
     );
 
-    let create_query = format!("CREATE DATABASE \"{}\"", escape_ident(dest_db_name));
+    let create_query = format!(
+        "CREATE DATABASE \"{}\" TEMPLATE template0",
+        escape_ident(dest_db_name)
+    );
     admin_client
         .batch_execute(&create_query)
         .context("failed to create destination database")?;
@@ -1132,15 +1217,21 @@ where
         ),
     );
 
-    let restore_output = match backend {
+    let restore_result = match backend {
         PgToolBackend::Native { .. } => std::process::Command::new("pg_restore")
-            .args(["--dbname", &dest_url, "--no-owner", "--no-privileges"])
+            .args([
+                "--dbname",
+                &dest_url,
+                "--no-owner",
+                "--no-privileges",
+                "--exit-on-error",
+            ])
             .arg(&dump_path)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .output()
-            .context("failed to execute pg_restore")?,
-        PgToolBackend::Docker { image } => {
+            .context("failed to execute pg_restore"),
+        PgToolBackend::Docker { image } => (|| -> Result<std::process::Output> {
             docker_pull_silent(image)?;
             let file = std::fs::File::open(&dump_path)
                 .context("failed to open dump file for pg_restore")?;
@@ -1157,23 +1248,30 @@ where
                     &dest_url,
                     "--no-owner",
                     "--no-privileges",
+                    "--exit-on-error",
                 ])
                 .stdin(file)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .output()
-                .context("failed to execute docker pg_restore")?
-        }
+                .context("failed to execute docker pg_restore")
+        })(),
         PgToolBackend::NotFound => unreachable!(),
+    };
+
+    let restore_output = match restore_result {
+        Ok(output) => output,
+        Err(error) => {
+            let cleanup = drop_database(&mut admin_client, dest_db_name);
+            return Err(combine_restore_cleanup_error(error, cleanup));
+        }
     };
 
     if !restore_output.status.success() {
         let stderr = String::from_utf8_lossy(&restore_output.stderr);
-        let _ = admin_client.batch_execute(&format!(
-            "DROP DATABASE IF EXISTS \"{}\"",
-            escape_ident(dest_db_name)
-        ));
-        anyhow::bail!("pg_restore failed: {}", stderr.trim());
+        let error = anyhow::anyhow!("pg_restore failed: {}", stderr.trim());
+        let cleanup = drop_database(&mut admin_client, dest_db_name);
+        return Err(combine_restore_cleanup_error(error, cleanup));
     }
 
     let restore_stderr = String::from_utf8_lossy(&restore_output.stderr);
@@ -1358,12 +1456,12 @@ mod tests {
 
     #[test]
     fn extract_pg_major_version_fallback() {
-        assert_eq!(extract_pg_major_version("MySQL unknown"), 16);
+        assert_eq!(extract_pg_major_version("MySQL unknown"), 0);
     }
 
     #[test]
     fn extract_pg_major_version_empty_fallback() {
-        assert_eq!(extract_pg_major_version(""), 16);
+        assert_eq!(extract_pg_major_version(""), 0);
     }
 
     #[test]
@@ -1373,7 +1471,7 @@ mod tests {
             restore_ver: "15".into(),
         };
         let result = resolve_docker_image(&backend, None);
-        assert_eq!(result, "postgres:16-alpine");
+        assert_eq!(result, "postgres:18-alpine");
     }
 
     #[test]
@@ -1591,7 +1689,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("truncated.pgdump.enc");
         // Write a file that's too small
-        std::fs::write(&path, &[1u8, 2, 3]).unwrap();
+        std::fs::write(&path, [1u8, 2, 3]).unwrap();
         let result = super::read_encrypted_dump(&path, key);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();

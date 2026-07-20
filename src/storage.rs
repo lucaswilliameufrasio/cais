@@ -791,6 +791,13 @@ fn database_path() -> Result<PathBuf> {
     Ok(project_dirs.data_dir().join("data.sqlite"))
 }
 
+/// Returns the stable application-owned directory for encrypted backups.
+pub fn backup_directory() -> Result<PathBuf> {
+    let project_dirs = ProjectDirs::from("com", "lucaseufrasiojcpm", "db-provisioner-tui")
+        .context("failed to resolve app data directory")?;
+    Ok(project_dirs.data_dir().join("backups"))
+}
+
 pub fn display_database_path() -> Result<String> {
     Ok(database_path()?.display().to_string())
 }
