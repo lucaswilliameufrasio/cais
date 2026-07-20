@@ -1836,8 +1836,9 @@ pub fn check_connection_health(url: &str) -> Result<(u64, String)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        INSTANCE_BACKUP_MAGIC, PgToolBackend, docker_pull_silent, extract_pg_major_version,
-        mask_connection_string, parse_database_url, read_instance_backup, resolve_docker_image,
+        INSTANCE_BACKUP_MAGIC, PgToolBackend, docker_pull_silent, error_string_database_exists,
+        extract_pg_major_version, mask_connection_string, parse_database_url, read_instance_backup,
+        resolve_docker_image,
     };
 
     #[test]
@@ -2270,5 +2271,56 @@ mod tests {
         assert_eq!(m2.unwrap().instance_name, "staging");
         assert_eq!(d1, b"data1");
         assert_eq!(d2, b"data2");
+    }
+
+    #[test]
+    fn error_string_database_exists_positive() {
+        let error = anyhow::anyhow!("database 'my_db' already exists on the target cluster");
+        assert!(error_string_database_exists(&error));
+    }
+
+    #[test]
+    fn error_string_database_exists_negative() {
+        let error = anyhow::anyhow!("connection refused");
+        assert!(!error_string_database_exists(&error));
+    }
+
+    #[test]
+    fn is_instance_backup_detects_dbp2() {
+        let key = b"01234567890123456789012345678901";
+        let manifest = serde_json::json!({
+            "format": "DBP2",
+            "source_instance": "src",
+            "source_version": "17",
+            "created_at": "now",
+            "databases": ["db1"],
+            "includes_globals": false,
+            "include_role_passwords": false,
+            "tablespace_mode": "flatten"
+        });
+        let manifest = serde_json::to_vec(&manifest).unwrap();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&INSTANCE_BACKUP_MAGIC);
+        payload.extend_from_slice(&(manifest.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&manifest);
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(&(3u32).to_le_bytes());
+        payload.extend_from_slice(b"db1");
+        payload.extend_from_slice(&4u64.to_le_bytes());
+        payload.extend_from_slice(b"data");
+        payload.extend_from_slice(&0u64.to_le_bytes()); // empty globals
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.cluster.pgdump.enc");
+        super::create_encrypted_dump(&payload, None, key, &path).unwrap();
+        assert!(super::is_instance_backup(&path, key).unwrap());
+    }
+
+    #[test]
+    fn is_instance_backup_rejects_dbp1() {
+        let key = b"01234567890123456789012345678901";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.pgdump.enc");
+        super::create_encrypted_dump(b"some dump data", None, key, &path).unwrap();
+        assert!(!super::is_instance_backup(&path, key).unwrap());
     }
 }

@@ -233,6 +233,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tablespace_mode_default_is_flatten() {
+        assert_eq!(TablespaceMode::default(), TablespaceMode::Flatten);
+    }
+
+    #[test]
+    fn backup_config_defaults() {
+        let config = BackupConfig::default();
+        assert!(config.include_globals);
+        assert!(!config.include_role_passwords);
+        assert_eq!(config.tablespace_mode, TablespaceMode::Flatten);
+    }
+
+    #[test]
+    fn conflict_policy_default_is_skip() {
+        assert_eq!(ConflictPolicy::default(), ConflictPolicy::Skip);
+    }
+
+    #[test]
     fn database_engine_default_is_postgresql() {
         assert_eq!(DatabaseEngine::default(), DatabaseEngine::PostgreSQL);
     }

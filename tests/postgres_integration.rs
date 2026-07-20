@@ -18,6 +18,10 @@ struct DockerPostgres {
 
 impl DockerPostgres {
     fn start() -> Self {
+        Self::start_with_tag("postgres:17")
+    }
+
+    fn start_with_tag(tag: &str) -> Self {
         let name = format!("db-provisioner-tui-{}", uuid::Uuid::new_v4());
         let port = 55432 + (uuid::Uuid::new_v4().as_u128() % 1000) as u16;
 
@@ -36,7 +40,7 @@ impl DockerPostgres {
                 "POSTGRES_DB=postgres",
                 "-p",
                 &format!("{port}:5432"),
-                "postgres:17",
+                tag,
             ])
             .status()
             .expect("docker run");
@@ -565,6 +569,132 @@ fn migrate_database_dest_already_exists() {
         err.to_string().contains("already exists"),
         "expected 'already exists' error, got: {err}"
     );
+}
+
+#[test]
+fn migrate_database_17_to_18_via_docker() {
+    if std::env::var("RUN_DOCKER_TESTS").ok().as_deref() != Some("1") {
+        return;
+    }
+
+    let source = DockerPostgres::start_with_tag("postgres:17");
+    let dest = DockerPostgres::start_with_tag("postgres:18");
+
+    let db_name = "upgrade_test";
+    {
+        let mut client = Client::connect(&source.url(), NoTls).expect("connect source");
+        client
+            .batch_execute(&format!("CREATE DATABASE \"{db_name}\""))
+            .expect("create source db");
+    }
+    {
+        let source_db_url = source.db_url(db_name);
+        let mut client = Client::connect(&source_db_url, NoTls).expect("connect source db");
+        client
+            .batch_execute("CREATE TABLE items (id SERIAL PRIMARY KEY, value TEXT)")
+            .expect("create table");
+        client
+            .execute("INSERT INTO items (value) VALUES ($1)", &[&"17to18"])
+            .expect("insert");
+    }
+
+    // Use PostgreSQL 18 tools to dump the 17 source and restore into 18 dest
+    let image = "postgres:18-alpine";
+    let source_cs = source.db_url(db_name);
+    migrate_database_with_progress(
+        &source_cs,
+        &dest.url(),
+        db_name,
+        &PgToolBackend::Docker {
+            image: image.to_owned(),
+        },
+        &mut |_| {},
+    )
+    .expect("17→18 migration via Docker");
+
+    let dest_db_url = dest.db_url(db_name);
+    let mut client = Client::connect(&dest_db_url, NoTls).expect("connect dest db");
+    let rows: Vec<String> = client
+        .query("SELECT value FROM items ORDER BY id", &[])
+        .expect("query dest")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(rows, vec!["17to18"]);
+}
+
+#[test]
+fn backup_and_restore_instance_17_to_18() {
+    if std::env::var("RUN_DOCKER_TESTS").ok().as_deref() != Some("1") {
+        return;
+    }
+
+    let source = DockerPostgres::start_with_tag("postgres:17");
+    let dest = DockerPostgres::start_with_tag("postgres:18");
+
+    let db_names = ["orders", "catalog"];
+    for db_name in &db_names {
+        {
+            let mut client = Client::connect(&source.url(), NoTls).expect("connect source");
+            client
+                .batch_execute(&format!("CREATE DATABASE \"{db_name}\""))
+                .expect("create source db");
+        }
+        let db_url = source.db_url(db_name);
+        let mut client = Client::connect(&db_url, NoTls).expect("connect source db");
+        client
+            .batch_execute("CREATE TABLE data (id SERIAL PRIMARY KEY, name TEXT)")
+            .expect("create table");
+        client
+            .execute("INSERT INTO data (name) VALUES ($1)", &[&db_name])
+            .expect("insert");
+    }
+
+    let image = "postgres:18-alpine";
+    let backend = PgToolBackend::Docker {
+        image: image.to_owned(),
+    };
+    let key = b"01234567890123456789012345678901";
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let outcome = backup_instance_with_progress(
+        &source.url(),
+        key,
+        dir.path(),
+        &backend,
+        InstanceBackupContext {
+            instance_name: "instance17",
+            machine_id: "m17",
+            hostname: "h17",
+        },
+        &db_names.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        &BackupConfig::default(),
+        &mut |_| {},
+    )
+    .expect("instance backup 17→18");
+
+    let restored = restore_instance_with_progress(
+        std::path::Path::new(&outcome.file_path),
+        key,
+        &dest.url(),
+        &backend,
+        ConflictPolicy::Skip,
+        &mut |_| {},
+    )
+    .expect("instance restore 17→18");
+    assert_eq!(restored.len(), 2);
+
+    for db_name in &db_names {
+        let db_url = dest.db_url(db_name);
+        let mut client = Client::connect(&db_url, NoTls).expect("connect dest db");
+        let rows: Vec<String> = client
+            .query("SELECT name FROM data ORDER BY id", &[])
+            .expect("query")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(rows, vec![db_name.to_string()]);
+    }
 }
 
 #[test]
