@@ -1,6 +1,6 @@
 # cais
 
-PostgreSQL operations TUI — provision, migrate, backup, and restore from the terminal.
+**Cais** (português para *wharf/dock*) — o lugar onde bancos de dados atracam, embarcam e desembarcam dados. Uma ferramenta TUI para operações com PostgreSQL: provisionar, migrar, fazer backup e restaurar.
 
 Secrets are encrypted with AES-256-GCM (Argon2id key derivation) and stored in a local SQLite database.
 
