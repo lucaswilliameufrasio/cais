@@ -2,13 +2,13 @@ use std::io::{self, stdout};
 use std::time::Duration;
 
 use anyhow::Result;
+use cais::app::App;
+use cais::ui;
 use crossterm::{
     event::{self, Event},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use db_provisioner_tui::app::App;
-use db_provisioner_tui::ui;
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 fn main() -> Result<()> {
@@ -35,7 +35,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
 
         if event::poll(Duration::from_millis(200))?
             && let Event::Key(key) = event::read()?
-            && let Err(error) = db_provisioner_tui::app::handle_key_event(&mut app, key)
+            && let Err(error) = cais::app::handle_key_event(&mut app, key)
         {
             app.set_status(format!("Error: {error:#}"));
         }

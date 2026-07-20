@@ -199,6 +199,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
+name = "cais"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "argon2",
+ "aws-lc-rs",
+ "base64",
+ "chrono",
+ "crossterm",
+ "directories",
+ "postgres",
+ "ratatui",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "url",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "castaway"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -426,30 +450,6 @@ dependencies = [
  "darling_core",
  "quote",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "db-provisioner-tui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "argon2",
- "aws-lc-rs",
- "base64",
- "chrono",
- "crossterm",
- "directories",
- "postgres",
- "ratatui",
- "regex",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "url",
- "uuid",
- "zeroize",
 ]
 
 [[package]]

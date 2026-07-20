@@ -1,10 +1,10 @@
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use db_provisioner_tui::models::{
+use cais::models::{
     BackupConfig, ConflictPolicy, ExtraUserProvisionRequest, PgToolBackend, ProvisionRequest,
 };
-use db_provisioner_tui::postgres::{
+use cais::postgres::{
     InstanceBackupContext, backup_instance_with_progress, check_pg_tools,
     migrate_database_with_progress, provision_database_with_progress,
     provision_extra_user_with_progress, restore_instance_with_progress,
@@ -418,9 +418,9 @@ fn migrate_database_via_docker() {
     let source_cs = source.db_url(db_name);
 
     // detect the source version so we use a matching pg_dump image
-    let source_version = db_provisioner_tui::postgres::detect_source_version(&source_cs)
-        .expect("detect source version");
-    let major = db_provisioner_tui::postgres::extract_pg_major_version(&source_version);
+    let source_version =
+        cais::postgres::detect_source_version(&source_cs).expect("detect source version");
+    let major = cais::postgres::extract_pg_major_version(&source_version);
     let docker_image = format!("postgres:{major}-alpine");
     let dest_db_name = "migrated_via_docker";
 
@@ -540,9 +540,9 @@ fn migrate_database_dest_already_exists() {
             .expect("create dest db upfront");
     }
 
-    let source_version = db_provisioner_tui::postgres::detect_source_version(&source_cs)
-        .expect("detect source version");
-    let major = db_provisioner_tui::postgres::extract_pg_major_version(&source_version);
+    let source_version =
+        cais::postgres::detect_source_version(&source_cs).expect("detect source version");
+    let major = cais::postgres::extract_pg_major_version(&source_version);
     let docker_image = format!("postgres:{major}-alpine");
 
     let backend = match check_pg_tools() {
@@ -732,9 +732,8 @@ fn backup_and_restore_instance_via_docker() {
     // Back up the entire instance
     let key = b"01234567890123456789012345678901";
     let dir = tempfile::tempdir().expect("tempdir");
-    let source_version =
-        db_provisioner_tui::postgres::detect_source_version(&source.url()).unwrap_or_default();
-    let major = db_provisioner_tui::postgres::extract_pg_major_version(&source_version);
+    let source_version = cais::postgres::detect_source_version(&source.url()).unwrap_or_default();
+    let major = cais::postgres::extract_pg_major_version(&source_version);
     let backend = PgToolBackend::Docker {
         image: format!("postgres:{major}-alpine"),
     };

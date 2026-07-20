@@ -121,11 +121,7 @@ fn draw_home(frame: &mut Frame<'_>, app: &mut App) {
         .map(|item| ListItem::new(item.label()))
         .collect();
     let list = List::new(items)
-        .block(
-            Block::default()
-                .title("db-provisioner-tui")
-                .borders(Borders::ALL),
-        )
+        .block(Block::default().title("cais").borders(Borders::ALL))
         .highlight_style(Style::default().add_modifier(Modifier::BOLD))
         .highlight_symbol(">> ");
 

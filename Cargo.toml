@@ -1,5 +1,5 @@
 [package]
-name = "db-provisioner-tui"
+name = "cais"
 version = "0.1.0"
 edition = "2024"
 

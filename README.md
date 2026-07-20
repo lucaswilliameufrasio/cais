@@ -1,6 +1,6 @@
-# db-provisioner-tui
+# cais
 
-Rust TUI for provisioning PostgreSQL databases, managing migration, backup, and restore — all from the terminal.
+PostgreSQL operations TUI — provision, migrate, backup, and restore from the terminal.
 
 Secrets are encrypted with AES-256-GCM (Argon2id key derivation) and stored in a local SQLite database.
 
@@ -151,8 +151,8 @@ About screen shows tool versions (native pg_dump or Docker image).
 
 The SQLite database is stored in the platform app data directory:
 
-- **macOS**: `~/Library/Application Support/db-provisioner-tui/data.sqlite`
-- **Linux**: `~/.local/share/db-provisioner-tui/data.sqlite`
+- **macOS**: `~/Library/Application Support/com.lucaseufrasiojcpm.cais/data.sqlite`
+- **Linux**: `~/.local/share/com.lucaseufrasiojcpm.cais/data.sqlite`
 
 ### Stored data
 

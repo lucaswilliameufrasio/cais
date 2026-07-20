@@ -8,7 +8,7 @@ use crate::models::{EncryptedValue, KdfConfig};
 
 const KEY_LEN: usize = 32;
 const NONCE_LEN: usize = 12;
-const PASSWORD_CHECK_VALUE: &[u8] = b"db-provisioner-tui:ok";
+const PASSWORD_CHECK_VALUE: &[u8] = b"cais:ok";
 
 pub fn default_kdf_config() -> Result<KdfConfig> {
     Ok(KdfConfig {
