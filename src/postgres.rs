@@ -1524,6 +1524,7 @@ pub fn restore_database_with_progress<F>(
     dest_base_url: &str,
     dest_db_name: &str,
     backend: &PgToolBackend,
+    conflict_policy: ConflictPolicy,
     emit: &mut F,
 ) -> Result<ProvisionFullOutcome>
 where
@@ -1575,22 +1576,57 @@ where
         .is_some();
 
     if db_exists {
-        anyhow::bail!("database '{dest_db_name}' already exists on the target cluster");
+        match conflict_policy {
+            ConflictPolicy::Fail => {
+                anyhow::bail!("database '{dest_db_name}' already exists on the target cluster");
+            }
+            ConflictPolicy::Skip => {
+                push_step(
+                    &mut Vec::new(),
+                    emit,
+                    format!("  [skip] '{dest_db_name}' already exists — leaving untouched"),
+                );
+                let parsed = parse_database_url(dest_base_url)?;
+                let dest_url = target_url(dest_base_url, dest_db_name)?;
+                return Ok(ProvisionFullOutcome {
+                    database_name: dest_db_name.to_owned(),
+                    application_name: dest_db_name.to_owned(),
+                    role_name: parsed.username,
+                    database_connection_string: dest_url,
+                    database_created: false,
+                    role_created: false,
+                    extra_username: None,
+                    extra_connection_string: None,
+                    extra_role_created: None,
+                    extra_grants_applied: None,
+                });
+            }
+            ConflictPolicy::Replace => {
+                push_step(
+                    &mut Vec::new(),
+                    emit,
+                    format!("Dropping existing database '{dest_db_name}' with (FORCE)..."),
+                );
+                drop_database(&mut admin_client, dest_db_name)?;
+            }
+        }
     }
 
-    push_step(
-        &mut Vec::new(),
-        emit,
-        format!("Creating database '{dest_db_name}' on target..."),
-    );
+    if !db_exists || conflict_policy == ConflictPolicy::Replace {
+        push_step(
+            &mut Vec::new(),
+            emit,
+            format!("Creating database '{dest_db_name}' on target..."),
+        );
 
-    let create_query = format!(
-        "CREATE DATABASE \"{}\" TEMPLATE template0",
-        escape_ident(dest_db_name)
-    );
-    admin_client
-        .batch_execute(&create_query)
-        .context("failed to create destination database")?;
+        let create_query = format!(
+            "CREATE DATABASE \"{}\" TEMPLATE template0",
+            escape_ident(dest_db_name)
+        );
+        admin_client
+            .batch_execute(&create_query)
+            .context("failed to create destination database")?;
+    }
 
     let dest_url = target_url(dest_base_url, dest_db_name)?;
     push_step(
@@ -1722,6 +1758,7 @@ where
                 dest_base_url,
                 &database_name,
                 backend,
+                on_conflict,
                 emit,
             )
         })();

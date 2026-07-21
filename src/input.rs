@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use crate::app::{
     App, BackupPhase, HomeItem, InputTarget, MigratePhase, RestorePhase, Screen, SettingsItem,
 };
-use crate::models::SavedConnectionRecord;
+use crate::models::{ConflictPolicy, SavedConnectionRecord};
 
 pub fn handle_key_event(app: &mut App, key: KeyEvent) -> Result<()> {
     match app.screen {
@@ -378,8 +378,7 @@ fn handle_restore_database(app: &mut App, key: KeyEvent) -> Result<()> {
                 }
                 KeyCode::Enter if len > 0 => {
                     app.restore_dest_instance = Some(app.instances[app.restore_dest_idx].clone());
-                    app.restore_phase = RestorePhase::EnterDestDbName;
-                    app.focused_input = InputTarget::RestoreDestDbName;
+                    app.prepare_restore_preview()?;
                 }
                 _ => {}
             }
@@ -394,6 +393,24 @@ fn handle_restore_database(app: &mut App, key: KeyEvent) -> Result<()> {
                 app.start_restore_database()?;
             }
             _ => edit_text_field(app, key),
+        },
+        RestorePhase::PreviewBundle => match key.code {
+            KeyCode::Esc => {
+                app.restore_phase = RestorePhase::SelectDestInstance;
+                app.restore_dest_instance = None;
+                app.restore_preview_databases.clear();
+            }
+            KeyCode::Char('c') | KeyCode::Char('C') => {
+                app.restore_conflict_policy = match app.restore_conflict_policy {
+                    ConflictPolicy::Fail => ConflictPolicy::Skip,
+                    ConflictPolicy::Skip => ConflictPolicy::Replace,
+                    ConflictPolicy::Replace => ConflictPolicy::Fail,
+                };
+            }
+            KeyCode::Enter => {
+                app.start_restore_database()?;
+            }
+            _ => {}
         },
         RestorePhase::Running => {
             if let KeyCode::Esc = key.code {

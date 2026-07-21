@@ -168,6 +168,7 @@ pub enum RestorePhase {
     EnterFilePath,
     SelectDestInstance,
     EnterDestDbName,
+    PreviewBundle,
     Running,
 }
 
@@ -280,6 +281,11 @@ pub struct App {
     pub restore_dest_idx: usize,
     pub restore_dest_instance: Option<String>,
     pub restore_dest_db_name: TextField,
+    pub restore_conflict_policy: ConflictPolicy,
+    pub restore_preview_databases: Vec<String>,
+    pub restore_preview_globals: bool,
+    pub restore_preview_source_version: String,
+    pub restore_preview_source_instance: String,
     pub home_list_state: ListState,
     pub settings_list_state: ListState,
     pub saved_connections_list_state: ListState,
@@ -402,6 +408,11 @@ impl App {
             restore_dest_idx: 0,
             restore_dest_instance: None,
             restore_dest_db_name: TextField::new("Destination database name", false),
+            restore_conflict_policy: ConflictPolicy::Skip,
+            restore_preview_databases: Vec::new(),
+            restore_preview_globals: false,
+            restore_preview_source_version: String::new(),
+            restore_preview_source_instance: String::new(),
             home_list_state,
             settings_list_state,
             saved_connections_list_state,
@@ -806,6 +817,8 @@ impl App {
                             self.restore_file_path.clear();
                             self.restore_dest_instance = None;
                             self.restore_dest_db_name.clear();
+                            self.restore_preview_databases.clear();
+                            self.restore_conflict_policy = ConflictPolicy::Skip;
                         }
                         _ => {}
                     }
@@ -1266,6 +1279,29 @@ impl App {
         })
     }
 
+    pub fn prepare_restore_preview(&mut self) -> Result<()> {
+        let key = self.session_key()?;
+        let input_path = std::path::PathBuf::from(self.restore_file_path.value.trim());
+        if !input_path.is_file() {
+            anyhow::bail!("backup file does not exist or is not a regular file");
+        }
+        if crate::postgres::is_instance_backup(&input_path, key)? {
+            let contents = crate::postgres::read_instance_backup(&input_path, key)?;
+            self.restore_preview_databases = contents.databases;
+            self.restore_preview_globals = !contents.globals.is_empty();
+            self.restore_preview_source_instance =
+                self.restore_dest_instance.clone().unwrap_or_default();
+            self.restore_preview_source_version = String::new();
+            self.restore_conflict_policy = ConflictPolicy::Skip;
+            self.restore_phase = RestorePhase::PreviewBundle;
+        } else {
+            self.restore_conflict_policy = ConflictPolicy::Fail;
+            self.restore_phase = RestorePhase::EnterDestDbName;
+            self.focused_input = InputTarget::RestoreDestDbName;
+        }
+        Ok(())
+    }
+
     pub fn start_restore_database(&mut self) -> Result<()> {
         if self.pending_operation {
             anyhow::bail!("an operation is already running")
@@ -1334,6 +1370,7 @@ impl App {
                     &dest_base_url,
                     &dest_db_name,
                     &backend,
+                    ConflictPolicy::Fail,
                     &mut |step| {
                         let _ = tx.send(WorkerEvent::Log(step.to_owned()));
                     },

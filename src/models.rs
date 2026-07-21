@@ -155,6 +155,7 @@ pub enum ConflictPolicy {
     Fail,
     #[default]
     Skip,
+    Replace,
 }
 
 #[derive(Debug, Clone)]

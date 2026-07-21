@@ -11,7 +11,7 @@ use crate::app::{
     App, BackupPhase, HealthStatus, HomeItem, InputTarget, MigratePhase, RestorePhase, Screen,
     SettingsItem, TextField,
 };
-use crate::models::{PgToolBackend, SavedConnectionRecord};
+use crate::models::{ConflictPolicy, PgToolBackend, SavedConnectionRecord};
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
     match app.screen {
@@ -1375,6 +1375,57 @@ fn draw_restore_database(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
                 centered_rect(frame.area(), 80, 100),
                 app,
                 "Enter DB name and press Enter to start restore. Esc back.",
+            );
+        }
+        RestorePhase::PreviewBundle => {
+            let layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(8), Constraint::Length(5)])
+                .split(frame.area());
+
+            let conflict_label = match app.restore_conflict_policy {
+                ConflictPolicy::Fail => "Fail",
+                ConflictPolicy::Skip => "Skip",
+                ConflictPolicy::Replace => "Replace",
+            };
+            let globals_label = if app.restore_preview_globals {
+                "yes"
+            } else {
+                "no"
+            };
+
+            let lines: Vec<Line<'_>> = {
+                let mut lines = vec![
+                    Line::from(format!("Source: {}", app.restore_preview_source_instance)),
+                    Line::from(format!("Version: {}", app.restore_preview_source_version)),
+                    Line::from(format!(
+                        "Databases: {}",
+                        app.restore_preview_databases.join(", ")
+                    )),
+                    Line::from(format!("Cluster globals included: {globals_label}")),
+                    Line::from(""),
+                    Line::from(format!("[C] Conflict policy: {conflict_label}")),
+                ];
+                if app.restore_conflict_policy == ConflictPolicy::Replace {
+                    lines.push(Line::from(
+                        "  ⚠ Existing databases will be DROPPED and recreated",
+                    ));
+                }
+                lines
+            };
+
+            let paragraph = Paragraph::new(lines).block(
+                Block::default()
+                    .title("Instance Restore Preview")
+                    .borders(Borders::ALL),
+            );
+            frame.render_widget(paragraph, layout[0]);
+
+            draw_footer(
+                frame,
+                layout[1],
+                app,
+                "C: toggle conflict policy  Enter: start restore  Esc: back",
             );
         }
         RestorePhase::Running => {
