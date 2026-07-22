@@ -2,6 +2,14 @@
 name = "cais"
 version = "0.1.0"
 edition = "2024"
+default-run = "cais"
+repository = "https://github.com/lucaswilliameufrasio/cais"
+authors = ["Lucas Eufrasio"]
+license = "MIT"
+
+[profile.dist]
+inherits = "release"
+lto = "thin"
 
 [dependencies]
 anyhow = "1.0.102"
