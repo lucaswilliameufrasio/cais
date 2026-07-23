@@ -845,6 +845,12 @@ impl App {
         result: Result<ProvisionFullOutcome, String>,
     ) -> Result<()> {
         match result {
+            Ok(outcome) if !outcome.database_created => {
+                self.push_log(format!(
+                    "  [skip] '{}' — not saved to catalog",
+                    outcome.database_name
+                ));
+            }
             Ok(outcome) => {
                 let key = self.session_key()?.to_vec();
                 let db_encrypted =
@@ -915,11 +921,27 @@ impl App {
     ) -> Result<()> {
         match result {
             Ok(outcomes) => {
-                let count = outcomes.len();
+                let restored_count = outcomes.iter().filter(|o| o.database_created).count();
+                let skipped_count = outcomes.len() - restored_count;
                 for outcome in outcomes {
-                    self.finish_full_operation(instance_name.clone(), Ok(outcome))?;
+                    if outcome.database_created {
+                        self.finish_full_operation(instance_name.clone(), Ok(outcome))?;
+                    } else {
+                        self.push_log(format!(
+                            "  [skip] '{}' — already existed, left untouched",
+                            outcome.database_name
+                        ));
+                    }
                 }
-                self.set_status(format!("Restored {count} databases in {instance_name}"));
+                self.set_status(format!(
+                    "Restored {} database(s) in {instance_name}{}",
+                    restored_count,
+                    if skipped_count > 0 {
+                        format!(" ({} skipped)", skipped_count)
+                    } else {
+                        String::new()
+                    },
+                ));
             }
             Err(error) => {
                 self.push_log(format!("Restore failed: {error}"));
@@ -1288,10 +1310,9 @@ impl App {
         if crate::postgres::is_instance_backup(&input_path, key)? {
             let contents = crate::postgres::read_instance_backup(&input_path, key)?;
             self.restore_preview_databases = contents.databases;
-            self.restore_preview_globals = !contents.globals.is_empty();
-            self.restore_preview_source_instance =
-                self.restore_dest_instance.clone().unwrap_or_default();
-            self.restore_preview_source_version = String::new();
+            self.restore_preview_globals = contents.includes_globals;
+            self.restore_preview_source_instance = contents.source_instance;
+            self.restore_preview_source_version = contents.source_version;
             self.restore_conflict_policy = ConflictPolicy::Skip;
             self.restore_phase = RestorePhase::PreviewBundle;
         } else {
@@ -1371,6 +1392,7 @@ impl App {
                     &dest_db_name,
                     &backend,
                     ConflictPolicy::Fail,
+                    false,
                     &mut |step| {
                         let _ = tx.send(WorkerEvent::Log(step.to_owned()));
                     },

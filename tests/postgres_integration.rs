@@ -792,7 +792,200 @@ fn backup_and_restore_instance_via_docker() {
     )
     .expect("second restore should not fail");
     assert!(
-        restored2.is_empty(),
-        "skip policy should yield no new restores"
+        restored2.iter().all(|o| !o.database_created),
+        "skip policy should yield no new restores (all database_created should be false)"
+    );
+}
+
+#[test]
+fn restore_with_replace_replaces_existing_data() {
+    if std::env::var("RUN_DOCKER_TESTS").ok().as_deref() != Some("1") {
+        return;
+    }
+
+    let source = DockerPostgres::start();
+    let dest = DockerPostgres::start();
+
+    let db_name = "replace_me";
+
+    // Create source database with data
+    {
+        let mut client = Client::connect(&source.url(), NoTls).expect("connect source");
+        client
+            .batch_execute(&format!("CREATE DATABASE \"{db_name}\""))
+            .expect("create source db");
+    }
+    {
+        let db_url = source.db_url(db_name);
+        let mut client = Client::connect(&db_url, NoTls).expect("connect source db");
+        client
+            .batch_execute("CREATE TABLE items (id SERIAL PRIMARY KEY, value TEXT)")
+            .expect("create table");
+        client
+            .execute("INSERT INTO items (value) VALUES ($1)", &[&"new_data"])
+            .expect("insert");
+    }
+
+    // Create destination database with DIFFERENT data
+    {
+        let mut client = Client::connect(&dest.url(), NoTls).expect("connect dest");
+        client
+            .batch_execute(&format!("CREATE DATABASE \"{db_name}\""))
+            .expect("create dest db");
+    }
+    {
+        let db_url = dest.db_url(db_name);
+        let mut client = Client::connect(&db_url, NoTls).expect("connect dest db");
+        client
+            .batch_execute("CREATE TABLE items (id SERIAL PRIMARY KEY, value TEXT)")
+            .expect("create table");
+        client
+            .execute("INSERT INTO items (value) VALUES ($1)", &[&"old_data"])
+            .expect("insert old data");
+    }
+
+    // Backup source instance
+    let key = b"01234567890123456789012345678901";
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source_version = cais::postgres::detect_source_version(&source.url()).unwrap_or_default();
+    let major = cais::postgres::extract_pg_major_version(&source_version);
+    let backend = PgToolBackend::Docker {
+        image: format!("postgres:{major}-alpine"),
+    };
+    let outcome = backup_instance_with_progress(
+        &source.url(),
+        key,
+        dir.path(),
+        &backend,
+        InstanceBackupContext {
+            instance_name: "replace-test",
+            machine_id: "replace-machine",
+            hostname: "replace-host",
+        },
+        &[db_name.to_string()],
+        &BackupConfig::default(),
+        &mut |_| {},
+    )
+    .expect("instance backup for replace test");
+
+    // Restore with Replace policy — should drop old database and recreate with new data
+    let restored = restore_instance_with_progress(
+        std::path::Path::new(&outcome.file_path),
+        key,
+        &dest.url(),
+        &backend,
+        ConflictPolicy::Replace,
+        &mut |_| {},
+    )
+    .expect("replace restore should succeed");
+    assert_eq!(restored.len(), 1, "one database should be restored");
+
+    // Verify old data is gone and new data is present
+    let dest_db_url = dest.db_url(db_name);
+    let mut client = Client::connect(&dest_db_url, NoTls).expect("connect dest db after replace");
+    let rows: Vec<String> = client
+        .query("SELECT value FROM items ORDER BY id", &[])
+        .expect("query after replace")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(
+        rows,
+        vec!["new_data"],
+        "old data should be replaced by new data"
+    );
+}
+
+#[test]
+fn restore_with_replace_works_17_to_18() {
+    if std::env::var("RUN_DOCKER_TESTS").ok().as_deref() != Some("1") {
+        return;
+    }
+
+    let source = DockerPostgres::start_with_tag("postgres:17");
+    let dest = DockerPostgres::start_with_tag("postgres:18");
+
+    let db_name = "upgrade_replace";
+
+    // Create source db with data
+    {
+        let mut client = Client::connect(&source.url(), NoTls).expect("connect source");
+        client
+            .batch_execute(&format!("CREATE DATABASE \"{db_name}\""))
+            .expect("create source db");
+    }
+    {
+        let db_url = source.db_url(db_name);
+        let mut client = Client::connect(&db_url, NoTls).expect("connect source db");
+        client
+            .batch_execute("CREATE TABLE data (id SERIAL PRIMARY KEY, value TEXT)")
+            .expect("create table");
+        client
+            .execute("INSERT INTO data (value) VALUES ($1)", &[&"v2_data"])
+            .expect("insert v2 data");
+    }
+
+    // Create dest db with old data
+    {
+        let mut client = Client::connect(&dest.url(), NoTls).expect("connect dest");
+        client
+            .batch_execute(&format!("CREATE DATABASE \"{db_name}\""))
+            .expect("create dest db");
+    }
+    {
+        let db_url = dest.db_url(db_name);
+        let mut client = Client::connect(&db_url, NoTls).expect("connect dest db");
+        client
+            .batch_execute("CREATE TABLE data (id SERIAL PRIMARY KEY, value TEXT)")
+            .expect("create table");
+        client
+            .execute("INSERT INTO data (value) VALUES ($1)", &[&"v1_data"])
+            .expect("insert v1 data");
+    }
+
+    let key = b"01234567890123456789012345678901";
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = PgToolBackend::Docker {
+        image: "postgres:18-alpine".to_owned(),
+    };
+    let outcome = backup_instance_with_progress(
+        &source.url(),
+        key,
+        dir.path(),
+        &backend,
+        InstanceBackupContext {
+            instance_name: "upgrade-test",
+            machine_id: "um",
+            hostname: "uh",
+        },
+        &[db_name.to_string()],
+        &BackupConfig::default(),
+        &mut |_| {},
+    )
+    .expect("backup for 17→18 replace test");
+
+    let restored = restore_instance_with_progress(
+        std::path::Path::new(&outcome.file_path),
+        key,
+        &dest.url(),
+        &backend,
+        ConflictPolicy::Replace,
+        &mut |_| {},
+    )
+    .expect("replace restore should succeed 17→18");
+    assert_eq!(restored.len(), 1);
+
+    let dest_db_url = dest.db_url(db_name);
+    let mut client = Client::connect(&dest_db_url, NoTls).expect("connect after replace");
+    let rows: Vec<String> = client
+        .query("SELECT value FROM data ORDER BY id", &[])
+        .expect("query")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(
+        rows,
+        vec!["v2_data"],
+        "data should be replaced during 17→18 restore"
     );
 }

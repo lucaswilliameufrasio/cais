@@ -1397,7 +1397,10 @@ fn draw_restore_database(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
             let lines: Vec<Line<'_>> = {
                 let mut lines = vec![
                     Line::from(format!("Source: {}", app.restore_preview_source_instance)),
-                    Line::from(format!("Version: {}", app.restore_preview_source_version)),
+                    Line::from(format!(
+                        "Server version: {}",
+                        app.restore_preview_source_version
+                    )),
                     Line::from(format!(
                         "Databases: {}",
                         app.restore_preview_databases.join(", ")

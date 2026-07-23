@@ -1312,6 +1312,11 @@ pub struct InstanceBackupContents {
     pub databases: Vec<String>,
     pub dumps: Vec<(String, Vec<u8>)>,
     pub globals: Vec<u8>,
+    pub source_instance: String,
+    pub source_version: String,
+    pub includes_globals: bool,
+    pub include_role_passwords: bool,
+    pub tablespace_mode: String,
 }
 
 /// Creates one encrypted bundle containing one custom-format dump per
@@ -1510,6 +1515,11 @@ pub fn read_instance_backup(
         databases: manifest.databases,
         dumps,
         globals,
+        source_instance: manifest.source_instance,
+        source_version: manifest.source_version,
+        includes_globals: manifest.includes_globals,
+        include_role_passwords: manifest.include_role_passwords,
+        tablespace_mode: manifest.tablespace_mode,
     })
 }
 
@@ -1518,6 +1528,7 @@ pub fn is_instance_backup(input_path: &std::path::Path, decrypt_key: &[u8]) -> R
     Ok(payload.starts_with(&INSTANCE_BACKUP_MAGIC))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn restore_database_with_progress<F>(
     input_path: &std::path::Path,
     decrypt_key: &[u8],
@@ -1525,6 +1536,7 @@ pub fn restore_database_with_progress<F>(
     dest_db_name: &str,
     backend: &PgToolBackend,
     conflict_policy: ConflictPolicy,
+    tablespace_flatten: bool,
     emit: &mut F,
 ) -> Result<ProvisionFullOutcome>
 where
@@ -1639,38 +1651,48 @@ where
     );
 
     let restore_result = match backend {
-        PgToolBackend::Native { .. } => std::process::Command::new("pg_restore")
-            .args([
+        PgToolBackend::Native { .. } => {
+            let mut command = std::process::Command::new("pg_restore");
+            command.args([
                 "--dbname",
                 &dest_url,
                 "--no-owner",
                 "--no-privileges",
                 "--exit-on-error",
-            ])
-            .arg(&dump_path)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .context("failed to execute pg_restore"),
+            ]);
+            if tablespace_flatten {
+                command.arg("--no-tablespaces");
+            }
+            command
+                .arg(&dump_path)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output()
+                .context("failed to execute pg_restore")
+        }
         PgToolBackend::Docker { image } => (|| -> Result<std::process::Output> {
             docker_pull_silent(image)?;
             let file = std::fs::File::open(&dump_path)
                 .context("failed to open dump file for pg_restore")?;
+            let mut args = vec![
+                "run",
+                "--rm",
+                "-i",
+                "--network",
+                "host",
+                image.as_str(),
+                "pg_restore",
+                "--dbname",
+                &dest_url,
+                "--no-owner",
+                "--no-privileges",
+                "--exit-on-error",
+            ];
+            if tablespace_flatten {
+                args.push("--no-tablespaces");
+            }
             std::process::Command::new("docker")
-                .args([
-                    "run",
-                    "--rm",
-                    "-i",
-                    "--network",
-                    "host",
-                    image.as_str(),
-                    "pg_restore",
-                    "--dbname",
-                    &dest_url,
-                    "--no-owner",
-                    "--no-privileges",
-                    "--exit-on-error",
-                ])
+                .args(&args)
                 .stdin(file)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
@@ -1759,6 +1781,7 @@ where
                 &database_name,
                 backend,
                 on_conflict,
+                contents.tablespace_mode == "flatten",
                 emit,
             )
         })();
@@ -1873,9 +1896,9 @@ pub fn check_connection_health(url: &str) -> Result<(u64, String)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        INSTANCE_BACKUP_MAGIC, PgToolBackend, docker_pull_silent, error_string_database_exists,
-        extract_pg_major_version, mask_connection_string, parse_database_url, read_instance_backup,
-        resolve_docker_image,
+        INSTANCE_BACKUP_MAGIC, PgToolBackend, create_encrypted_dump, docker_pull_silent,
+        error_string_database_exists, extract_pg_major_version, mask_connection_string,
+        parse_database_url, read_instance_backup, resolve_docker_image, safe_filename_component,
     };
 
     #[test]
@@ -2359,5 +2382,76 @@ mod tests {
         let path = dir.path().join("test.pgdump.enc");
         super::create_encrypted_dump(b"some dump data", None, key, &path).unwrap();
         assert!(!super::is_instance_backup(&path, key).unwrap());
+    }
+
+    #[test]
+    fn safe_filename_component_removes_special_chars() {
+        assert_eq!(safe_filename_component("hello"), "hello");
+        assert_eq!(safe_filename_component("my instance!"), "my_instance_");
+        assert_eq!(safe_filename_component("prod/db/1"), "prod_db_1");
+        assert_eq!(safe_filename_component(""), "unnamed");
+        assert_eq!(safe_filename_component("a.b-c_d"), "a.b-c_d");
+        assert_eq!(safe_filename_component("!@#$"), "____");
+    }
+
+    #[test]
+    fn instance_backup_contents_has_all_metadata_fields() {
+        let key = b"01234567890123456789012345678901";
+        let manifest = serde_json::json!({
+            "format": "DBP2",
+            "source_instance": "prod-cluster",
+            "source_version": "PostgreSQL 17.0",
+            "created_at": "2026-07-20T00:00:00Z",
+            "databases": ["orders", "analytics"],
+            "includes_globals": true,
+            "include_role_passwords": false,
+            "tablespace_mode": "flatten"
+        });
+        let manifest = serde_json::to_vec(&manifest).unwrap();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&INSTANCE_BACKUP_MAGIC);
+        payload.extend_from_slice(&(manifest.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&manifest);
+        payload.extend_from_slice(&2u32.to_le_bytes());
+        for (name, dump) in [
+            ("orders", b"order_data" as &[u8]),
+            ("analytics", b"analytics_data" as &[u8]),
+        ] {
+            payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            payload.extend_from_slice(name.as_bytes());
+            payload.extend_from_slice(&(dump.len() as u64).to_le_bytes());
+            payload.extend_from_slice(dump);
+        }
+        payload.extend_from_slice(&8u64.to_le_bytes());
+        payload.extend_from_slice(b"some_sql");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meta.cluster.pgdump.enc");
+        create_encrypted_dump(&payload, None, key, &path).unwrap();
+
+        let contents = read_instance_backup(&path, key).unwrap();
+        assert_eq!(contents.source_instance, "prod-cluster");
+        assert_eq!(contents.source_version, "PostgreSQL 17.0");
+        assert!(contents.includes_globals);
+        assert!(!contents.include_role_passwords);
+        assert_eq!(contents.tablespace_mode, "flatten");
+        assert_eq!(contents.databases, ["orders", "analytics"]);
+        assert!(!contents.globals.is_empty());
+    }
+
+    #[test]
+    fn database_backup_encrypts_and_decrypts_roundtrip() {
+        let key = b"01234567890123456789012345678901";
+        let dump_data = b"pgdump custom format data \x00 with nulls";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backup.pgdump.enc");
+        create_encrypted_dump(dump_data, None, key, &path).unwrap();
+
+        let path2 = dir.path().join("backup.copy.pgdump.enc");
+        std::fs::rename(&path, &path2).unwrap();
+        create_encrypted_dump(dump_data, None, key, &path).unwrap();
+
+        let (meta, data) = super::read_encrypted_dump(&path, key).unwrap();
+        assert!(meta.is_none());
+        assert_eq!(data, dump_data);
     }
 }
