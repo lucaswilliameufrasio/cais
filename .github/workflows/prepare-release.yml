@@ -71,19 +71,14 @@ jobs:
 
           git push origin HEAD:"$BRANCH"
 
+          printf 'Automated release preparation for **v%s**.\n\n' "$V" > /tmp/pr-body.md
+          printf '## After merging\n\n' >> /tmp/pr-body.md
+          printf 'Pull latest main, then create and push the tag:\n\n' >> /tmp/pr-body.md
+          printf '```bash\ngit checkout main && git pull --rebase\ngit tag v%s && git push origin v%s\n```\n\n' "$V" "$V" >> /tmp/pr-body.md
+          printf 'The `Release` workflow will build artifacts and create the GitHub Release.\n' >> /tmp/pr-body.md
+
           gh pr create \
             --base main \
             --head "$BRANCH" \
             --title "$TITLE" \
-            --body "Automated release preparation for **v$V**.
-
-## After merging
-
-Pull latest main, then create and push the tag:
-
-```bash
-git checkout main && git pull --rebase
-git tag v$V && git push origin v$V
-```
-
-The `Release` workflow will build artifacts and create the GitHub Release."
+            --body-file /tmp/pr-body.md
