@@ -687,7 +687,7 @@ fn docker_pull_silent(image: &str) -> Result<()> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .output()
-        .context("failed to execute docker pull")?;
+        .with_context(|| format!("failed to execute docker pull for image '{}'", image))?;
     if !pull.status.success() {
         let stderr = String::from_utf8_lossy(&pull.stderr);
         anyhow::bail!("failed to pull Docker image '{}': {}", image, stderr.trim());
@@ -2098,8 +2098,12 @@ mod tests {
 
     #[test]
     fn docker_pull_silent_already_cached_does_not_pollute_stderr() {
-        // Pull once to ensure the image is cached
-        let _ = docker_pull_silent("postgres:16-alpine");
+        // Pull once to ensure the image is cached — if this fails (e.g. Windows
+        // cannot pull Linux images, or Docker is not installed), skip the test.
+        let image = "postgres:16-alpine";
+        if docker_pull_silent(image).is_err() {
+            return;
+        }
         // Run a docker command that would have triggered a pull on stderr
         let output = std::process::Command::new("docker")
             .args([
@@ -2107,7 +2111,7 @@ mod tests {
                 "--rm",
                 "--network",
                 "host",
-                "postgres:16-alpine",
+                image,
                 "pg_dump",
                 "--version",
             ])

@@ -81,9 +81,9 @@ jobs:
 
 Pull latest main, then create and push the tag:
 
-\`\`\`bash
+```bash
 git checkout main && git pull --rebase
 git tag v$V && git push origin v$V
-\`\`\`
+```
 
-The \`Release\` workflow will build artifacts and create the GitHub Release."
+The `Release` workflow will build artifacts and create the GitHub Release."
