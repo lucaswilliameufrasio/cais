@@ -87,6 +87,22 @@ impl Drop for DockerPostgres {
     }
 }
 
+/// Pick a PostgreSQL Docker tag compatible with the native pg_dump
+/// version (if running natively). Falls back to postgres:17 otherwise.
+fn native_compatible_pg_tag() -> String {
+    match check_pg_tools() {
+        PgToolBackend::Native { dump_ver, .. } => {
+            let major = cais::postgres::extract_pg_major_version(&dump_ver);
+            if major > 0 {
+                format!("postgres:{major}")
+            } else {
+                "postgres:17".into()
+            }
+        }
+        _ => "postgres:17".into(),
+    }
+}
+
 #[test]
 fn provision_database_creates_database_and_owner() {
     if std::env::var("RUN_DOCKER_TESTS").ok().as_deref() != Some("1") {
@@ -457,8 +473,9 @@ fn migrate_database_via_native() {
         _ => return, // native tools not available, skip
     };
 
-    let source = DockerPostgres::start();
-    let dest = DockerPostgres::start();
+    let tag = native_compatible_pg_tag();
+    let source = DockerPostgres::start_with_tag(&tag);
+    let dest = DockerPostgres::start_with_tag(&tag);
 
     let db_name = "native_source";
 
@@ -511,13 +528,18 @@ fn migrate_database_dest_already_exists() {
         return;
     }
 
-    match check_pg_tools() {
+    let backend = check_pg_tools();
+    match &backend {
         PgToolBackend::Docker { .. } | PgToolBackend::Native { .. } => {} // proceed
         PgToolBackend::NotFound => return,
     }
 
-    let source = DockerPostgres::start();
-    let dest = DockerPostgres::start();
+    let tag = match &backend {
+        PgToolBackend::Native { .. } => native_compatible_pg_tag(),
+        _ => "postgres:17".into(),
+    };
+    let source = DockerPostgres::start_with_tag(&tag);
+    let dest = DockerPostgres::start_with_tag(&tag);
 
     let db_name = "source_data";
 
@@ -545,12 +567,9 @@ fn migrate_database_dest_already_exists() {
     let major = cais::postgres::extract_pg_major_version(&source_version);
     let docker_image = format!("postgres:{major}-alpine");
 
-    let backend = match check_pg_tools() {
-        PgToolBackend::Native { .. } => PgToolBackend::Native {
-            dump_ver: String::new(),
-            restore_ver: String::new(),
-        },
-        PgToolBackend::Docker { image: _ } => PgToolBackend::Docker {
+    let migrate_backend = match backend {
+        PgToolBackend::Native { .. } => backend.clone(),
+        PgToolBackend::Docker { .. } => PgToolBackend::Docker {
             image: docker_image,
         },
         PgToolBackend::NotFound => unreachable!(),
@@ -560,7 +579,7 @@ fn migrate_database_dest_already_exists() {
         &source_cs,
         &dest.url(),
         dest_db_name,
-        &backend,
+        &migrate_backend,
         &mut |_| {},
     )
     .expect_err("should fail when dest database already exists");
