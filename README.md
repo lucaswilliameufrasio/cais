@@ -1,6 +1,6 @@
 # cais
 
-**Cais** (português para *wharf/dock*) — o lugar onde bancos de dados atracam, embarcam e desembarcam dados. Uma ferramenta TUI para operações com PostgreSQL: provisionar, migrar, fazer backup e restaurar.
+**Cais** (português para *wharf/dock*) — o lugar onde bancos de dados atracam, embarcam e desembarcam dados. Uma ferramenta de terminal (TUI) e interface web para operações com PostgreSQL: provisionar, migrar, fazer backup e restaurar.
 
 Secrets are encrypted with AES-256-GCM (Argon2id key derivation) and stored in a local SQLite database.
 
@@ -17,6 +17,7 @@ Secrets are encrypted with AES-256-GCM (Argon2id key derivation) and stored in a
 - **Version check** — detects pg_dump/server version mismatch and warns before migration/backup
 - **Unicode-aware cursor navigation** in text fields (Left/Right/Home/End)
 - **Background worker** — provisioning, migrations, backup, and restore run in a thread; UI stays responsive
+- **Web interface** — `cais serve` exposes the same operations in the browser, with a dashboard grouped by instance
 
 ## Prerequisites
 
@@ -50,6 +51,40 @@ cargo run
 ```
 
 On first run you will be prompted to create a master password. This password is never stored — only a verification blob derived from it is saved.
+
+## Web interface
+
+Run the local web interface with:
+
+```bash
+cargo run -- serve
+```
+
+This serves a single-page app at `http://127.0.0.1:8080` and opens your browser. The TUI remains the default when running `cargo run` with no arguments.
+
+Options:
+
+```bash
+cargo run -- serve --host 127.0.0.1 --port 8080   # bind address/port
+cargo run -- serve --no-browser                   # do not auto-open the browser
+```
+
+What you can do in the browser:
+
+- **Dashboard grouped by instance** — each instance is a card listing every provisioned database (owner + extra users) with health checks
+- **Provision** new databases in an instance (owner role + optional extra user) and copy the generated connection string
+- **Migrate** a database between instances
+- **Backup** a database or an entire instance (select databases, include globals/passwords)
+- **Restore** from an encrypted backup, with a preview of instance bundles (`DBP2`)
+- Manage instances and saved connections (view/copy/rename/delete)
+
+### Security model
+
+- The server binds to `127.0.0.1` by default. Binding to another interface (e.g. `--host 0.0.0.0`) prints a warning.
+- On first use the browser asks for the master password; it is verified against the stored blob and is **never stored or transmitted again**.
+- After unlocking, the server issues a random bearer token that maps to the in-memory decryption key. All data endpoints require `Authorization: Bearer <token>`.
+- Connection strings are decrypted only when you explicitly view/copy them.
+- `Lock` in the UI, or stopping the server, wipes all session keys.
 
 ## Makefile targets
 

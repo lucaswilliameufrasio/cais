@@ -6,3 +6,4 @@ pub mod postgres;
 pub mod storage;
 pub mod ui;
 pub mod validation;
+pub mod web;

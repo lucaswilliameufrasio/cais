@@ -1,0 +1,938 @@
+'use strict';
+
+// ---------------------------------------------------------------------------
+// API helper
+// ---------------------------------------------------------------------------
+
+const TOKEN_KEY = 'cais_token';
+let token = localStorage.getItem(TOKEN_KEY) || '';
+
+async function api(path, options = {}) {
+  const headers = { ...(options.headers || {}) };
+  if (options.body !== undefined && !headers['Content-Type']) {
+    headers['Content-Type'] = 'application/json';
+  }
+  if (token) headers['Authorization'] = 'Bearer ' + token;
+
+  const res = await fetch(path, { ...options, headers });
+  if (res.status === 401) {
+    lockLocal();
+    throw new Error('Sessão expirada. Desbloqueie novamente.');
+  }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || ('Erro ' + res.status));
+  return data;
+}
+
+const apiGet = (p) => api(p);
+const apiPost = (p, body) => api(p, { method: 'POST', body: JSON.stringify(body) });
+const apiPut = (p, body) => api(p, { method: 'PUT', body: JSON.stringify(body) });
+const apiDelete = (p) => api(p, { method: 'DELETE' });
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
+let dashboard = { instances: [], totals: { databases: 0, extra_users: 0 } };
+
+// ---------------------------------------------------------------------------
+// DOM helpers
+// ---------------------------------------------------------------------------
+
+const $ = (sel) => document.querySelector(sel);
+const el = (tag, attrs = {}, children = []) => {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === 'text') node.textContent = v;
+    else if (k === 'html') node.innerHTML = v;
+    else if (k.startsWith('on') && typeof v === 'function') node.addEventListener(k.slice(2), v);
+    else if (v !== null && v !== undefined) node.setAttribute(k, v);
+  }
+  for (const child of [].concat(children)) {
+    if (child) node.appendChild(typeof child === 'string' ? document.createTextNode(child) : child);
+  }
+  return node;
+};
+
+function escapeHtml(value) {
+  const div = document.createElement('div');
+  div.textContent = value == null ? '' : String(value);
+  return div.innerHTML;
+}
+
+function showView(id) {
+  document.querySelectorAll('.view').forEach((v) => v.classList.add('hidden'));
+  const view = document.getElementById(id);
+  if (view) view.classList.remove('hidden');
+}
+
+function setStatus(msg) {
+  const bars = document.querySelectorAll('#status-bar');
+  bars.forEach((b) => { b.textContent = msg || ''; });
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    setStatus('Copiado para a área de transferência.');
+  } catch {
+    window.prompt('Copie manualmente:', text);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Modal
+// ---------------------------------------------------------------------------
+
+function openModal(html) {
+  $('#modal-body').innerHTML = html;
+  $('#modal-overlay').classList.remove('hidden');
+  const firstInput = $('#modal-body input, #modal-body select');
+  if (firstInput) firstInput.focus();
+}
+
+function closeModal() {
+  $('#modal-overlay').classList.add('hidden');
+  $('#modal-body').innerHTML = '';
+}
+
+function confirmModal(title, message, confirmLabel = 'Confirmar') {
+  return new Promise((resolve) => {
+    openModal(`
+      <h2>${escapeHtml(title)}</h2>
+      <p class="hint">${escapeHtml(message)}</p>
+      <div class="form-actions">
+        <button id="cm-cancel" class="ghost">Cancelar</button>
+        <button id="cm-ok" class="danger">${escapeHtml(confirmLabel)}</button>
+      </div>
+    `);
+    $('#cm-ok').addEventListener('click', () => { closeModal(); resolve(true); });
+    $('#cm-cancel').addEventListener('click', () => { closeModal(); resolve(false); });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Unlock / first run
+// ---------------------------------------------------------------------------
+
+async function boot() {
+  let status;
+  try {
+    status = await apiGet('/api/status');
+  } catch (e) {
+    setStatus('Falha ao consultar o servidor: ' + e.message);
+    return;
+  }
+
+  if (status.initialized) {
+    showUnlock(false);
+  } else {
+    showUnlock(true);
+  }
+
+  if (token) {
+    try {
+      await loadDashboard();
+      return;
+    } catch {
+      showUnlock(status.initialized);
+    }
+  }
+}
+
+function showUnlock(firstRun) {
+  showView('view-unlock');
+  $('#unlock-submit').textContent = firstRun ? 'Criar senha mestra' : 'Desbloquear';
+  $('#unlock-subtitle').textContent = firstRun
+    ? 'Primeira execução. Crie a senha mestra que criptografa todos os segredos.'
+    : 'Digite a senha mestra para desbloquear o cofre.';
+  $('#field-confirm-wrap').classList.toggle('hidden', !firstRun);
+  $('#field-password').value = '';
+  $('#field-confirm').value = '';
+  $('#unlock-error').classList.add('hidden');
+  $('#field-password').focus();
+}
+
+$('#unlock-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const password = $('#field-password').value;
+  const firstRun = !$('#field-confirm-wrap').classList.contains('hidden');
+  const errEl = $('#unlock-error');
+  errEl.classList.add('hidden');
+  try {
+    let tokenResp;
+    if (firstRun) {
+      tokenResp = await apiPost('/api/init', { password, confirm: $('#field-confirm').value });
+    } else {
+      tokenResp = await apiPost('/api/unlock', { password });
+    }
+    token = tokenResp.token;
+    localStorage.setItem(TOKEN_KEY, token);
+    await loadDashboard();
+  } catch (err) {
+    errEl.textContent = err.message;
+    errEl.classList.remove('hidden');
+  }
+});
+
+$('#btn-lock').addEventListener('click', async () => {
+  try {
+    if (token) await apiPost('/api/lock', {});
+  } catch { /* ignore */ }
+  lockLocal();
+  const status = await apiGet('/api/status');
+  showUnlock(status.initialized);
+});
+
+function lockLocal() {
+  token = '';
+  localStorage.removeItem(TOKEN_KEY);
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard
+// ---------------------------------------------------------------------------
+
+async function loadDashboard() {
+  try {
+    dashboard = await apiGet('/api/dashboard');
+  } catch (e) {
+    showView('view-unlock');
+    return;
+  }
+  showView('view-dashboard');
+  renderDashboard();
+  renderTotals();
+}
+
+function renderTotals() {
+  const t = dashboard.totals;
+  $('#totals').textContent =
+    `${t.databases} banco(s) e ${t.extra_users} usuário(s) extra(s) em ${dashboard.instances.length} instância(s).`;
+}
+
+function healthBadge(health) {
+  const status = health ? health.status : 'unknown';
+  const label = {
+    ok: health && health.latency_ms != null ? `OK ${health.latency_ms}ms` : 'OK',
+    error: 'ERRO',
+    checking: 'Verificando...',
+    unknown: 'Desconhecido',
+  }[status] || 'Desconhecido';
+  return el('span', { class: 'health ' + status, text: label });
+}
+
+function renderDashboard() {
+  const container = $('#instance-cards');
+  container.innerHTML = '';
+  if (!dashboard.instances.length) {
+    container.appendChild(el('p', { class: 'empty', text: 'Nenhuma instância. Clique em "+ Instância" para começar.' }));
+    return;
+  }
+  for (const inst of dashboard.instances) {
+    container.appendChild(instanceCard(inst));
+  }
+}
+
+function instanceCard(inst) {
+  const head = el('div', { class: 'card-head' }, [
+    el('span', { class: 'inst-name', text: inst.name }),
+    healthBadge(inst.health),
+    el('span', { class: 'inst-host', text: hostLabel(inst) }),
+    el('div', { class: 'inst-actions' }, [
+      el('button', { class: 'small ghost', type: 'button', onclick: () => revealInstanceUrl(inst.name), text: 'URL base' }),
+    ]),
+  ]);
+
+  const tbody = el('tbody');
+  for (const db of inst.databases) {
+    tbody.appendChild(dbRow(inst.name, db));
+  }
+  const table = el('table', {}, [
+    el('thead', {}, [
+      el('tr', {}, [
+        el('th', { text: 'Banco' }), el('th', { text: 'Aplicação' }),
+        el('th', { text: 'Role' }), el('th', { text: '' }),
+      ]),
+    ]),
+    tbody,
+  ]);
+
+  const foot = el('div', { class: 'card-foot' }, [
+    el('button', { class: 'primary', type: 'button', onclick: () => openProvisionModal(inst.name), text: '+ Provisionar banco nesta instância' }),
+  ]);
+
+  return el('div', { class: 'card' }, [head, table, foot]);
+}
+
+function hostLabel(inst) {
+  if (inst.host) return `${inst.host}:${inst.port}  /  ${inst.base_database || ''}`;
+  return 'host desconhecido';
+}
+
+function dbRow(instanceName, db) {
+  const tagClass = db.kind === 'db' ? 'owner' : 'user';
+  const tagText = db.kind === 'db' ? 'owner' : 'user';
+  const nameCell = el('td', {}, [
+    el('span', { text: db.database_name }),
+    el('span', { class: 'tag ' + tagClass, text: tagText }),
+  ]);
+  const actions = el('td', { class: 'row-actions' }, [
+    el('button', { class: 'link', type: 'button', onclick: () => copyConnection(db), text: 'copiar' }),
+    el('button', { class: 'link', type: 'button', onclick: () => revealConnection(db), text: 'ver' }),
+    el('button', { class: 'link', type: 'button', onclick: () => editName(db), text: 'renomear' }),
+    el('button', { class: 'link', type: 'button', onclick: () => deleteConnection(instanceName, db), text: 'excluir' }),
+  ]);
+  return el('tr', {}, [
+    nameCell,
+    el('td', { text: db.application_name }),
+    el('td', { class: 'mono', text: db.role_or_username }),
+    actions,
+  ]);
+}
+
+async function fetchConnection(kind, id) {
+  const data = await apiGet(`/api/connections/${kind}/${id}`);
+  return data.connection_string;
+}
+
+async function copyConnection(db) {
+  try {
+    const cs = await fetchConnection(db.kind, db.id);
+    await copyText(cs);
+  } catch (e) {
+    setStatus(e.message);
+  }
+}
+
+async function revealConnection(db) {
+  try {
+    const cs = await fetchConnection(db.kind, db.id);
+    openModal(`
+      <h2>${escapeHtml(db.database_name)} — ${escapeHtml(db.role_or_username)}</h2>
+      <div class="result-box">
+        <div class="cs">${escapeHtml(cs)}</div>
+        <div class="form-actions">
+          <button id="rc-copy" class="primary">Copiar</button>
+          <button id="rc-close" class="ghost">Fechar</button>
+        </div>
+      </div>
+    `);
+    $('#rc-copy').addEventListener('click', () => copyText(cs));
+    $('#rc-close').addEventListener('click', closeModal);
+  } catch (e) {
+    setStatus(e.message);
+  }
+}
+
+async function revealInstanceUrl(name) {
+  try {
+    const data = await apiGet('/api/connections/instance/' + encodeURIComponent(name));
+    openModal(`
+      <h2>URL base — ${escapeHtml(name)}</h2>
+      <div class="result-box">
+        <div class="cs">${escapeHtml(data.connection_string)}</div>
+        <div class="form-actions">
+          <button id="ri-copy" class="primary">Copiar</button>
+          <button id="ri-close" class="ghost">Fechar</button>
+        </div>
+      </div>
+    `);
+    $('#ri-copy').addEventListener('click', () => copyText(data.connection_string));
+    $('#ri-close').addEventListener('click', closeModal);
+  } catch (e) {
+    setStatus(e.message);
+  }
+}
+
+async function editName(db) {
+  openModal(`
+    <h2>Renomear aplicação</h2>
+    <div class="form-grid">
+      <label>Banco / role: <span class="hint">${escapeHtml(db.database_name)} · ${escapeHtml(db.role_or_username)}</span></label>
+      <label>
+        Novo nome da aplicação
+        <input id="en-name" type="text" value="${escapeHtml(db.application_name)}">
+      </label>
+      <div class="form-actions">
+        <button id="en-cancel" class="ghost">Cancelar</button>
+        <button id="en-save" class="primary">Salvar</button>
+      </div>
+    </div>
+  `);
+  $('#en-save').addEventListener('click', async () => {
+    const name = $('#en-name').value.trim();
+    if (!name) return setStatus('Nome não pode ser vazio.');
+    try {
+      await apiPut(`/api/connections/${db.kind}/${db.id}/name`, { name });
+      closeModal();
+      await loadDashboard();
+      setStatus('Nome atualizado.');
+    } catch (e) {
+      setStatus(e.message);
+    }
+  });
+  $('#en-cancel').addEventListener('click', closeModal);
+  $('#en-name').focus();
+}
+
+async function deleteConnection(instanceName, db) {
+  const ok = await confirmModal(
+    'Excluir conexão',
+    `Excluir a conexão ${db.database_name} (${db.role_or_username}) da instância ${instanceName}? Isso não remove o banco do PostgreSQL.`,
+    'Excluir',
+  );
+  if (!ok) return;
+  try {
+    await apiDelete(`/api/connections/${db.kind}/${db.id}`);
+    await loadDashboard();
+    setStatus('Conexão excluída.');
+  } catch (e) {
+    setStatus(e.message);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Add instance
+// ---------------------------------------------------------------------------
+
+$('#btn-add-instance').addEventListener('click', () => {
+  openModal(`
+    <h2>Adicionar instância</h2>
+    <div class="form-grid">
+      <label>
+        Nome da instância
+        <input id="ai-name" type="text" placeholder="ex.: prod">
+      </label>
+      <label>
+        Base DATABASE_URL
+        <input id="ai-url" type="text" placeholder="postgresql://user:pass@host:5432/postgres">
+      </label>
+      <p class="hint">Ex.: postgresql://admin:secret@db.example.com:5432/postgres</p>
+      <div class="form-actions">
+        <button id="ai-cancel" class="ghost">Cancelar</button>
+        <button id="ai-save" class="primary">Adicionar</button>
+      </div>
+    </div>
+  `);
+  $('#ai-save').addEventListener('click', async () => {
+    const name = $('#ai-name').value.trim();
+    const url = $('#ai-url').value.trim();
+    if (!name || !url) return setStatus('Preencha nome e URL.');
+    try {
+      const info = await apiPost('/api/instances', { name, url });
+      closeModal();
+      await loadDashboard();
+      setStatus(`Instância '${info.name}' adicionada (${info.host}:${info.port} / ${info.database}).`);
+    } catch (e) {
+      setStatus(e.message);
+    }
+  });
+  $('#ai-cancel').addEventListener('click', closeModal);
+  $('#ai-name').focus();
+});
+
+// ---------------------------------------------------------------------------
+// Health
+// ---------------------------------------------------------------------------
+
+$('#btn-health').addEventListener('click', async () => {
+  setStatus('Verificando conexões...');
+  try {
+    await apiPost('/api/health', {});
+    setTimeout(async () => {
+      await loadDashboard();
+      setStatus('Health check concluído.');
+    }, 1200);
+  } catch (e) {
+    setStatus(e.message);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Provision
+// ---------------------------------------------------------------------------
+
+function openProvisionModal(instanceName) {
+  openModal(`
+    <h2>Provisionar banco — ${escapeHtml(instanceName)}</h2>
+    <div class="form-grid">
+      <label>
+        Nome do banco
+        <input id="pv-db" type="text" placeholder="ex.: orders_api">
+      </label>
+      <label>
+        Nome da aplicação (opcional)
+        <input id="pv-app" type="text" placeholder="se vazio, usa o nome do banco">
+      </label>
+      <label>
+        Usuário extra (opcional)
+        <input id="pv-extra-user" type="text" placeholder="ex.: orders_worker">
+      </label>
+      <label>
+        App name do usuário extra (opcional)
+        <input id="pv-extra-app" type="text" placeholder="se vazio, usa o nome do banco">
+      </label>
+      <p class="hint">Cria banco + role owner + opcional role extra, salva no catálogo e gera connection strings.</p>
+      <div class="form-actions">
+        <button id="pv-cancel" class="ghost">Cancelar</button>
+        <button id="pv-start" class="primary">Provisionar</button>
+      </div>
+    </div>
+  `);
+  $('#pv-start').addEventListener('click', async () => {
+    const body = {
+      instance_name: instanceName,
+      database_name: $('#pv-db').value.trim(),
+      application_name: $('#pv-app').value.trim() || null,
+      extra_username: $('#pv-extra-user').value.trim() || null,
+      extra_application_name: $('#pv-extra-app').value.trim() || null,
+    };
+    if (!body.database_name) return setStatus('Informe o nome do banco.');
+    try {
+      const data = await apiPost('/api/provision', body);
+      closeModal();
+      startOperation(data.operation_id);
+    } catch (e) {
+      setStatus(e.message);
+    }
+  });
+  $('#pv-cancel').addEventListener('click', closeModal);
+  $('#pv-db').focus();
+}
+
+// ---------------------------------------------------------------------------
+// Migrate wizard
+// ---------------------------------------------------------------------------
+
+$('#btn-migrate').addEventListener('click', () => {
+  if (!dashboard.instances.length) {
+    return setStatus('Adicione uma instância antes de migrar.');
+  }
+  const sources = buildSourceOptions();
+  const options = sources
+    .map((s) => `<div class="source-item" data-source="${escapeHtml(JSON.stringify(s.value))}">${escapeHtml(s.label)}</div>`)
+    .join('');
+
+  openModal(`
+    <h2>Migrar banco</h2>
+    <div class="wizard-step">
+      <p class="hint">1. Fonte (o banco que será migrado)</p>
+      <div id="mg-sources">${options}</div>
+      <p class="hint">2. Instância destino</p>
+      <select id="mg-dest">
+        ${dashboard.instances.map((i) => `<option value="${escapeHtml(i.name)}">${escapeHtml(i.name)}</option>`).join('')}
+      </select>
+      <label class="form-grid">
+        Nome do banco no destino
+        <input id="mg-db" type="text" placeholder="ex.: orders_clone">
+      </label>
+      <div class="form-actions">
+        <button id="mg-cancel" class="ghost">Cancelar</button>
+        <button id="mg-start" class="primary">Migrar</button>
+      </div>
+    </div>
+  `);
+
+  let selectedSource = null;
+  const items = $('#mg-sources').querySelectorAll('.source-item');
+  items.forEach((item) => {
+    item.addEventListener('click', () => {
+      items.forEach((i) => i.classList.remove('selected'));
+      item.classList.add('selected');
+      selectedSource = JSON.parse(item.dataset.source);
+    });
+  });
+
+  $('#mg-start').addEventListener('click', async () => {
+    if (!selectedSource) return setStatus('Selecione a fonte.');
+    const destInstance = $('#mg-dest').value;
+    const destDbName = $('#mg-db').value.trim();
+    if (!destDbName) return setStatus('Informe o nome do banco no destino.');
+    try {
+      const data = await apiPost('/api/migrate', {
+        source: selectedSource,
+        dest_instance: destInstance,
+        dest_db_name: destDbName,
+      });
+      closeModal();
+      startOperation(data.operation_id);
+    } catch (e) {
+      setStatus(e.message);
+    }
+  });
+  $('#mg-cancel').addEventListener('click', closeModal);
+});
+
+function buildSourceOptions() {
+  const opts = [];
+  for (const inst of dashboard.instances) {
+    for (const db of inst.databases) {
+      if (db.kind === 'db') {
+        opts.push({ value: { kind: 'db', id: db.id }, label: `${db.database_name} (owner) @ ${inst.name}` });
+      } else {
+        opts.push({ value: { kind: 'user', id: db.id }, label: `${db.database_name} (${db.role_or_username}) @ ${inst.name}` });
+      }
+    }
+    opts.push({ value: { kind: 'instance', name: inst.name }, label: `${inst.name} (base URL)` });
+  }
+  return opts;
+}
+
+// ---------------------------------------------------------------------------
+// Backup
+// ---------------------------------------------------------------------------
+
+$('#btn-backup').addEventListener('click', () => {
+  if (!dashboard.instances.length) {
+    return setStatus('Adicione uma instância antes de criar um backup.');
+  }
+  const options = buildSourceOptions()
+    .map((s) => `<div class="source-item" data-source="${escapeHtml(JSON.stringify(s.value))}">${escapeHtml(s.label)}</div>`)
+    .join('');
+
+  openModal(`
+    <h2>Novo backup</h2>
+    <div class="wizard-step">
+      <p class="hint">1. Fonte</p>
+      <div id="bk-sources">${options}</div>
+      <div id="bk-db-wrap">
+        <p class="hint">2. Bancos da instância</p>
+        <div id="bk-dbs" class="checkboxes"></div>
+      </div>
+      <p class="hint">3. Opções</p>
+      <div id="bk-config" class="checkboxes">
+        <label><input id="bk-globals" type="checkbox" checked> Incluir roles e membros do cluster</label>
+        <label><input id="bk-passwords" type="checkbox"> Incluir hashes de senha de roles</label>
+        <label><input id="bk-flatten" type="checkbox" checked> Achatar tablespaces</label>
+      </div>
+      <div class="form-actions">
+        <button id="bk-cancel" class="ghost">Cancelar</button>
+        <button id="bk-start" class="primary">Fazer backup</button>
+      </div>
+    </div>
+  `);
+
+  let selectedSource = null;
+  const items = $('#bk-sources').querySelectorAll('.source-item');
+  items.forEach((item) => {
+    item.addEventListener('click', () => {
+      items.forEach((i) => i.classList.remove('selected'));
+      item.classList.add('selected');
+      selectedSource = JSON.parse(item.dataset.source);
+      updateBackupDbs(selectedSource);
+    });
+  });
+
+  async function updateBackupDbs(source) {
+    const wrap = $('#bk-db-wrap');
+    const box = $('#bk-dbs');
+    if (!source || source.kind !== 'instance') {
+      wrap.classList.add('hidden');
+      box.innerHTML = '';
+      return;
+    }
+    wrap.classList.remove('hidden');
+    try {
+      const dbs = await apiPost('/api/discover', { source });
+      box.innerHTML = '';
+      dbs.forEach((db) => {
+        box.appendChild(el('label', {}, [
+          el('input', { type: 'checkbox', value: db.name, checked: true }),
+          el('span', { text: `${db.name} (owner: ${db.owner})` }),
+        ]));
+      });
+    } catch (e) {
+      box.innerHTML = `<span class="error">${escapeHtml(e.message)}</span>`;
+    }
+  }
+
+  $('#bk-start').addEventListener('click', async () => {
+    if (!selectedSource) return setStatus('Selecione a fonte.');
+    const databases = Array.from($('#bk-dbs').querySelectorAll('input[type=checkbox]:checked')).map((i) => i.value);
+    if (selectedSource.kind === 'instance' && !databases.length) {
+      return setStatus('Selecione ao menos um banco.');
+    }
+    try {
+      const data = await apiPost('/api/backup', {
+        source: selectedSource,
+        databases,
+        include_globals: $('#bk-globals').checked,
+        include_role_passwords: $('#bk-passwords').checked,
+        flatten_tablespaces: $('#bk-flatten').checked,
+      });
+      closeModal();
+      startOperation(data.operation_id);
+    } catch (e) {
+      setStatus(e.message);
+    }
+  });
+  $('#bk-cancel').addEventListener('click', closeModal);
+});
+
+// ---------------------------------------------------------------------------
+// Restore
+// ---------------------------------------------------------------------------
+
+$('#btn-restore').addEventListener('click', async () => {
+  if (!dashboard.instances.length) {
+    return setStatus('Adicione uma instância antes de restaurar.');
+  }
+  let backups;
+  try {
+    backups = await apiGet('/api/backups');
+  } catch (e) {
+    return setStatus(e.message);
+  }
+  if (!backups.length) {
+    return setStatus('Nenhum backup encontrado em ' + '(diretório de backups).');
+  }
+  const options = backups
+    .map((b) => `<option value="${escapeHtml(b.filename)}">${escapeHtml(b.filename)} (${formatBytes(b.size)})</option>`)
+    .join('');
+
+  openModal(`
+    <h2>Restaurar</h2>
+    <div class="wizard-step">
+      <label class="form-grid">
+        Arquivo de backup
+        <select id="rs-file">${options}</select>
+      </label>
+      <p class="hint">2. Instância destino</p>
+      <select id="rs-dest">
+        ${dashboard.instances.map((i) => `<option value="${escapeHtml(i.name)}">${escapeHtml(i.name)}</option>`).join('')}
+      </select>
+      <div id="rs-detail" class="form-grid"></div>
+      <div class="form-actions">
+        <button id="rs-cancel" class="ghost">Cancelar</button>
+        <button id="rs-start" class="primary">Restaurar</button>
+      </div>
+    </div>
+  `);
+
+  async function loadPreview() {
+    const file = $('#rs-file').value;
+    const detail = $('#rs-detail');
+    detail.innerHTML = '<p class="hint">Carregando preview...</p>';
+    try {
+      const preview = await apiPost('/api/restore/preview', { file });
+      if (preview.type === 'bundle') {
+        detail.innerHTML = `
+          <p class="hint">Bundle de instância — fonte: ${escapeHtml(preview.source_instance || '?')} (${escapeHtml(preview.source_version || '?')})</p>
+          <p class="hint">Bancos: ${escapeHtml(preview.databases.join(', '))}</p>
+          <p class="hint">Globals do cluster: ${preview.includes_globals ? 'sim' : 'não'}</p>
+          <label>
+            Política de conflito
+            <select id="rs-policy">
+              <option value="skip" selected>Skip (não sobrescreve existentes)</option>
+              <option value="fail">Fail (aborta se existir)</option>
+            </select>
+          </label>
+        `;
+      } else {
+        const m = preview.metadata || {};
+        detail.innerHTML = `
+          <p class="hint">Backup simples — origem: ${escapeHtml(m.database_name || '?')} em ${escapeHtml(m.instance_name || '?')} (${escapeHtml(m.hostname || '?')}, ${escapeHtml(m.timestamp || '?')})</p>
+          <label>
+            Nome do banco no destino
+            <input id="rs-dbname" type="text" value="${escapeHtml(m.database_name || '')}" placeholder="ex.: orders">
+          </label>
+          <label>
+            Política de conflito
+            <select id="rs-policy">
+              <option value="fail" selected>Fail (aborta se existir)</option>
+              <option value="skip">Skip (não sobrescreve existentes)</option>
+            </select>
+          </label>
+        `;
+      }
+    } catch (e) {
+      detail.innerHTML = `<span class="error">${escapeHtml(e.message)}</span>`;
+    }
+  }
+
+  $('#rs-file').addEventListener('change', loadPreview);
+  loadPreview();
+
+  $('#rs-start').addEventListener('click', async () => {
+    const file = $('#rs-file').value;
+    const destInstance = $('#rs-dest').value;
+    const dbNameInput = $('#rs-dbname');
+    const destDbName = dbNameInput ? dbNameInput.value.trim() : '';
+    const policy = $('#rs-policy').value;
+    try {
+      const data = await apiPost('/api/restore', {
+        file,
+        dest_instance: destInstance,
+        dest_db_name: destDbName || null,
+        conflict_policy: policy,
+      });
+      closeModal();
+      startOperation(data.operation_id);
+    } catch (e) {
+      setStatus(e.message);
+    }
+  });
+  $('#rs-cancel').addEventListener('click', closeModal);
+});
+
+// ---------------------------------------------------------------------------
+// Backups view
+// ---------------------------------------------------------------------------
+
+$('#btn-backups').addEventListener('click', showBackups);
+$('#back-to-dashboard').addEventListener('click', () => loadDashboard());
+$('#btn-refresh-backups').addEventListener('click', showBackups);
+
+async function showBackups() {
+  showView('view-backups');
+  await refreshBackups();
+}
+
+async function refreshBackups() {
+  const tbody = $('#backups-tbody');
+  tbody.innerHTML = '';
+  let backups;
+  try {
+    backups = await apiGet('/api/backups');
+  } catch (e) {
+    setStatus(e.message);
+    return;
+  }
+  $('#backups-empty').classList.toggle('hidden', backups.length > 0);
+  for (const b of backups) {
+    const row = el('tr', {}, [
+      el('td', { class: 'mono', text: b.filename }),
+      el('td', { text: formatBytes(b.size) }),
+      el('td', { text: b.modified }),
+      el('td', { class: 'row-actions' }, [
+        el('button', { class: 'link', type: 'button', onclick: () => openRestoreFor(b.filename), text: 'restaurar' }),
+      ]),
+    ]);
+    tbody.appendChild(row);
+  }
+}
+
+function openRestoreFor(filename) {
+  $('#btn-restore').click();
+  // Set the file select to the chosen backup once the modal exists.
+  setTimeout(() => {
+    const sel = $('#rs-file');
+    if (sel) {
+      sel.value = filename;
+      sel.dispatchEvent(new Event('change'));
+    }
+  }, 50);
+}
+
+function formatBytes(size) {
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+// ---------------------------------------------------------------------------
+// Operations
+// ---------------------------------------------------------------------------
+
+function startOperation(opId) {
+  openModal(`
+    <h2>Operação em andamento</h2>
+    <pre id="op-logs" class="logs"></pre>
+    <div id="op-result"></div>
+  `);
+
+  let timer = null;
+  let finished = false;
+
+  async function poll() {
+    let data;
+    try {
+      data = await apiGet('/api/operations/' + opId);
+    } catch (e) {
+      clearInterval(timer);
+      $('#op-result').innerHTML = `<span class="error">${escapeHtml(e.message)}</span>`;
+      return;
+    }
+    const logsEl = $('#op-logs');
+    logsEl.textContent = (data.logs || []).join('\n');
+    logsEl.scrollTop = logsEl.scrollHeight;
+
+    if (data.status === 'done' && !finished) {
+      finished = true;
+      clearInterval(timer);
+      renderOperationResult(data.result);
+      try { apiDelete('/api/operations/' + opId); } catch { /* ignore */ }
+    }
+  }
+
+  timer = setInterval(poll, 800);
+  poll();
+}
+
+function renderOperationResult(result) {
+  const box = $('#op-result');
+  if (!result) {
+    box.innerHTML = '<p class="hint">Operação concluída.</p>';
+    return;
+  }
+  if (!result.ok) {
+    box.innerHTML = `<div class="result-box"><span class="error">${escapeHtml(result.error)}</span></div>`;
+    return;
+  }
+  const v = result.value;
+  let html = '<div class="result-box">';
+  switch (v.type) {
+    case 'provision':
+      html += `<p><strong>${escapeHtml(v.database_name)}</strong> provisionado.</p>`;
+      html += `<p class="hint">Role owner: ${escapeHtml(v.role_name)}</p>`;
+      html += `<p class="hint">Connection string do banco:</p><div class="cs">${escapeHtml(v.connection_string)}</div>`;
+      if (v.extra_username) {
+        html += `<p class="hint">Usuário extra: ${escapeHtml(v.extra_username)}</p>`;
+        html += `<div class="cs">${escapeHtml(v.extra_connection_string || '')}</div>`;
+      }
+      html += '<div class="form-actions"><button id="op-copy" class="primary">Copiar conexão do banco</button></div>';
+      break;
+    case 'migrate':
+      html += `<p><strong>${escapeHtml(v.database_name)}</strong> migrado para ${escapeHtml(v.instance_name)}.</p>`;
+      html += `<div class="cs">${escapeHtml(v.connection_string)}</div>`;
+      html += '<div class="form-actions"><button id="op-copy" class="primary">Copiar conexão</button></div>';
+      break;
+    case 'backup':
+      html += `<p>Backup salvo em:</p><div class="cs">${escapeHtml(v.file_path)}</div>`;
+      html += `<p class="hint">${v.database_names.join(', ')}</p>`;
+      break;
+    case 'restore':
+      if (v.restored.length) html += `<p><strong>Restaurados:</strong> ${escapeHtml(v.restored.join(', '))}</p>`;
+      if (v.skipped.length) html += `<p class="hint">Pulados (já existiam): ${escapeHtml(v.skipped.join(', '))}</p>`;
+      if (!v.restored.length && !v.skipped.length) html += '<p>Nada a restaurar.</p>';
+      break;
+    default:
+      html += '<p>Operação concluída.</p>';
+  }
+  html += '</div>';
+  box.innerHTML = html;
+
+  const copyBtn = $('#op-copy');
+  if (copyBtn) {
+    const csToCopy = v.connection_string || '';
+    copyBtn.addEventListener('click', () => copyText(csToCopy));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Global wiring
+// ---------------------------------------------------------------------------
+
+$('#modal-close').addEventListener('click', closeModal);
+$('#modal-overlay').addEventListener('click', (e) => {
+  if (e.target === $('#modal-overlay')) closeModal();
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !$('#modal-overlay').classList.contains('hidden')) {
+    closeModal();
+  }
+});
+
+boot();

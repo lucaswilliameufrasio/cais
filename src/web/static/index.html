@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cais — gestão de bancos</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="app">
+
+  <section id="view-unlock" class="view hidden">
+    <form id="unlock-form" class="auth-box">
+      <h1>cais</h1>
+      <p id="unlock-subtitle">Digite a senha mestra para desbloquear o cofre.</p>
+      <label>
+        Senha mestra
+        <input id="field-password" type="password" autocomplete="current-password" required>
+      </label>
+      <label id="field-confirm-wrap" class="hidden">
+        Confirmar senha
+        <input id="field-confirm" type="password" autocomplete="new-password">
+      </label>
+      <button type="submit" id="unlock-submit">Desbloquear</button>
+      <p id="unlock-error" class="error hidden"></p>
+    </form>
+  </section>
+
+  <section id="view-dashboard" class="view hidden">
+    <header class="topbar">
+      <h1>cais</h1>
+      <div class="topbar-actions">
+        <button id="btn-migrate" class="ghost">Migrar</button>
+        <button id="btn-backup" class="ghost">Backup</button>
+        <button id="btn-restore" class="ghost">Restaurar</button>
+        <button id="btn-health" class="ghost">Health</button>
+        <button id="btn-backups" class="ghost">Backups</button>
+        <button id="btn-add-instance" class="primary">+ Instância</button>
+        <button id="btn-lock" class="danger">Bloquear</button>
+      </div>
+    </header>
+    <p id="status-bar" class="status"></p>
+    <p id="totals" class="totals"></p>
+    <div id="instance-cards" class="cards"></div>
+  </section>
+
+  <section id="view-backups" class="view hidden">
+    <header class="topbar">
+      <button id="back-to-dashboard" class="ghost">&larr; Dashboard</button>
+      <h1>Backups</h1>
+      <div class="topbar-actions">
+        <button id="btn-refresh-backups" class="ghost">Atualizar</button>
+      </div>
+    </header>
+    <p id="status-bar" class="status"></p>
+    <table class="table">
+      <thead>
+        <tr><th>Arquivo</th><th>Tamanho</th><th>Modificado</th><th></th></tr>
+      </thead>
+      <tbody id="backups-tbody"></tbody>
+    </table>
+    <p id="backups-empty" class="empty hidden">Nenhum backup encontrado.</p>
+  </section>
+
+  <div id="modal-overlay" class="overlay hidden">
+    <div id="modal" class="modal">
+      <button id="modal-close" class="close" aria-label="Fechar">&times;</button>
+      <div id="modal-body"></div>
+    </div>
+  </div>
+
+</div>
+<script src="/app.js"></script>
+</body>
+</html>
