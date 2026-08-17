@@ -7,7 +7,7 @@ use cais::models::{
 use cais::postgres::{
     InstanceBackupContext, backup_instance_with_progress, check_pg_tools,
     migrate_database_with_progress, provision_database_with_progress,
-    provision_extra_user_with_progress, restore_instance_with_progress,
+    provision_extra_user_with_progress, resolve_docker_image, restore_instance_with_progress,
 };
 use postgres::{Client, NoTls};
 
@@ -1007,4 +1007,26 @@ fn restore_with_replace_works_17_to_18() {
         vec!["v2_data"],
         "data should be replaced during 17→18 restore"
     );
+}
+
+#[test]
+fn resolve_docker_image_detects_timescaledb() {
+    if std::env::var("RUN_DOCKER_TESTS").ok().as_deref() != Some("1") {
+        eprintln!("skipping; set RUN_DOCKER_TESTS=1 to run docker integration tests");
+        return;
+    }
+
+    // A plain PostgreSQL instance must resolve to the plain alpine image.
+    let plain = DockerPostgres::start_with_tag("postgres:17");
+    let backend = PgToolBackend::Docker {
+        image: "postgres:18-alpine".to_owned(),
+    };
+    let plain_image = resolve_docker_image(&backend, Some(&plain.url()));
+    assert_eq!(plain_image, "postgres:17-alpine");
+
+    // A TimescaleDB instance must resolve to the timescale image, otherwise a
+    // restore that creates the timescaledb extension would fail on a plain image.
+    let ts = DockerPostgres::start_with_tag("timescale/timescaledb:2.28.2-pg18");
+    let ts_image = resolve_docker_image(&backend, Some(&ts.url()));
+    assert_eq!(ts_image, "timescale/timescaledb:latest-pg18");
 }

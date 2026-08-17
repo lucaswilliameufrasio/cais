@@ -622,14 +622,36 @@ pub fn resolve_docker_image(backend: &PgToolBackend, source_cs: Option<&str>) ->
             match detect_source_version(source_cs) {
                 Ok(version) => {
                     let major = extract_pg_major_version(&version);
-                    let tag = format!("postgres:{major}-alpine");
-                    tag
+                    if detect_timescale_installed(source_cs) {
+                        format!("timescale/timescaledb:latest-pg{major}")
+                    } else {
+                        format!("postgres:{major}-alpine")
+                    }
                 }
                 Err(_) => image.clone(),
             }
         }
         _ => "postgres:18-alpine".to_owned(),
     }
+}
+
+/// Reports whether the source database has the TimescaleDB extension installed.
+/// When it does, pg_dump/pg_restore must run inside an image that ships the
+/// extension (timescale/timescaledb), otherwise restoring a backup that uses
+/// hypertables fails because the extension is missing from the plain
+/// postgres:<major>-alpine image.
+fn detect_timescale_installed(source_cs: &str) -> bool {
+    let Ok(mut client) = Client::connect(source_cs, NoTls) else {
+        return false;
+    };
+    let found = client
+        .query_one(
+            "SELECT 1 FROM pg_extension WHERE extname = 'timescaledb'",
+            &[],
+        )
+        .is_ok();
+    let _ = client.close();
+    found
 }
 
 pub fn extract_pg_major_version(version: &str) -> u32 {
@@ -1896,9 +1918,10 @@ pub fn check_connection_health(url: &str) -> Result<(u64, String)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        INSTANCE_BACKUP_MAGIC, PgToolBackend, create_encrypted_dump, docker_pull_silent,
-        error_string_database_exists, extract_pg_major_version, mask_connection_string,
-        parse_database_url, read_instance_backup, resolve_docker_image, safe_filename_component,
+        INSTANCE_BACKUP_MAGIC, PgToolBackend, create_encrypted_dump, detect_timescale_installed,
+        docker_pull_silent, error_string_database_exists, extract_pg_major_version,
+        mask_connection_string, parse_database_url, read_instance_backup, resolve_docker_image,
+        safe_filename_component,
     };
 
     #[test]
@@ -2000,6 +2023,11 @@ mod tests {
         };
         let result = resolve_docker_image(&backend, Some("postgres://invalid:0/postgres"));
         assert_eq!(result, "postgres:16-alpine");
+    }
+
+    #[test]
+    fn detect_timescale_installed_invalid_connection_returns_false() {
+        assert!(!detect_timescale_installed("postgres://invalid:0/postgres"));
     }
 
     #[test]
