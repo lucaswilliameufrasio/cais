@@ -410,6 +410,13 @@ async fn style_css() -> Response {
         .expect("static style.css")
 }
 
+async fn favicon() -> Response {
+    Response::builder()
+        .header(header::CONTENT_TYPE, "image/svg+xml")
+        .body(Body::from(include_str!("static/favicon.svg")))
+        .expect("static favicon.svg")
+}
+
 // ---------------------------------------------------------------------------
 // Handlers: session
 // ---------------------------------------------------------------------------
@@ -1357,6 +1364,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/", get(index))
         .route("/app.js", get(app_js))
         .route("/style.css", get(style_css))
+        .route("/favicon.svg", get(favicon))
         .route("/api/status", get(get_status))
         .route("/api/init", post(post_init))
         .route("/api/unlock", post(post_unlock))

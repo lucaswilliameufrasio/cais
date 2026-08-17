@@ -71,6 +71,15 @@ function setStatus(msg) {
   bars.forEach((b) => { b.textContent = msg || ''; });
 }
 
+function showLoading(msg = 'Carregando...') {
+  $('#loading-text').textContent = msg;
+  $('#loading-overlay').classList.remove('hidden');
+}
+
+function hideLoading() {
+  $('#loading-overlay').classList.add('hidden');
+}
+
 async function copyText(text) {
   try {
     await navigator.clipboard.writeText(text);
@@ -158,7 +167,11 @@ $('#unlock-form').addEventListener('submit', async (e) => {
   const password = $('#field-password').value;
   const firstRun = !$('#field-confirm-wrap').classList.contains('hidden');
   const errEl = $('#unlock-error');
+  const submitBtn = $('#unlock-submit');
   errEl.classList.add('hidden');
+  submitBtn.disabled = true;
+  const originalLabel = submitBtn.textContent;
+  submitBtn.textContent = firstRun ? 'Criando senha...' : 'Desbloqueando...';
   try {
     let tokenResp;
     if (firstRun) {
@@ -172,6 +185,8 @@ $('#unlock-form').addEventListener('submit', async (e) => {
   } catch (err) {
     errEl.textContent = err.message;
     errEl.classList.remove('hidden');
+    submitBtn.disabled = false;
+    submitBtn.textContent = originalLabel;
   }
 });
 
@@ -194,12 +209,15 @@ function lockLocal() {
 // ---------------------------------------------------------------------------
 
 async function loadDashboard() {
+  showLoading('Carregando painel...');
   try {
     dashboard = await apiGet('/api/dashboard');
   } catch (e) {
+    hideLoading();
     showView('view-unlock');
     return;
   }
+  hideLoading();
   showView('view-dashboard');
   renderDashboard();
   renderTotals();

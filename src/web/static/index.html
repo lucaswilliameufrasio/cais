@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>cais — gestão de bancos</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
@@ -66,6 +67,13 @@
     <div id="modal" class="modal">
       <button id="modal-close" class="close" aria-label="Fechar">&times;</button>
       <div id="modal-body"></div>
+    </div>
+  </div>
+
+  <div id="loading-overlay" class="overlay hidden" aria-live="polite">
+    <div class="loading-box">
+      <span class="spinner" aria-hidden="true"></span>
+      <span id="loading-text">Carregando...</span>
     </div>
   </div>
 
