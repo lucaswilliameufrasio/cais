@@ -7,6 +7,8 @@
 const TOKEN_KEY = 'cais_token';
 let token = localStorage.getItem(TOKEN_KEY) || '';
 
+const REQUEST_TIMEOUT_MS = 30000;
+
 async function api(path, options = {}) {
   const headers = { ...(options.headers || {}) };
   if (options.body !== undefined && !headers['Content-Type']) {
@@ -14,7 +16,19 @@ async function api(path, options = {}) {
   }
   if (token) headers['Authorization'] = 'Bearer ' + token;
 
-  const res = await fetch(path, { ...options, headers });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  let res;
+  try {
+    res = await fetch(path, { ...options, headers, signal: controller.signal });
+  } catch (e) {
+    if (e && e.name === 'AbortError') {
+      throw new Error('Tempo esgotado aguardando o servidor.');
+    }
+    throw e;
+  } finally {
+    clearTimeout(timeout);
+  }
   if (res.status === 401) {
     lockLocal();
     throw new Error('Sessão expirada. Desbloqueie novamente.');
@@ -93,6 +107,10 @@ async function copyText(text) {
 // Modal
 // ---------------------------------------------------------------------------
 
+// Poll timers of active operations. Closing the modal must stop them, or they
+// keep hitting the server every 800ms forever.
+const opPollTimers = new Set();
+
 function openModal(html) {
   $('#modal-body').innerHTML = html;
   $('#modal-overlay').classList.remove('hidden');
@@ -101,6 +119,8 @@ function openModal(html) {
 }
 
 function closeModal() {
+  opPollTimers.forEach((t) => clearInterval(t));
+  opPollTimers.clear();
   $('#modal-overlay').classList.add('hidden');
   $('#modal-body').innerHTML = '';
 }
@@ -860,31 +880,43 @@ function startOperation(opId) {
     <div id="op-result"></div>
   `);
 
-  let timer = null;
   let finished = false;
 
+  function stopPoll() {
+    opPollTimers.delete(timer);
+    clearInterval(timer);
+  }
+
   async function poll() {
+    const logsEl = $('#op-logs');
+    if (!logsEl) {
+      stopPoll();
+      return;
+    }
     let data;
     try {
       data = await apiGet('/api/operations/' + opId);
     } catch (e) {
-      clearInterval(timer);
-      $('#op-result').innerHTML = `<span class="error">${escapeHtml(e.message)}</span>`;
+      stopPoll();
+      const resultEl = $('#op-result');
+      if (resultEl) {
+        resultEl.innerHTML = `<span class="error">${escapeHtml(e.message)}</span>`;
+      }
       return;
     }
-    const logsEl = $('#op-logs');
     logsEl.textContent = (data.logs || []).join('\n');
     logsEl.scrollTop = logsEl.scrollHeight;
 
     if (data.status === 'done' && !finished) {
       finished = true;
-      clearInterval(timer);
+      stopPoll();
       renderOperationResult(data.result);
       try { apiDelete('/api/operations/' + opId); } catch { /* ignore */ }
     }
   }
 
-  timer = setInterval(poll, 800);
+  const timer = setInterval(poll, 800);
+  opPollTimers.add(timer);
   poll();
 }
 
