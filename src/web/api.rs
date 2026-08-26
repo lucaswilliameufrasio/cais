@@ -668,13 +668,18 @@ async fn post_connection_health(
             latency_ms: Some(latency_ms),
             version: Some(version),
             error: None,
+            timed_out: false,
         },
-        Err(error) => HealthInfo {
-            status: "error".to_owned(),
-            latency_ms: None,
-            version: None,
-            error: Some(format!("{error:#}")),
-        },
+        Err(error) => {
+            let message = format!("{error:#}");
+            HealthInfo {
+                status: "error".to_owned(),
+                latency_ms: None,
+                version: None,
+                error: Some(message.clone()),
+                timed_out: postgres::is_connect_timeout(&message),
+            }
+        }
     }))
 }
 
@@ -901,12 +906,14 @@ async fn post_health(
                         latency_ms: Some(latency_ms),
                         version: Some(version),
                         error: None,
+                        timed_out: false,
                     },
                     Err(e) => HealthInfo {
                         status: "error".to_owned(),
                         latency_ms: None,
                         version: None,
                         error: Some(format!("{e:#}")),
+                        timed_out: postgres::is_connect_timeout(&format!("{e:#}")),
                     },
                 },
             );
@@ -1702,5 +1709,6 @@ mod tests {
                 .await
                 .expect("handler returns health info");
         assert_eq!(result.0.status, "error");
+        assert!(!result.0.timed_out);
     }
 }

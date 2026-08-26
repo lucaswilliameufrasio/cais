@@ -1922,9 +1922,18 @@ pub fn kill_query(url: &str, pid: i32) -> Result<String> {
     }
 }
 
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Probes a connection and returns the round-trip latency plus the server
+/// version. A socket-level connect timeout bounds how long an unreachable host
+/// can stall the check (the OS TCP timeout alone can take a minute or more).
 pub fn check_connection_health(url: &str) -> Result<(u64, String)> {
     let start = std::time::Instant::now();
-    let mut client = Client::connect(url, NoTls).context("connection failed")?;
+    let mut config: postgres::Config = url
+        .parse()
+        .context("connection string is not a valid DATABASE_URL")?;
+    config.connect_timeout(CONNECT_TIMEOUT);
+    let mut client = config.connect(NoTls).context("connection failed")?;
     let latency = start.elapsed().as_millis() as u64;
     let version = client
         .query_one("SELECT version()", &[])
@@ -1934,13 +1943,20 @@ pub fn check_connection_health(url: &str) -> Result<(u64, String)> {
     Ok((latency, version))
 }
 
+/// Reports whether a health-check failure was caused by the connect timeout
+/// rather than a refusal, DNS or auth problem. Matches the message produced by
+/// the `tokio-postgres` connect timeout (e.g. "connection timed out").
+pub fn is_connect_timeout(error: &str) -> bool {
+    error.contains("connection timed out")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         INSTANCE_BACKUP_MAGIC, PgToolBackend, create_encrypted_dump, database_connection_string,
         detect_timescale_installed, docker_pull_silent, error_string_database_exists,
-        extract_pg_major_version, mask_connection_string, parse_database_url, read_instance_backup,
-        resolve_docker_image, safe_filename_component,
+        extract_pg_major_version, is_connect_timeout, mask_connection_string, parse_database_url,
+        read_instance_backup, resolve_docker_image, safe_filename_component,
     };
 
     #[test]
@@ -1971,6 +1987,15 @@ mod tests {
     #[test]
     fn rejects_invalid_scheme_when_deriving_connection_string() {
         assert!(database_connection_string("http://example.com/db", "orders").is_err());
+    }
+
+    #[test]
+    fn detects_connect_timeout_messages() {
+        assert!(is_connect_timeout(
+            "connection failed: connection timed out"
+        ));
+        assert!(!is_connect_timeout("connection refused"));
+        assert!(!is_connect_timeout("password authentication failed"));
     }
 
     #[test]

@@ -366,16 +366,55 @@ async function revealConnection(db) {
 }
 
 async function testConnection(db) {
+  openModal(`
+    <h2>Testar conexão — ${escapeHtml(db.database_name)}</h2>
+    <div class="health-check" id="hc-status" data-state="checking">
+      <span class="spinner" id="hc-spinner"></span>
+      <span id="hc-label">Verificando conexão...</span>
+    </div>
+    <div id="hc-detail" class="hint"></div>
+    <div class="form-actions">
+      <button id="hc-close" class="ghost">Fechar</button>
+    </div>
+  `);
+
+  const statusBox = $('#hc-status');
+  const spinner = $('#hc-spinner');
+  const label = $('#hc-label');
+  const detail = $('#hc-detail');
+
+  const showResult = (state, message, detailHtml) => {
+    statusBox.dataset.state = state;
+    label.textContent = message;
+    detail.innerHTML = detailHtml || '';
+    if (state !== 'checking') {
+      spinner.classList.add('hidden');
+    }
+  };
+
   try {
     const info = await api(`/api/connections/${db.kind}/${db.id}/health`, { method: 'POST' });
     if (info.status === 'ok') {
-      setStatus(`Conexão OK (${info.latency_ms}ms)`);
+      showResult(
+        'ok',
+        `Conexão OK (${info.latency_ms}ms)`,
+        info.version ? `<div class="cs">${escapeHtml(info.version)}</div>` : '',
+      );
+    } else if (info.timed_out) {
+      showResult('timeout', 'Tempo esgotado', escapeHtml(info.error || ''));
     } else {
-      setStatus('Falha na conexão: ' + (info.error || 'desconhecida'));
+      showResult('error', 'Falha na conexão', escapeHtml(info.error || ''));
     }
   } catch (error) {
-    setStatus(error.message);
+    const timedOut = error.message === 'Tempo esgotado aguardando o servidor.';
+    showResult(
+      timedOut ? 'timeout' : 'error',
+      timedOut ? 'Tempo esgotado' : 'Falha na conexão',
+      escapeHtml(error.message),
+    );
   }
+
+  $('#hc-close').addEventListener('click', closeModal);
 }
 
 async function revealInstanceUrl(name) {

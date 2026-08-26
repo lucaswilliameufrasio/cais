@@ -21,6 +21,12 @@ pub struct HealthInfo {
     pub version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub timed_out: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 /// Shared state for the HTTP server. Held behind `Arc` so every handler can
