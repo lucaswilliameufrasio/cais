@@ -189,14 +189,19 @@ fn backup_path_for(file: &str) -> Result<std::path::PathBuf, ApiError> {
 }
 
 /// Persists a completed provision/migrate outcome to the catalog, mirroring the
-/// TUI behavior. Skipped databases (already existed) are not saved.
+/// TUI behavior. Skipped databases (restore with a skip policy, or migrate onto
+/// an existing database) are not saved unless `save_even_if_not_created` is
+/// set. Provision passes `true` because re-provisioning an existing database
+/// still yields a fresh, rotated password and a valid connection string that
+/// should be recorded.
 fn save_provision_outcome(
     storage: &crate::storage::Storage,
     key: &[u8],
     instance_name: &str,
     outcome: &ProvisionFullOutcome,
+    save_even_if_not_created: bool,
 ) -> Result<()> {
-    if !outcome.database_created {
+    if !outcome.database_created && !save_even_if_not_created {
         return Ok(());
     }
     let db_encrypted = crypto::encrypt(key, outcome.database_connection_string.as_bytes())?;
@@ -310,6 +315,13 @@ struct NameRequest {
 struct InstanceRequest {
     name: String,
     url: String,
+}
+
+#[derive(Deserialize)]
+struct AdoptRequest {
+    instance_name: String,
+    database_name: String,
+    application_name: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -634,6 +646,38 @@ async fn get_instance_connection(
     }))
 }
 
+/// Tests a single saved connection without touching the shared health cache.
+/// Always responds 200 so the UI can read the per-connection outcome.
+async fn post_connection_health(
+    Session { key, .. }: Session,
+    State(state): State<Arc<WebState>>,
+    Path((kind, id)): Path<(String, i64)>,
+) -> Result<Json<HealthInfo>, ApiError> {
+    let kind = connection_kind(&kind)?;
+    let cs = {
+        let storage = state.storage.lock().unwrap();
+        let record = find_connection(&storage, &kind, id)?;
+        decrypt_connection(key.as_ref().as_slice(), record_encrypted(&record))?
+    };
+    let probe = tokio::task::spawn_blocking(move || postgres::check_connection_health(&cs))
+        .await
+        .map_err(|error| ApiError::from(anyhow::anyhow!("health check task failed: {error}")))?;
+    Ok(Json(match probe {
+        Ok((latency_ms, version)) => HealthInfo {
+            status: "ok".to_owned(),
+            latency_ms: Some(latency_ms),
+            version: Some(version),
+            error: None,
+        },
+        Err(error) => HealthInfo {
+            status: "error".to_owned(),
+            latency_ms: None,
+            version: None,
+            error: Some(format!("{error:#}")),
+        },
+    }))
+}
+
 async fn put_connection_name(
     Session { .. }: Session,
     State(state): State<Arc<WebState>>,
@@ -709,13 +753,82 @@ async fn delete_instance(
     Ok(Json(json!({ "ok": true })))
 }
 
+/// Adopts an already-existing database on an instance into the catalog. The
+/// connection string reuses the instance base URI credentials, pointing at the
+/// target database. The database must exist and accept connections.
+async fn post_adopt(
+    Session { key, .. }: Session,
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<AdoptRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let instance_name = req.instance_name.trim().to_owned();
+    if instance_name.is_empty() {
+        return Err(ApiError::bad_request("instance name cannot be empty"));
+    }
+    let database_name = req.database_name.trim().to_owned();
+    validate_database_name(&database_name).map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    let application_name = normalize_application_name(
+        &database_name,
+        req.application_name.as_deref().unwrap_or(""),
+    );
+
+    let base_url = {
+        let storage = state.storage.lock().unwrap();
+        let secret = storage
+            .load_instance_secret(&instance_name)?
+            .ok_or_else(|| {
+                ApiError::bad_request(format!("no saved base URI for instance '{instance_name}'"))
+            })?;
+        decrypt_connection(key.as_ref().as_slice(), &secret.encrypted)?
+    };
+
+    let parsed = postgres::parse_database_url(&base_url)?;
+    let connection_string = postgres::database_connection_string(&base_url, &database_name)?;
+    let probe_cs = connection_string.clone();
+    let probe_db = database_name.clone();
+    let probe_instance = instance_name.clone();
+    tokio::task::spawn_blocking(move || postgres::check_connection_health(&probe_cs))
+        .await
+        .map_err(|error| ApiError::from(anyhow::anyhow!("adopt probe task failed: {error}")))?
+        .map_err(|error| {
+            ApiError::bad_request(format!(
+                "cannot connect to existing database '{probe_db}' on instance '{probe_instance}': {error:#}"
+            ))
+        })?;
+
+    let encrypted = crypto::encrypt(key.as_ref().as_slice(), connection_string.as_bytes())?;
+    let outcome = ProvisionOutcome {
+        database_name: database_name.clone(),
+        application_name: application_name.clone(),
+        role_name: parsed.username.clone(),
+        connection_string: connection_string.clone(),
+        database_created: false,
+        role_created: false,
+    };
+    state.storage.lock().unwrap().save_provisioned_database(
+        &instance_name,
+        &outcome,
+        &encrypted,
+    )?;
+
+    Ok(Json(json!({
+        "database_name": database_name,
+        "application_name": application_name,
+        "role_name": parsed.username,
+        "connection_string": connection_string,
+    })))
+}
+
 async fn post_discover(
     Session { key, .. }: Session,
     State(state): State<Arc<WebState>>,
     Json(req): Json<DiscoverRequest>,
 ) -> Result<Json<Vec<DiscoveredDb>>, ApiError> {
     let source_cs = resolve_source_cs(&state, key.as_ref().as_slice(), &req.source)?;
-    let discovered = postgres::discover_databases(&source_cs)?;
+    let discovered = tokio::task::spawn_blocking(move || postgres::discover_databases(&source_cs))
+        .await
+        .map_err(|error| ApiError::from(anyhow::anyhow!("discover task failed: {error}")))?
+        .map_err(ApiError::from)?;
     Ok(Json(
         discovered
             .into_iter()
@@ -932,7 +1045,9 @@ async fn post_provision(
                 Ok(outcome) => {
                     let k = op_key.as_ref().as_slice();
                     let storage = storage.lock().unwrap();
-                    if let Err(e) = save_provision_outcome(&storage, k, &op_instance, &outcome) {
+                    if let Err(e) =
+                        save_provision_outcome(&storage, k, &op_instance, &outcome, true)
+                    {
                         return Err(format!(
                             "provisioning succeeded but failed to save catalog: {e:#}"
                         ));
@@ -1006,7 +1121,9 @@ async fn post_migrate(
                 Ok(outcome) => {
                     let k = op_key.as_ref().as_slice();
                     let storage = storage.lock().unwrap();
-                    if let Err(e) = save_provision_outcome(&storage, k, &op_instance, &outcome) {
+                    if let Err(e) =
+                        save_provision_outcome(&storage, k, &op_instance, &outcome, false)
+                    {
                         return Err(format!(
                             "migration succeeded but failed to save catalog: {e:#}"
                         ));
@@ -1298,7 +1415,7 @@ async fn post_restore(
             )
             .map_err(|e| e.to_string())?;
             let storage = storage.lock().unwrap();
-            if let Err(e) = save_provision_outcome(&storage, k, &op_instance, &outcome) {
+            if let Err(e) = save_provision_outcome(&storage, k, &op_instance, &outcome, false) {
                 return Err(format!(
                     "restore succeeded but failed to save catalog: {e:#}"
                 ));
@@ -1375,6 +1492,10 @@ pub fn router(state: Arc<WebState>) -> Router {
             get(get_connection).delete(delete_connection),
         )
         .route(
+            "/api/connections/{kind}/{id}/health",
+            post(post_connection_health),
+        )
+        .route(
             "/api/connections/{kind}/{id}/name",
             put(put_connection_name),
         )
@@ -1384,6 +1505,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         )
         .route("/api/instances", post(post_instances))
         .route("/api/instances/{name}", delete(delete_instance))
+        .route("/api/adopt", post(post_adopt))
         .route("/api/discover", post(post_discover))
         .route("/api/health", post(post_health))
         .route("/api/provision", post(post_provision))
@@ -1511,5 +1633,74 @@ mod tests {
         assert_eq!(dash.instances.len(), 1);
         assert_eq!(dash.instances[0].name, "dev");
         assert_eq!(dash.instances[0].databases.len(), 0);
+    }
+
+    fn test_session(key: &[u8; 32]) -> Session {
+        Session {
+            key: Arc::new(Zeroizing::new(key.to_vec())),
+            token: "test-token".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn discover_returns_error_instead_of_panicking_on_blocking_connect() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open_at(dir.path().join("data.sqlite")).unwrap();
+        let key = b"01234567890123456789012345678901";
+        let inst_enc = crypto::encrypt(key, b"postgresql://u:p@127.0.0.1:1/nope").unwrap();
+        storage.save_instance_secret("dev", &inst_enc).unwrap();
+        let state = Arc::new(WebState::from_storage(storage).unwrap());
+        let request = DiscoverRequest {
+            source: SourceRef::Instance {
+                name: "dev".to_owned(),
+            },
+        };
+        let result = post_discover(test_session(key), State(state), Json(request)).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn adopt_returns_error_instead_of_panicking_on_blocking_connect() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open_at(dir.path().join("data.sqlite")).unwrap();
+        let key = b"01234567890123456789012345678901";
+        let inst_enc = crypto::encrypt(key, b"postgresql://u:p@127.0.0.1:1/postgres").unwrap();
+        storage.save_instance_secret("dev", &inst_enc).unwrap();
+        let state = Arc::new(WebState::from_storage(storage).unwrap());
+        let request = AdoptRequest {
+            instance_name: "dev".to_owned(),
+            database_name: "orders".to_owned(),
+            application_name: None,
+        };
+        let result = post_adopt(test_session(key), State(state), Json(request)).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn connection_health_reports_error_instead_of_panicking() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open_at(dir.path().join("data.sqlite")).unwrap();
+        let key = b"01234567890123456789012345678901";
+        let enc = crypto::encrypt(key, b"postgresql://u:p@127.0.0.1:1/orders").unwrap();
+        storage
+            .save_provisioned_database(
+                "prod",
+                &ProvisionOutcome {
+                    database_name: "orders".into(),
+                    application_name: "orders".into(),
+                    role_name: "u".into(),
+                    connection_string: "cs".into(),
+                    database_created: true,
+                    role_created: true,
+                },
+                &enc,
+            )
+            .unwrap();
+        let state = Arc::new(WebState::from_storage(storage).unwrap());
+        let result =
+            post_connection_health(test_session(key), State(state), Path(("db".to_owned(), 1)))
+                .await
+                .expect("handler returns health info");
+        assert_eq!(result.0.status, "error");
     }
 }

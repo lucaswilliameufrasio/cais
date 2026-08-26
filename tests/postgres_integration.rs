@@ -213,6 +213,29 @@ fn provision_database_is_idempotent() {
 }
 
 #[test]
+fn provision_existing_role_rotates_password_so_connection_works() {
+    if std::env::var("RUN_DOCKER_TESTS").ok().as_deref() != Some("1") {
+        return;
+    }
+
+    let pg = DockerPostgres::start();
+    let request = ProvisionRequest {
+        database_name: "staging".into(),
+        application_name: "staging".into(),
+    };
+
+    let first = provision_database_with_progress(&pg.url(), &request, |_| {}).expect("first");
+    Client::connect(&first.connection_string, NoTls).expect("connect with first credentials");
+
+    let second = provision_database_with_progress(&pg.url(), &request, |_| {}).expect("second");
+    assert!(!second.database_created);
+    assert!(!second.role_created);
+    // The role pre-existed, so the password must have been rotated for the
+    // returned connection string to be usable.
+    Client::connect(&second.connection_string, NoTls).expect("connect with rotated credentials");
+}
+
+#[test]
 fn provision_extra_user_is_idempotent() {
     if std::env::var("RUN_DOCKER_TESTS").ok().as_deref() != Some("1") {
         return;

@@ -228,8 +228,8 @@ function lockLocal() {
 // Dashboard
 // ---------------------------------------------------------------------------
 
-async function loadDashboard() {
-  showLoading('Carregando painel...');
+async function loadDashboard(showOverlay = true) {
+  if (showOverlay) showLoading('Carregando painel...');
   try {
     dashboard = await apiGet('/api/dashboard');
   } catch (e) {
@@ -297,6 +297,7 @@ function instanceCard(inst) {
   ]);
 
   const foot = el('div', { class: 'card-foot' }, [
+    el('button', { class: 'ghost', type: 'button', onclick: () => openAdoptModal(inst.name), text: 'Adicionar banco existente' }),
     el('button', { class: 'primary', type: 'button', onclick: () => openProvisionModal(inst.name), text: '+ Provisionar banco nesta instância' }),
   ]);
 
@@ -318,6 +319,7 @@ function dbRow(instanceName, db) {
   const actions = el('td', { class: 'row-actions' }, [
     el('button', { class: 'link', type: 'button', onclick: () => copyConnection(db), text: 'copiar' }),
     el('button', { class: 'link', type: 'button', onclick: () => revealConnection(db), text: 'ver' }),
+    el('button', { class: 'link', type: 'button', onclick: () => testConnection(db), text: 'testar' }),
     el('button', { class: 'link', type: 'button', onclick: () => editName(db), text: 'renomear' }),
     el('button', { class: 'link', type: 'button', onclick: () => deleteConnection(instanceName, db), text: 'excluir' }),
   ]);
@@ -360,6 +362,19 @@ async function revealConnection(db) {
     $('#rc-close').addEventListener('click', closeModal);
   } catch (e) {
     setStatus(e.message);
+  }
+}
+
+async function testConnection(db) {
+  try {
+    const info = await api(`/api/connections/${db.kind}/${db.id}/health`, { method: 'POST' });
+    if (info.status === 'ok') {
+      setStatus(`Conexão OK (${info.latency_ms}ms)`);
+    } else {
+      setStatus('Falha na conexão: ' + (info.error || 'desconhecida'));
+    }
+  } catch (error) {
+    setStatus(error.message);
   }
 }
 
@@ -540,6 +555,73 @@ function openProvisionModal(instanceName) {
 }
 
 // ---------------------------------------------------------------------------
+// Adopt existing database
+// ---------------------------------------------------------------------------
+
+async function openAdoptModal(instanceName) {
+  openModal(`
+    <h2>Adicionar banco existente — ${escapeHtml(instanceName)}</h2>
+    <div class="wizard-step">
+      <p class="hint">Bancos presentes na instância que ainda não estão no catálogo.</p>
+      <div id="ad-dbs" class="checkboxes"></div>
+      <label class="form-grid">
+        Nome da aplicação (opcional)
+        <input id="ad-app" type="text" placeholder="se vazio, usa o nome do banco">
+      </label>
+      <div class="form-actions">
+        <button id="ad-cancel" class="ghost">Cancelar</button>
+        <button id="ad-start" class="primary">Adicionar</button>
+      </div>
+    </div>
+  `);
+
+  const box = $('#ad-dbs');
+  box.innerHTML = '<p class="hint">Descobrindo bancos...</p>';
+  try {
+    const instance = dashboard.instances.find((entry) => entry.name === instanceName);
+    const known = new Set((instance ? instance.databases : []).map((db) => db.database_name));
+    const discovered = await apiPost('/api/discover', { source: { kind: 'instance', name: instanceName } });
+    const candidates = discovered.filter((db) => !known.has(db.name));
+    box.innerHTML = '';
+    if (!candidates.length) {
+      box.innerHTML = '<p class="hint">Todos os bancos da instância já estão no catálogo.</p>';
+    } else {
+      for (const db of candidates) {
+        box.appendChild(el('label', {}, [
+          el('input', { type: 'checkbox', value: db.name, checked: true }),
+          el('span', { text: `${db.name} (owner: ${db.owner})` }),
+        ]));
+      }
+    }
+  } catch (error) {
+    box.innerHTML = `<span class="error">${escapeHtml(error.message)}</span>`;
+  }
+
+  $('#ad-start').addEventListener('click', async () => {
+    const selected = Array.from(box.querySelectorAll('input[type=checkbox]:checked')).map((input) => input.value);
+    if (!selected.length) {
+      return setStatus('Selecione ao menos um banco.');
+    }
+    const applicationName = $('#ad-app').value.trim() || null;
+    try {
+      for (const databaseName of selected) {
+        await apiPost('/api/adopt', {
+          instance_name: instanceName,
+          database_name: databaseName,
+          application_name: applicationName,
+        });
+      }
+      closeModal();
+      await loadDashboard();
+      setStatus(`Adicionado(s) ${selected.length} banco(s) ao catálogo.`);
+    } catch (error) {
+      setStatus(error.message);
+    }
+  });
+  $('#ad-cancel').addEventListener('click', closeModal);
+}
+
+// ---------------------------------------------------------------------------
 // Migrate wizard
 // ---------------------------------------------------------------------------
 
@@ -549,7 +631,7 @@ $('#btn-migrate').addEventListener('click', () => {
   }
   const sources = buildSourceOptions();
   const options = sources
-    .map((s) => `<div class="source-item" data-source="${escapeHtml(JSON.stringify(s.value))}">${escapeHtml(s.label)}</div>`)
+    .map((source, index) => `<div class="source-item" data-index="${index}">${escapeHtml(source.label)}</div>`)
     .join('');
 
   openModal(`
@@ -559,7 +641,7 @@ $('#btn-migrate').addEventListener('click', () => {
       <div id="mg-sources">${options}</div>
       <p class="hint">2. Instância destino</p>
       <select id="mg-dest">
-        ${dashboard.instances.map((i) => `<option value="${escapeHtml(i.name)}">${escapeHtml(i.name)}</option>`).join('')}
+        ${dashboard.instances.map((instance) => `<option value="${escapeHtml(instance.name)}">${escapeHtml(instance.name)}</option>`).join('')}
       </select>
       <label class="form-grid">
         Nome do banco no destino
@@ -574,13 +656,15 @@ $('#btn-migrate').addEventListener('click', () => {
 
   let selectedSource = null;
   const items = $('#mg-sources').querySelectorAll('.source-item');
-  items.forEach((item) => {
+  for (const item of items) {
     item.addEventListener('click', () => {
-      items.forEach((i) => i.classList.remove('selected'));
+      for (const sibling of items) {
+        sibling.classList.remove('selected');
+      }
       item.classList.add('selected');
-      selectedSource = JSON.parse(item.dataset.source);
+      selectedSource = sources[Number(item.dataset.index)].value;
     });
-  });
+  }
 
   $('#mg-start').addEventListener('click', async () => {
     if (!selectedSource) return setStatus('Selecione a fonte.');
@@ -625,8 +709,9 @@ $('#btn-backup').addEventListener('click', () => {
   if (!dashboard.instances.length) {
     return setStatus('Adicione uma instância antes de criar um backup.');
   }
-  const options = buildSourceOptions()
-    .map((s) => `<div class="source-item" data-source="${escapeHtml(JSON.stringify(s.value))}">${escapeHtml(s.label)}</div>`)
+  const sources = buildSourceOptions();
+  const options = sources
+    .map((source, index) => `<div class="source-item" data-index="${index}">${escapeHtml(source.label)}</div>`)
     .join('');
 
   openModal(`
@@ -653,14 +738,16 @@ $('#btn-backup').addEventListener('click', () => {
 
   let selectedSource = null;
   const items = $('#bk-sources').querySelectorAll('.source-item');
-  items.forEach((item) => {
+  for (const item of items) {
     item.addEventListener('click', () => {
-      items.forEach((i) => i.classList.remove('selected'));
+      for (const sibling of items) {
+        sibling.classList.remove('selected');
+      }
       item.classList.add('selected');
-      selectedSource = JSON.parse(item.dataset.source);
+      selectedSource = sources[Number(item.dataset.index)].value;
       updateBackupDbs(selectedSource);
     });
-  });
+  }
 
   async function updateBackupDbs(source) {
     const wrap = $('#bk-db-wrap');
@@ -912,6 +999,7 @@ function startOperation(opId) {
       stopPoll();
       renderOperationResult(data.result);
       try { apiDelete('/api/operations/' + opId); } catch { /* ignore */ }
+      loadDashboard(false);
     }
   }
 

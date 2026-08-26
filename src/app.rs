@@ -845,12 +845,6 @@ impl App {
         result: Result<ProvisionFullOutcome, String>,
     ) -> Result<()> {
         match result {
-            Ok(outcome) if !outcome.database_created => {
-                self.push_log(format!(
-                    "  [skip] '{}' — not saved to catalog",
-                    outcome.database_name
-                ));
-            }
             Ok(outcome) => {
                 let key = self.session_key()?.to_vec();
                 let db_encrypted =

@@ -42,6 +42,19 @@ pub fn parse_database_url(raw: &str) -> Result<ParsedDatabaseUrl> {
     })
 }
 
+/// Derives a connection string for a specific database on the same cluster as
+/// `base_url`, keeping the base URL's credentials, host, port and any query
+/// parameters (for example `sslmode`).
+pub fn database_connection_string(base_url: &str, database_name: &str) -> Result<String> {
+    let mut url = Url::parse(base_url).context("base DATABASE_URL is not a valid URI")?;
+    let scheme = url.scheme();
+    if scheme != "postgresql" && scheme != "postgres" {
+        anyhow::bail!("DATABASE_URL must use the postgres or postgresql scheme");
+    }
+    url.set_path(&format!("/{database_name}"));
+    Ok(url.to_string())
+}
+
 pub fn provision_database_with_progress<F>(
     base_url: &str,
     request: &ProvisionRequest,
@@ -390,17 +403,23 @@ fn ensure_role(
     steps: &mut Vec<String>,
     emit: &mut impl FnMut(String),
 ) -> Result<bool> {
+    let escaped_password = escape_literal(password);
     let exists = client.query_opt("SELECT 1 FROM pg_roles WHERE rolname = $1", &[&role_name])?;
     if exists.is_some() {
+        let query = format!(
+            "ALTER ROLE \"{}\" WITH PASSWORD '{}'",
+            escape_ident(role_name),
+            escaped_password
+        );
+        client.batch_execute(&query)?;
         push_step(
             steps,
             emit,
-            format!("Role {role_name} already exists; password not rotated automatically"),
+            format!("Role {role_name} already exists; password rotated"),
         );
         return Ok(false);
     }
 
-    let escaped_password = escape_literal(password);
     let query = format!(
         "CREATE ROLE \"{}\" WITH LOGIN PASSWORD '{}' CREATEDB",
         escape_ident(role_name),
@@ -1918,10 +1937,10 @@ pub fn check_connection_health(url: &str) -> Result<(u64, String)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        INSTANCE_BACKUP_MAGIC, PgToolBackend, create_encrypted_dump, detect_timescale_installed,
-        docker_pull_silent, error_string_database_exists, extract_pg_major_version,
-        mask_connection_string, parse_database_url, read_instance_backup, resolve_docker_image,
-        safe_filename_component,
+        INSTANCE_BACKUP_MAGIC, PgToolBackend, create_encrypted_dump, database_connection_string,
+        detect_timescale_installed, docker_pull_silent, error_string_database_exists,
+        extract_pg_major_version, mask_connection_string, parse_database_url, read_instance_backup,
+        resolve_docker_image, safe_filename_component,
     };
 
     #[test]
@@ -1934,6 +1953,24 @@ mod tests {
         assert_eq!(parsed.host, "db.example.com");
         assert_eq!(parsed.port, 5432);
         assert_eq!(parsed.database, "shared");
+    }
+
+    #[test]
+    fn derives_database_connection_string() {
+        let derived = database_connection_string(
+            "postgresql://admin:p%40ss@db.example.com:5432/shared?application_name=infra",
+            "orders",
+        )
+        .expect("derive connection string");
+        assert_eq!(
+            derived,
+            "postgresql://admin:p%40ss@db.example.com:5432/orders?application_name=infra"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_scheme_when_deriving_connection_string() {
+        assert!(database_connection_string("http://example.com/db", "orders").is_err());
     }
 
     #[test]
