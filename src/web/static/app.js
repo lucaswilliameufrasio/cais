@@ -279,6 +279,7 @@ function instanceCard(inst) {
     el('span', { class: 'inst-host', text: hostLabel(inst) }),
     el('div', { class: 'inst-actions' }, [
       el('button', { class: 'small ghost', type: 'button', onclick: () => revealInstanceUrl(inst.name), text: 'URL base' }),
+      el('button', { class: 'small ghost', type: 'button', onclick: () => rotateInstance(inst.name), text: 'Rotacionar' }),
     ]),
   ]);
 
@@ -320,6 +321,7 @@ function dbRow(instanceName, db) {
     el('button', { class: 'link', type: 'button', onclick: () => copyConnection(db), text: 'copiar' }),
     el('button', { class: 'link', type: 'button', onclick: () => revealConnection(db), text: 'ver' }),
     el('button', { class: 'link', type: 'button', onclick: () => testConnection(db), text: 'testar' }),
+    el('button', { class: 'link', type: 'button', onclick: () => rotateConnection(db), text: 'rotacionar' }),
     el('button', { class: 'link', type: 'button', onclick: () => editName(db), text: 'renomear' }),
     el('button', { class: 'link', type: 'button', onclick: () => deleteConnection(instanceName, db), text: 'excluir' }),
   ]);
@@ -415,6 +417,54 @@ async function testConnection(db) {
   }
 
   $('#hc-close').addEventListener('click', closeModal);
+}
+
+async function rotateConnection(db) {
+  const confirmed = await confirmModal(
+    'Rotacionar credencial',
+    `Rotacionar a senha de ${db.role_or_username} (${db.database_name})? A senha atual é invalidada imediatamente — serviços que a usam vão falhar até serem atualizados.`,
+    'Rotacionar',
+  );
+  if (!confirmed) return;
+  try {
+    const data = await api(`/api/connections/${db.kind}/${db.id}/rotate`, { method: 'POST' });
+    showRotatedCredential(data.connection_string, `${db.database_name} · ${data.role_name}`);
+    await loadDashboard(false);
+  } catch (error) {
+    setStatus(error.message);
+  }
+}
+
+async function rotateInstance(name) {
+  const confirmed = await confirmModal(
+    'Rotacionar credencial da instância',
+    `Rotacionar a senha do usuário base da instância ${name}? A base DATABASE_URL salva no catálogo será atualizada com a nova senha.`,
+    'Rotacionar',
+  );
+  if (!confirmed) return;
+  try {
+    const data = await api(`/api/instances/${encodeURIComponent(name)}/rotate`, { method: 'POST' });
+    showRotatedCredential(data.connection_string, name);
+    await loadDashboard(false);
+  } catch (error) {
+    setStatus(error.message);
+  }
+}
+
+function showRotatedCredential(connectionString, title) {
+  openModal(`
+    <h2>Credencial rotacionada — ${escapeHtml(title)}</h2>
+    <p class="hint">Nova connection string. Atualize o serviço que a utiliza.</p>
+    <div class="result-box">
+      <div class="cs">${escapeHtml(connectionString)}</div>
+      <div class="form-actions">
+        <button id="rot-copy" class="primary">Copiar</button>
+        <button id="rot-close" class="ghost">Fechar</button>
+      </div>
+    </div>
+  `);
+  $('#rot-copy').addEventListener('click', () => copyText(connectionString));
+  $('#rot-close').addEventListener('click', closeModal);
 }
 
 async function revealInstanceUrl(name) {

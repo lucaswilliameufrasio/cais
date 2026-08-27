@@ -443,6 +443,14 @@ impl Storage {
         Ok(())
     }
 
+    pub fn update_database_connection(&self, id: i64, encrypted: &EncryptedValue) -> Result<()> {
+        self.conn.execute(
+            "UPDATE provisioned_databases SET connection_string_ciphertext = ?1, connection_string_nonce = ?2 WHERE id = ?3",
+            params![encrypted.ciphertext, encrypted.nonce, id],
+        )?;
+        Ok(())
+    }
+
     pub fn list_provisioned_databases(&self) -> Result<Vec<ProvisionedDatabaseRecord>> {
         let mut stmt = self.conn.prepare(
             r#"
@@ -588,6 +596,14 @@ impl Storage {
             output.push(row?);
         }
         Ok(output)
+    }
+
+    pub fn update_extra_user_connection(&self, id: i64, encrypted: &EncryptedValue) -> Result<()> {
+        self.conn.execute(
+            "UPDATE provisioned_extra_users SET connection_string_ciphertext = ?1, connection_string_nonce = ?2 WHERE id = ?3",
+            params![encrypted.ciphertext, encrypted.nonce, id],
+        )?;
+        Ok(())
     }
 
     pub fn delete_provisioned_extra_user(&self, id: i64) -> Result<()> {
@@ -1152,5 +1168,75 @@ mod tests {
             }
             _ => panic!("expected extra user record"),
         }
+    }
+
+    #[test]
+    fn updates_database_connection_string() {
+        let dir = tempdir().expect("dir");
+        let storage = Storage::open_at(dir.path().join("data.sqlite")).expect("storage");
+        let key = b"01234567890123456789012345678901";
+        let db_enc = crypto::encrypt(key, b"old-cs").expect("encrypt");
+
+        storage
+            .save_provisioned_database(
+                "dev",
+                &ProvisionOutcome {
+                    database_name: "crm".into(),
+                    application_name: "crm".into(),
+                    role_name: "crm_owner".into(),
+                    connection_string: "old-cs".into(),
+                    database_created: true,
+                    role_created: true,
+                },
+                &db_enc,
+            )
+            .expect("save");
+
+        let records = storage.list_provisioned_databases().expect("list");
+        let id = records[0].id;
+
+        let new_enc = crypto::encrypt(key, b"new-cs").expect("encrypt");
+        storage
+            .update_database_connection(id, &new_enc)
+            .expect("update");
+
+        let updated = storage.list_provisioned_databases().expect("list");
+        let plaintext = crypto::decrypt(key, &updated[0].encrypted).expect("decrypt");
+        assert_eq!(plaintext.as_slice(), b"new-cs");
+    }
+
+    #[test]
+    fn updates_extra_user_connection_string() {
+        let dir = tempdir().expect("dir");
+        let storage = Storage::open_at(dir.path().join("data.sqlite")).expect("storage");
+        let key = b"01234567890123456789012345678901";
+        let user_enc = crypto::encrypt(key, b"old-cs").expect("encrypt");
+
+        storage
+            .save_provisioned_extra_user(
+                "dev",
+                &ExtraUserProvisionOutcome {
+                    database_name: "crm".into(),
+                    username: "crm_app".into(),
+                    application_name: "crm".into(),
+                    connection_string: "old-cs".into(),
+                    role_created: true,
+                    grants_applied: true,
+                },
+                &user_enc,
+            )
+            .expect("save");
+
+        let records = storage.list_provisioned_extra_users().expect("list");
+        let id = records[0].id;
+
+        let new_enc = crypto::encrypt(key, b"new-cs").expect("encrypt");
+        storage
+            .update_extra_user_connection(id, &new_enc)
+            .expect("update");
+
+        let updated = storage.list_provisioned_extra_users().expect("list");
+        let plaintext = crypto::decrypt(key, &updated[0].encrypted).expect("decrypt");
+        assert_eq!(plaintext.as_slice(), b"new-cs");
     }
 }

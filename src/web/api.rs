@@ -701,6 +701,101 @@ async fn put_connection_name(
     Ok(Json(json!({ "ok": true })))
 }
 
+/// Rotates the password of a saved database owner or extra-user role on its
+/// instance and updates the catalog with the new connection string.
+async fn post_rotate_connection(
+    Session { key, .. }: Session,
+    State(state): State<Arc<WebState>>,
+    Path((kind, id)): Path<(String, i64)>,
+) -> Result<Json<Value>, ApiError> {
+    let kind = connection_kind(&kind)?;
+    let (instance_name, database_name, application_name, role_name) = {
+        let storage = state.storage.lock().unwrap();
+        let record = find_connection(&storage, &kind, id)?;
+        match &record {
+            SavedConnectionRecord::Database(r) => (
+                r.instance_name.clone(),
+                r.database_name.clone(),
+                r.application_name.clone(),
+                r.role_name.clone(),
+            ),
+            SavedConnectionRecord::ExtraUser(r) => (
+                r.instance_name.clone(),
+                r.database_name.clone(),
+                r.application_name.clone(),
+                r.username.clone(),
+            ),
+            SavedConnectionRecord::Instance { .. } => unreachable!(),
+        }
+    };
+
+    let base_url = {
+        let storage = state.storage.lock().unwrap();
+        let secret = storage
+            .load_instance_secret(&instance_name)?
+            .ok_or_else(|| {
+                ApiError::bad_request(format!("no saved base URI for instance '{instance_name}'"))
+            })?;
+        decrypt_connection(key.as_ref().as_slice(), &secret.encrypted)?
+    };
+
+    let rotate_base = base_url.clone();
+    let rotate_db = database_name.clone();
+    let rotate_role = role_name.clone();
+    let rotate_app = application_name.clone();
+    let new_cs = tokio::task::spawn_blocking(move || {
+        postgres::rotate_database_credential(&rotate_base, &rotate_db, &rotate_role, &rotate_app)
+    })
+    .await
+    .map_err(|error| ApiError::from(anyhow::anyhow!("rotate task failed: {error}")))?
+    .map_err(ApiError::from)?;
+
+    let encrypted = crypto::encrypt(key.as_ref().as_slice(), new_cs.as_bytes())?;
+    let storage = state.storage.lock().unwrap();
+    match kind {
+        ConnectionKind::Db => storage.update_database_connection(id, &encrypted)?,
+        ConnectionKind::User => storage.update_extra_user_connection(id, &encrypted)?,
+    }
+
+    Ok(Json(json!({
+        "database_name": database_name,
+        "role_name": role_name,
+        "application_name": application_name,
+        "connection_string": new_cs,
+    })))
+}
+
+/// Rotates the password of an instance's base URI user and updates the saved
+/// base DATABASE_URL in the catalog.
+async fn post_rotate_instance(
+    Session { key, .. }: Session,
+    State(state): State<Arc<WebState>>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let base_url = {
+        let storage = state.storage.lock().unwrap();
+        let secret = storage.load_instance_secret(&name)?.ok_or_else(|| {
+            ApiError::bad_request(format!("no saved base URI for instance '{name}'"))
+        })?;
+        decrypt_connection(key.as_ref().as_slice(), &secret.encrypted)?
+    };
+    let new_url =
+        tokio::task::spawn_blocking(move || postgres::rotate_base_url_password(&base_url))
+            .await
+            .map_err(|error| ApiError::from(anyhow::anyhow!("rotate task failed: {error}")))?
+            .map_err(ApiError::from)?;
+    let encrypted = crypto::encrypt(key.as_ref().as_slice(), new_url.as_bytes())?;
+    state
+        .storage
+        .lock()
+        .unwrap()
+        .save_instance_secret(&name, &encrypted)?;
+    Ok(Json(json!({
+        "name": name,
+        "connection_string": new_url,
+    })))
+}
+
 async fn delete_connection(
     Session { .. }: Session,
     State(state): State<Arc<WebState>>,
@@ -1503,6 +1598,10 @@ pub fn router(state: Arc<WebState>) -> Router {
             post(post_connection_health),
         )
         .route(
+            "/api/connections/{kind}/{id}/rotate",
+            post(post_rotate_connection),
+        )
+        .route(
             "/api/connections/{kind}/{id}/name",
             put(put_connection_name),
         )
@@ -1512,6 +1611,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         )
         .route("/api/instances", post(post_instances))
         .route("/api/instances/{name}", delete(delete_instance))
+        .route("/api/instances/{name}/rotate", post(post_rotate_instance))
         .route("/api/adopt", post(post_adopt))
         .route("/api/discover", post(post_discover))
         .route("/api/health", post(post_health))
@@ -1710,5 +1810,47 @@ mod tests {
                 .expect("handler returns health info");
         assert_eq!(result.0.status, "error");
         assert!(!result.0.timed_out);
+    }
+
+    #[tokio::test]
+    async fn rotate_connection_returns_error_instead_of_panicking_on_blocking_connect() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open_at(dir.path().join("data.sqlite")).unwrap();
+        let key = b"01234567890123456789012345678901";
+        let inst_enc = crypto::encrypt(key, b"postgresql://u:p@127.0.0.1:1/postgres").unwrap();
+        storage.save_instance_secret("dev", &inst_enc).unwrap();
+        let enc = crypto::encrypt(key, b"postgresql://u:p@127.0.0.1:1/orders").unwrap();
+        storage
+            .save_provisioned_database(
+                "dev",
+                &ProvisionOutcome {
+                    database_name: "orders".into(),
+                    application_name: "orders".into(),
+                    role_name: "orders_owner".into(),
+                    connection_string: "cs".into(),
+                    database_created: true,
+                    role_created: true,
+                },
+                &enc,
+            )
+            .unwrap();
+        let state = Arc::new(WebState::from_storage(storage).unwrap());
+        let result =
+            post_rotate_connection(test_session(key), State(state), Path(("db".to_owned(), 1)))
+                .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn rotate_instance_returns_error_instead_of_panicking_on_blocking_connect() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open_at(dir.path().join("data.sqlite")).unwrap();
+        let key = b"01234567890123456789012345678901";
+        let inst_enc = crypto::encrypt(key, b"postgresql://u:p@127.0.0.1:1/postgres").unwrap();
+        storage.save_instance_secret("dev", &inst_enc).unwrap();
+        let state = Arc::new(WebState::from_storage(storage).unwrap());
+        let result =
+            post_rotate_instance(test_session(key), State(state), Path("dev".to_owned())).await;
+        assert!(result.is_err());
     }
 }

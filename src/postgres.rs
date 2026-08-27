@@ -1950,6 +1950,57 @@ pub fn is_connect_timeout(error: &str) -> bool {
     error.contains("connection timed out")
 }
 
+/// Rotates a role's password by connecting as an administrator (the instance
+/// base URI user). The role must exist and the connecting user must have
+/// privileges to alter it.
+pub fn rotate_role_password(admin_cs: &str, role_name: &str, new_password: &str) -> Result<()> {
+    let mut client = Client::connect(admin_cs, NoTls)
+        .context("failed to connect to instance while rotating role password")?;
+    let query = format!(
+        "ALTER ROLE \"{}\" WITH PASSWORD '{}'",
+        escape_ident(role_name),
+        escape_literal(new_password)
+    );
+    client
+        .batch_execute(&query)
+        .context("failed to rotate role password")?;
+    Ok(())
+}
+
+/// Rotates the password of `role_name` on the cluster of `admin_cs` and
+/// returns a fresh connection string for `database_name` using the new
+/// password. The previous password is invalidated immediately.
+pub fn rotate_database_credential(
+    admin_cs: &str,
+    database_name: &str,
+    role_name: &str,
+    application_name: &str,
+) -> Result<String> {
+    let new_password = crypto::generate_password()?;
+    rotate_role_password(admin_cs, role_name, &new_password)?;
+    let parsed = parse_database_url(admin_cs)?;
+    Ok(build_connection_string(
+        &parsed.host,
+        parsed.port,
+        database_name,
+        role_name,
+        &new_password,
+        application_name,
+    ))
+}
+
+/// Rotates the password of the administrator user on `base_url` and returns
+/// the base URI with the new password, preserving any query parameters.
+pub fn rotate_base_url_password(base_url: &str) -> Result<String> {
+    let parsed = parse_database_url(base_url)?;
+    let new_password = crypto::generate_password()?;
+    rotate_role_password(base_url, &parsed.username, &new_password)?;
+    let mut url = Url::parse(base_url).context("invalid base DATABASE_URL")?;
+    url.set_password(Some(&new_password))
+        .map_err(|_| anyhow::anyhow!("failed to set password in base DATABASE_URL"))?;
+    Ok(url.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
