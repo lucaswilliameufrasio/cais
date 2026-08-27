@@ -1,4 +1,3 @@
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use cais::models::{
@@ -12,43 +11,42 @@ use cais::postgres::{
     restore_instance_with_progress, run_sql_query, run_table_page,
 };
 use postgres::{Client, NoTls};
+use testcontainers::{GenericImage, Image, ImageExt, core::WaitFor, runners::SyncRunner};
 
-struct DockerPostgres {
-    name: String,
+/// Ephemeral PostgreSQL server backed by its own testcontainers container.
+/// Every test starts its own instance: unique name, Docker-assigned host port
+/// and automatic removal when the container is dropped.
+struct DockerPostgres<I: Image> {
     port: u16,
+    _container: testcontainers::Container<I>,
 }
 
-impl DockerPostgres {
+impl DockerPostgres<GenericImage> {
     fn start() -> Self {
         Self::start_with_tag("postgres:17")
     }
 
     fn start_with_tag(tag: &str) -> Self {
-        let name = format!("db-provisioner-tui-{}", uuid::Uuid::new_v4());
-        let port = 55432 + (uuid::Uuid::new_v4().as_u128() % 1000) as u16;
-
-        let run_status = Command::new("docker")
-            .args([
-                "run",
-                "-d",
-                "--rm",
-                "--name",
-                &name,
-                "-e",
-                "POSTGRES_PASSWORD=postgres",
-                "-e",
-                "POSTGRES_USER=postgres",
-                "-e",
-                "POSTGRES_DB=postgres",
-                "-p",
-                &format!("{port}:5432"),
-                tag,
-            ])
-            .status()
-            .expect("docker run");
-        assert!(run_status.success(), "docker container failed to start");
-
-        let started = DockerPostgres { name, port };
+        let (name, image_tag) = match tag.split_once(':') {
+            Some((name, tag)) => (name, tag),
+            None => (tag, "latest"),
+        };
+        let container = GenericImage::new(name, image_tag)
+            .with_wait_for(WaitFor::message_on_stderr(
+                "database system is ready to accept connections",
+            ))
+            .with_env_var("POSTGRES_PASSWORD", "postgres")
+            .with_env_var("POSTGRES_USER", "postgres")
+            .with_env_var("POSTGRES_DB", "postgres")
+            .start()
+            .expect("start postgres container");
+        let port = container
+            .get_host_port_ipv4(5432)
+            .expect("mapped host port for 5432");
+        let started = Self {
+            port,
+            _container: container,
+        };
         started.wait_ready();
         started
     }
@@ -67,6 +65,8 @@ impl DockerPostgres {
         )
     }
 
+    /// The wait-for message can fire during initdb (before the server
+    /// restarts), so poll until the server actually accepts connections.
     fn wait_ready(&self) {
         let start = Instant::now();
         loop {
@@ -78,14 +78,6 @@ impl DockerPostgres {
             }
             std::thread::sleep(Duration::from_millis(500));
         }
-    }
-}
-
-impl Drop for DockerPostgres {
-    fn drop(&mut self) {
-        let _ = Command::new("docker")
-            .args(["rm", "-f", &self.name])
-            .status();
     }
 }
 

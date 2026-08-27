@@ -37,5 +37,5 @@ zeroize = "1.8.2"
 
 [dev-dependencies]
 http-body-util = "0.1"
+testcontainers = { version = "0.28.0", features = ["blocking"] }
 tower = { version = "0.5", features = ["util"] }
-uuid = { version = "1.18.1", features = ["v4"] }
