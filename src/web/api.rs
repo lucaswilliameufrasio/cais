@@ -326,6 +326,27 @@ struct AdoptRequest {
     application_name: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct QueryTablesRequest {
+    source: SourceRef,
+}
+
+#[derive(Deserialize)]
+struct QueryDataRequest {
+    source: SourceRef,
+    schema: String,
+    table: String,
+    offset: i64,
+}
+
+#[derive(Deserialize)]
+struct QueryRunRequest {
+    source: SourceRef,
+    sql: String,
+    #[serde(default = "default_true")]
+    read_only: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Serialized responses
 // ---------------------------------------------------------------------------
@@ -400,6 +421,26 @@ struct InstanceInfo {
 #[derive(Serialize)]
 struct TokenResponse {
     token: String,
+}
+
+#[derive(Serialize)]
+struct QueryTableInfo {
+    schema: String,
+    name: String,
+    kind: String,
+    rows_estimate: i64,
+    size_bytes: i64,
+}
+
+#[derive(Serialize)]
+struct QueryRowsResponse {
+    columns: Vec<String>,
+    rows: Vec<Vec<Option<String>>>,
+    row_count: usize,
+    duration_ms: u64,
+    truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -988,6 +1029,95 @@ async fn post_discover(
             })
             .collect(),
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Handlers: query console
+// ---------------------------------------------------------------------------
+
+/// SQL errors are part of the normal flow of a query console, so the run
+/// endpoint always responds 200 and reports failures in the `error` field.
+fn query_rows_response(result: anyhow::Result<crate::models::SqlQueryResult>) -> QueryRowsResponse {
+    match result {
+        Ok(r) => {
+            let row_count = r.rows.len();
+            QueryRowsResponse {
+                columns: r.columns,
+                rows: r.rows,
+                row_count,
+                duration_ms: r.duration_ms,
+                truncated: r.truncated,
+                error: None,
+            }
+        }
+        Err(e) => QueryRowsResponse {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            row_count: 0,
+            duration_ms: 0,
+            truncated: false,
+            error: Some(format!("{e:#}")),
+        },
+    }
+}
+
+async fn post_query_tables(
+    Session { key, .. }: Session,
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<QueryTablesRequest>,
+) -> Result<Json<Vec<QueryTableInfo>>, ApiError> {
+    let cs = resolve_source_cs(&state, key.as_ref().as_slice(), &req.source)?;
+    let tables = tokio::task::spawn_blocking(move || postgres::list_database_tables(&cs))
+        .await
+        .map_err(|error| ApiError::from(anyhow::anyhow!("tables task failed: {error}")))?
+        .map_err(ApiError::from)?;
+    Ok(Json(
+        tables
+            .into_iter()
+            .map(|t| QueryTableInfo {
+                schema: t.schema,
+                name: t.name,
+                kind: t.kind,
+                rows_estimate: t.rows_estimate,
+                size_bytes: t.size_bytes,
+            })
+            .collect(),
+    ))
+}
+
+async fn post_query_data(
+    Session { key, .. }: Session,
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<QueryDataRequest>,
+) -> Result<Json<QueryRowsResponse>, ApiError> {
+    let schema = req.schema.trim().to_owned();
+    let table = req.table.trim().to_owned();
+    if schema.is_empty() || table.is_empty() {
+        return Err(ApiError::bad_request("schema and table cannot be empty"));
+    }
+    if req.offset < 0 {
+        return Err(ApiError::bad_request("offset cannot be negative"));
+    }
+    let cs = resolve_source_cs(&state, key.as_ref().as_slice(), &req.source)?;
+    let result = tokio::task::spawn_blocking(move || {
+        postgres::run_table_page(&cs, &schema, &table, req.offset)
+    })
+    .await
+    .map_err(|error| ApiError::from(anyhow::anyhow!("table page task failed: {error}")))?;
+    Ok(Json(query_rows_response(result)))
+}
+
+async fn post_query_run(
+    Session { key, .. }: Session,
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<QueryRunRequest>,
+) -> Result<Json<QueryRowsResponse>, ApiError> {
+    let cs = resolve_source_cs(&state, key.as_ref().as_slice(), &req.source)?;
+    let result =
+        tokio::task::spawn_blocking(move || postgres::run_sql_query(&cs, &req.sql, req.read_only))
+            .await
+            .map_err(|error| ApiError::from(anyhow::anyhow!("query task failed: {error}")))?;
+    Ok(Json(query_rows_response(result)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1594,6 +1724,9 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/backups", get(get_backups))
         .route("/api/restore/preview", post(post_restore_preview))
         .route("/api/restore", post(post_restore))
+        .route("/api/query/tables", post(post_query_tables))
+        .route("/api/query/data", post(post_query_data))
+        .route("/api/query/run", post(post_query_run))
         .route(
             "/api/operations/{id}",
             get(get_operation).delete(delete_operation),
@@ -1809,6 +1942,65 @@ mod tests {
         let result =
             post_instance_health(test_session(key), State(state), Path("ghost".to_owned())).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn query_tables_fails_for_unreachable_source() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open_at(dir.path().join("data.sqlite")).unwrap();
+        let key = b"01234567890123456789012345678901";
+        let inst_enc = crypto::encrypt(key, b"postgresql://u:p@127.0.0.1:1/postgres").unwrap();
+        storage.save_instance_secret("dev", &inst_enc).unwrap();
+        let state = Arc::new(WebState::from_storage(storage).unwrap());
+        let request = QueryTablesRequest {
+            source: SourceRef::Instance {
+                name: "dev".to_owned(),
+            },
+        };
+        let result = post_query_tables(test_session(key), State(state), Json(request)).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn query_data_rejects_negative_offset() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open_at(dir.path().join("data.sqlite")).unwrap();
+        let key = b"01234567890123456789012345678901";
+        let inst_enc = crypto::encrypt(key, b"postgresql://u:p@127.0.0.1:1/postgres").unwrap();
+        storage.save_instance_secret("dev", &inst_enc).unwrap();
+        let state = Arc::new(WebState::from_storage(storage).unwrap());
+        let request = QueryDataRequest {
+            source: SourceRef::Instance {
+                name: "dev".to_owned(),
+            },
+            schema: "public".to_owned(),
+            table: "orders".to_owned(),
+            offset: -1,
+        };
+        let result = post_query_data(test_session(key), State(state), Json(request)).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn query_run_reports_sql_errors_in_error_field() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open_at(dir.path().join("data.sqlite")).unwrap();
+        let key = b"01234567890123456789012345678901";
+        let inst_enc = crypto::encrypt(key, b"postgresql://u:p@127.0.0.1:1/postgres").unwrap();
+        storage.save_instance_secret("dev", &inst_enc).unwrap();
+        let state = Arc::new(WebState::from_storage(storage).unwrap());
+        let request = QueryRunRequest {
+            source: SourceRef::Instance {
+                name: "dev".to_owned(),
+            },
+            sql: "SELECT 1".to_owned(),
+            read_only: true,
+        };
+        let result = post_query_run(test_session(key), State(state), Json(request))
+            .await
+            .expect("handler responds even when the connection fails");
+        assert!(result.0.error.is_some());
+        assert_eq!(result.0.row_count, 0);
     }
 
     #[tokio::test]

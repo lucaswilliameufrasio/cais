@@ -103,6 +103,27 @@ pub struct ProvisionedExtraUserRecord {
     pub created_at: String,
 }
 
+/// A table or view shown by the web query console.
+#[derive(Debug, Clone)]
+pub struct DatabaseTableInfo {
+    pub schema: String,
+    pub name: String,
+    /// `table`, `view` or `matview`.
+    pub kind: String,
+    pub rows_estimate: i64,
+    pub size_bytes: i64,
+}
+
+/// Result of a SQL query executed by the web query console. Values come from
+/// the simple query protocol, so they are text — `None` means NULL.
+#[derive(Debug, Clone)]
+pub struct SqlQueryResult {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Option<String>>>,
+    pub truncated: bool,
+    pub duration_ms: u64,
+}
+
 #[derive(Debug, Clone)]
 pub enum SavedConnectionRecord {
     Database(ProvisionedDatabaseRecord),

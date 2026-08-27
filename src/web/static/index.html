@@ -66,6 +66,50 @@
     <p id="backups-empty" class="empty hidden">Nenhum backup encontrado.</p>
   </section>
 
+  <section id="view-query" class="view hidden">
+    <header class="topbar">
+      <button id="query-back" class="ghost">&larr; Dashboard</button>
+      <h1>Consultar</h1>
+      <div class="topbar-actions">
+        <select id="query-instance" title="Instância"></select>
+        <select id="query-source" title="Conexão"></select>
+      </div>
+    </header>
+    <p id="status-bar" class="status"></p>
+    <div class="query-layout">
+      <aside class="query-sidebar">
+        <input id="query-table-filter" type="search" placeholder="Filtrar tabelas..." autocomplete="off">
+        <div id="query-tables" class="query-tables"></div>
+      </aside>
+      <div class="query-main">
+        <div class="query-tabs">
+          <button id="tab-data" class="ghost active" type="button">Data</button>
+          <button id="tab-sql" class="ghost" type="button">SQL</button>
+        </div>
+        <div id="query-data-pane" class="query-pane">
+          <p id="query-data-title" class="hint">Selecione uma tabela na lateral.</p>
+          <div id="query-data-wrap" class="query-grid-wrap">
+            <table class="table" id="query-data-table"></table>
+          </div>
+        </div>
+        <div id="query-sql-pane" class="query-pane hidden">
+          <textarea id="query-sql-input" class="mono" rows="6" placeholder="SELECT ..."></textarea>
+          <div class="query-sql-actions">
+            <label class="check-row">
+              <input id="query-read-only" type="checkbox" checked>
+              <span>Somente leitura</span>
+            </label>
+            <button id="query-run" class="primary" type="button">Executar (Ctrl+Enter)</button>
+          </div>
+          <p id="query-sql-status" class="query-status"></p>
+          <div id="query-result-wrap" class="query-grid-wrap">
+            <table class="table" id="query-result-table"></table>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <div id="modal-overlay" class="overlay hidden">
     <div id="modal" class="modal">
       <button id="modal-close" class="close" aria-label="Fechar">&times;</button>

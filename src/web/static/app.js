@@ -513,6 +513,7 @@ function dbRow(instanceName, db) {
   const actions = el('td', { class: 'row-actions' }, [
     el('button', { class: 'link', type: 'button', onclick: () => copyConnection(db), text: 'copiar' }),
     el('button', { class: 'link', type: 'button', onclick: () => revealConnection(db), text: 'ver' }),
+    el('button', { class: 'link', type: 'button', onclick: () => openQueryView({ kind: db.kind, id: db.id }), text: 'consultar' }),
     el('button', { class: 'link', type: 'button', onclick: () => testConnection(db), text: 'testar' }),
     el('button', { class: 'link', type: 'button', onclick: () => rotateConnection(db), text: 'rotacionar' }),
     el('button', { class: 'link', type: 'button', onclick: () => editName(db), text: 'renomear' }),
@@ -1357,6 +1358,269 @@ function formatBytes(size) {
   }
   return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 }
+
+// ---------------------------------------------------------------------------
+// Query console
+// ---------------------------------------------------------------------------
+
+const QUERY_PAGE_SIZE = 200;
+const QUERY_DATA_HINT = 'Selecione uma tabela na lateral.';
+
+let queryState = {
+  source: null,
+  sources: [],
+  tables: [],
+  activeTable: null,
+  offset: 0,
+  hasMore: false,
+  loadingMore: false,
+};
+
+function openQueryView(source = null) {
+  const instanceSelect = $('#query-instance');
+  instanceSelect.innerHTML = '';
+  for (const inst of dashboard.instances) {
+    instanceSelect.appendChild(el('option', { value: inst.name, text: inst.name }));
+  }
+
+  let instanceName = dashboard.instances.length ? dashboard.instances[0].name : '';
+  if (source) {
+    if (source.kind === 'instance') {
+      instanceName = source.name;
+    } else {
+      for (const inst of dashboard.instances) {
+        const match = inst.databases.some((db) => db.kind === source.kind && db.id === source.id);
+        if (match) {
+          instanceName = inst.name;
+        }
+      }
+    }
+  }
+  instanceSelect.value = instanceName;
+  fillQuerySources(instanceName, source);
+  showView('view-query');
+}
+
+function fillQuerySources(instanceName, wanted) {
+  const select = $('#query-source');
+  select.innerHTML = '';
+  queryState.sources = buildSourceOptionsFor(instanceName);
+  let selected = queryState.sources.length ? queryState.sources.length - 1 : 0;
+  for (const [index, source] of queryState.sources.entries()) {
+    const option = el('option', { value: String(index), text: source.label });
+    if (wanted && sourceMatches(source.value, wanted)) {
+      selected = index;
+    }
+    select.appendChild(option);
+  }
+  select.value = String(selected);
+  onQuerySourceChange();
+}
+
+function sourceMatches(candidate, wanted) {
+  return candidate.kind === wanted.kind && candidate.id === wanted.id && candidate.name === wanted.name;
+}
+
+function onQuerySourceChange() {
+  const index = Number($('#query-source').value) || 0;
+  queryState.source = queryState.sources[index] ? queryState.sources[index].value : null;
+  queryState.tables = [];
+  queryState.activeTable = null;
+  queryState.offset = 0;
+  queryState.hasMore = false;
+  clearQueryData();
+  loadQueryTables();
+}
+
+function clearQueryData() {
+  $('#query-data-table').innerHTML = '';
+  $('#query-data-title').textContent = QUERY_DATA_HINT;
+  $('#query-result-table').innerHTML = '';
+  $('#query-sql-status').textContent = '';
+}
+
+async function loadQueryTables() {
+  const list = $('#query-tables');
+  list.innerHTML = '';
+  if (!queryState.source) {
+    return;
+  }
+  list.appendChild(el('p', { class: 'hint', text: 'Carregando tabelas...' }));
+  try {
+    const tables = await apiPost('/api/query/tables', { source: queryState.source });
+    queryState.tables = tables;
+    renderQueryTables();
+  } catch (e) {
+    list.innerHTML = '';
+    list.appendChild(el('p', { class: 'error', text: e.message }));
+  }
+}
+
+function renderQueryTables() {
+  const list = $('#query-tables');
+  list.innerHTML = '';
+  const query = ($('#query-table-filter').value || '').trim().toLowerCase();
+  const kindLabels = { table: 'tb', view: 'vw', matview: 'mv' };
+  let shown = 0;
+  for (const t of queryState.tables) {
+    const haystack = `${t.schema}.${t.name}`.toLowerCase();
+    if (query && !haystack.includes(query)) {
+      continue;
+    }
+    shown += 1;
+    const active = queryState.activeTable
+      && queryState.activeTable.schema === t.schema
+      && queryState.activeTable.name === t.name;
+    list.appendChild(el('div', {
+      class: 'query-table-item' + (active ? ' active' : ''),
+      onclick: () => selectQueryTable(t),
+    }, [
+      el('span', { class: 'qt-kind', text: kindLabels[t.kind] || '? ' }),
+      el('span', { class: 'qt-name', text: `${t.schema}.${t.name}` }),
+      el('span', { class: 'qt-meta', text: formatBytes(t.size_bytes) }),
+    ]));
+  }
+  if (!shown) {
+    list.appendChild(el('p', { class: 'hint', text: 'Nenhuma tabela.' }));
+  }
+}
+
+function selectQueryTable(t) {
+  queryState.activeTable = t;
+  queryState.offset = 0;
+  queryState.hasMore = false;
+  switchQueryTab('data');
+  renderQueryTables();
+  $('#query-data-table').innerHTML = '';
+  $('#query-data-title').textContent = `${t.schema}.${t.name} — carregando...`;
+  fetchTablePage(false);
+}
+
+async function fetchTablePage(append) {
+  const t = queryState.activeTable;
+  if (!t || queryState.loadingMore) {
+    return;
+  }
+  queryState.loadingMore = true;
+  try {
+    const data = await apiPost('/api/query/data', {
+      source: queryState.source,
+      schema: t.schema,
+      table: t.name,
+      offset: queryState.offset,
+    });
+    queryState.offset += data.rows.length;
+    queryState.hasMore = data.rows.length >= QUERY_PAGE_SIZE;
+    appendQueryGridRows($('#query-data-table'), data);
+    $('#query-data-title').textContent =
+      `${t.schema}.${t.name} — ${queryState.offset} linha(s) carregada(s) · ~${t.rows_estimate} estimada(s)`;
+  } catch (e) {
+    setStatus(e.message);
+  } finally {
+    queryState.loadingMore = false;
+  }
+}
+
+function appendQueryGridRows(grid, data) {
+  let body = grid.querySelector('tbody');
+  if (!body) {
+    const headRow = el('tr');
+    for (const column of data.columns) {
+      headRow.appendChild(el('th', { text: column }));
+    }
+    grid.appendChild(el('thead', {}, [headRow]));
+    body = el('tbody');
+    grid.appendChild(body);
+  }
+  for (const row of data.rows) {
+    const tr = el('tr');
+    for (const value of row) {
+      if (value === null || value === undefined) {
+        tr.appendChild(el('td', { class: 'null', text: 'NULL' }));
+      } else {
+        tr.appendChild(el('td', { text: value }));
+      }
+    }
+    body.appendChild(tr);
+  }
+}
+
+function switchQueryTab(tab) {
+  const isData = tab === 'data';
+  $('#query-data-pane').classList.toggle('hidden', !isData);
+  $('#query-sql-pane').classList.toggle('hidden', isData);
+  $('#tab-data').classList.toggle('active', isData);
+  $('#tab-sql').classList.toggle('active', !isData);
+}
+
+async function runQuerySql() {
+  const sql = $('#query-sql-input').value;
+  if (!sql.trim()) {
+    return setStatus('Escreva uma query primeiro.');
+  }
+  if (!queryState.source) {
+    return setStatus('Selecione uma conexão.');
+  }
+  const readOnly = $('#query-read-only').checked;
+  $('#query-sql-status').textContent = 'Executando...';
+  try {
+    const data = await apiPost('/api/query/run', {
+      source: queryState.source,
+      sql,
+      read_only: readOnly,
+    });
+    renderSqlResult(data);
+  } catch (e) {
+    $('#query-sql-status').textContent = e.message;
+  }
+}
+
+function renderSqlResult(data) {
+  const grid = $('#query-result-table');
+  const statusEl = $('#query-sql-status');
+  grid.innerHTML = '';
+  statusEl.innerHTML = '';
+  if (data.error) {
+    statusEl.appendChild(el('span', { class: 'query-error', text: data.error }));
+    return;
+  }
+  const headRow = el('tr');
+  for (const column of data.columns) {
+    headRow.appendChild(el('th', { text: column }));
+  }
+  grid.appendChild(el('thead', {}, [headRow]));
+  grid.appendChild(el('tbody'));
+  appendQueryGridRows(grid, { columns: data.columns, rows: data.rows });
+  let status = `${data.row_count} linha(s) em ${data.duration_ms}ms`;
+  if (data.truncated) {
+    status += ' · truncado em 500 linhas (refine com LIMIT)';
+  }
+  if (!data.row_count && !data.columns.length) {
+    status = `Comando executado (sem result set). ${status}`;
+  }
+  statusEl.textContent = status;
+}
+
+$('#query-back').addEventListener('click', () => loadDashboard());
+$('#query-instance').addEventListener('change', (e) => fillQuerySources(e.target.value, null));
+$('#query-source').addEventListener('change', onQuerySourceChange);
+$('#query-table-filter').addEventListener('input', renderQueryTables);
+$('#tab-data').addEventListener('click', () => switchQueryTab('data'));
+$('#tab-sql').addEventListener('click', () => switchQueryTab('sql'));
+$('#query-run').addEventListener('click', runQuerySql);
+$('#query-sql-input').addEventListener('keydown', (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+    e.preventDefault();
+    runQuerySql();
+  }
+});
+$('#query-data-wrap').addEventListener('scroll', () => {
+  const wrap = $('#query-data-wrap');
+  const nearBottom = wrap.scrollTop + wrap.clientHeight >= wrap.scrollHeight - 60;
+  if (nearBottom && queryState.hasMore && !queryState.loadingMore) {
+    fetchTablePage(true);
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Operations

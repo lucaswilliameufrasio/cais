@@ -1,12 +1,13 @@
 use anyhow::{Context, Result};
-use postgres::{Client, NoTls};
+use postgres::{Client, NoTls, SimpleQueryMessage};
 use url::{Host, Url, form_urlencoded::byte_serialize};
 
 use crate::crypto;
 use crate::models::{
-    ActiveQuery, BackupConfig, BackupMetadata, BackupOutcome, ConflictPolicy, DiscoveredDatabase,
-    ExtraUserProvisionOutcome, ExtraUserProvisionRequest, ParsedDatabaseUrl, PgToolBackend,
-    ProvisionFullOutcome, ProvisionFullRequest, ProvisionOutcome, ProvisionRequest, TablespaceMode,
+    ActiveQuery, BackupConfig, BackupMetadata, BackupOutcome, ConflictPolicy, DatabaseTableInfo,
+    DiscoveredDatabase, ExtraUserProvisionOutcome, ExtraUserProvisionRequest, ParsedDatabaseUrl,
+    PgToolBackend, ProvisionFullOutcome, ProvisionFullRequest, ProvisionOutcome, ProvisionRequest,
+    SqlQueryResult, TablespaceMode,
 };
 use crate::validation::{normalize_application_name, validate_database_name};
 
@@ -673,6 +674,144 @@ pub fn discover_databases(instance_cs: &str) -> Result<Vec<DiscoveredDatabase>> 
             connection_limit: row.get(4),
         })
         .collect())
+}
+
+// ---------------------------------------------------------------------------
+// Query console (web)
+// ---------------------------------------------------------------------------
+
+/// Fixed page size of the query console's table data browser.
+pub const TABLE_PAGE_SIZE: i64 = 200;
+
+/// Row cap applied to manually written queries in the web console.
+pub const QUERY_ROW_CAP: usize = 500;
+
+const QUERY_STATEMENT_TIMEOUT_MS: u64 = 30_000;
+
+/// Lists ordinary tables and views of a database for the web query console.
+/// System schemas (`pg_catalog`, `information_schema`, TOAST) are excluded.
+pub fn list_database_tables(client_cs: &str) -> Result<Vec<DatabaseTableInfo>> {
+    let mut client = connect_client(client_cs).context("failed to connect while listing tables")?;
+    let rows = client.query(
+        r#"
+        SELECT n.nspname,
+               c.relname,
+               CASE c.relkind
+                   WHEN 'r' THEN 'table'
+                   WHEN 'p' THEN 'table'
+                   WHEN 'v' THEN 'view'
+                   WHEN 'm' THEN 'matview'
+                   ELSE 'other'
+               END,
+               GREATEST(c.reltuples, 0)::bigint,
+               COALESCE(pg_total_relation_size(c.oid), 0)::bigint
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relkind IN ('r', 'p', 'v', 'm')
+          AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+          AND n.nspname NOT LIKE 'pg_toast%'
+        ORDER BY n.nspname, c.relname
+        "#,
+        &[],
+    )?;
+    Ok(rows
+        .iter()
+        .map(|row| DatabaseTableInfo {
+            schema: row.get(0),
+            name: row.get(1),
+            kind: row.get(2),
+            rows_estimate: row.get(3),
+            size_bytes: row.get(4),
+        })
+        .collect())
+}
+
+/// Browses one page of rows from `schema.table` (always read-only). The table
+/// must exist and be a plain table, partitioned table or view.
+pub fn run_table_page(
+    client_cs: &str,
+    schema: &str,
+    table: &str,
+    offset: i64,
+) -> Result<SqlQueryResult> {
+    let mut client = connect_client(client_cs).context("failed to connect while browsing table")?;
+    let exists = client.query_opt(
+        "SELECT 1 FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r', 'p', 'v', 'm')",
+        &[&schema, &table],
+    )?;
+    if exists.is_none() {
+        anyhow::bail!("table '{schema}.{table}' does not exist or is not browsable");
+    }
+    apply_query_console_settings(&mut client, true)?;
+    let sql = format!(
+        "SELECT * FROM \"{}\".\"{}\" OFFSET {} LIMIT {}",
+        escape_ident(schema),
+        escape_ident(table),
+        offset.max(0),
+        TABLE_PAGE_SIZE,
+    );
+    let cap = usize::try_from(TABLE_PAGE_SIZE.max(0)).unwrap_or(0);
+    execute_simple_query(&mut client, &sql, cap)
+}
+
+/// Runs a manually written query. With `read_only`, the session rejects any
+/// statement that writes to the database. Results are capped at
+/// [`QUERY_ROW_CAP`] rows (flagged via `truncated`).
+pub fn run_sql_query(client_cs: &str, sql: &str, read_only: bool) -> Result<SqlQueryResult> {
+    if sql.trim().is_empty() {
+        anyhow::bail!("query is empty");
+    }
+    let mut client = connect_client(client_cs).context("failed to connect while running query")?;
+    apply_query_console_settings(&mut client, read_only)?;
+    execute_simple_query(&mut client, sql, QUERY_ROW_CAP)
+}
+
+fn apply_query_console_settings(client: &mut Client, read_only: bool) -> Result<()> {
+    client.batch_execute(&format!(
+        "SET statement_timeout = {QUERY_STATEMENT_TIMEOUT_MS}; \
+         SET default_transaction_read_only = {};",
+        if read_only { "on" } else { "off" }
+    ))?;
+    Ok(())
+}
+
+/// Executes `sql` with the simple query protocol (text values, multiple
+/// statements allowed) and caps the serialized rows at `row_cap`.
+fn execute_simple_query(client: &mut Client, sql: &str, row_cap: usize) -> Result<SqlQueryResult> {
+    let start = std::time::Instant::now();
+    let messages = client.simple_query(sql)?;
+    let mut columns: Vec<String> = Vec::new();
+    let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+    let mut truncated = false;
+    for message in &messages {
+        let SimpleQueryMessage::Row(row) = message else {
+            continue;
+        };
+        if columns.is_empty() {
+            columns = row
+                .columns()
+                .iter()
+                .map(|column| column.name().to_owned())
+                .collect();
+        }
+        if rows.len() >= row_cap {
+            truncated = true;
+            break;
+        }
+        let mut values = Vec::with_capacity(row.len());
+        for index in 0..row.len() {
+            values.push(row.get(index).map(str::to_owned));
+        }
+        rows.push(values);
+    }
+    Ok(SqlQueryResult {
+        columns,
+        rows,
+        truncated,
+        duration_ms: start.elapsed().as_millis() as u64,
+    })
 }
 
 pub fn resolve_docker_image(backend: &PgToolBackend, source_cs: Option<&str>) -> String {

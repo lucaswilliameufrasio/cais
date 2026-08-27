@@ -319,6 +319,88 @@ table.table td, .card table td {
 .source-item:hover { background: var(--panel-2); }
 .source-item.selected { background: rgba(79, 140, 255, 0.12); border: 1px solid var(--accent); }
 
+/* Query console */
+.query-layout {
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  gap: 16px;
+  align-items: start;
+}
+.query-sidebar {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 72vh;
+}
+.query-sidebar input {
+  font: inherit;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+}
+.query-sidebar input:focus { outline: none; border-color: var(--accent); }
+.query-tables { overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
+.query-table-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.query-table-item:hover { background: var(--panel-2); }
+.query-table-item.active { background: rgba(79, 140, 255, 0.12); }
+.qt-kind {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+.qt-name { font-size: 13px; word-break: break-all; }
+.qt-meta { margin-left: auto; color: var(--muted); font-size: 11px; white-space: nowrap; }
+.query-main {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.query-tabs { display: flex; gap: 6px; }
+.query-tabs button.active { border-color: var(--accent); color: var(--accent); }
+.query-grid-wrap {
+  max-height: 58vh;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.query-grid-wrap table { min-width: 100%; }
+#query-sql-input {
+  width: 100%;
+  font-family: var(--mono);
+  font-size: 13px;
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  resize: vertical;
+}
+#query-sql-input:focus { outline: none; border-color: var(--accent); }
+.query-sql-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.query-status { min-height: 16px; font-size: 12px; color: var(--muted); margin: 0; }
+.query-error { color: var(--err); font-size: 13px; white-space: pre-wrap; word-break: break-word; }
+td.null { color: var(--muted); font-style: italic; }
+
 /* Loading overlay */
 #loading-overlay { pointer-events: auto; }
 .loading-box {

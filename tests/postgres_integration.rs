@@ -6,10 +6,10 @@ use cais::models::{
     ProvisionRequest,
 };
 use cais::postgres::{
-    InstanceBackupContext, backup_instance_with_progress, check_pg_tools,
+    InstanceBackupContext, backup_instance_with_progress, check_pg_tools, list_database_tables,
     migrate_database_with_progress, provision_database_with_progress,
     provision_extra_user_with_progress, provision_full_with_progress, resolve_docker_image,
-    restore_instance_with_progress,
+    restore_instance_with_progress, run_sql_query, run_table_page,
 };
 use postgres::{Client, NoTls};
 
@@ -272,6 +272,78 @@ fn provision_full_without_dedicated_owner_reuses_base_user() {
     // The returned connection string reuses the base credentials and works.
     Client::connect(&outcome.database_connection_string, NoTls)
         .expect("connect with returned connection string");
+}
+
+#[test]
+fn query_console_lists_tables_and_pages_data() {
+    if std::env::var("RUN_DOCKER_TESTS").ok().as_deref() != Some("1") {
+        return;
+    }
+
+    let pg = DockerPostgres::start();
+    let cs = pg.url();
+    let mut client = Client::connect(&cs, NoTls).expect("connect");
+    client
+        .batch_execute(
+            "CREATE TABLE query_console_items (id bigint PRIMARY KEY, label text); \
+             INSERT INTO query_console_items \
+             SELECT g, 'item-' || g FROM generate_series(1, 250) g;",
+        )
+        .expect("seed table");
+    drop(client);
+
+    let tables = list_database_tables(&cs).expect("list tables");
+    let item = tables
+        .iter()
+        .find(|t| t.schema == "public" && t.name == "query_console_items")
+        .expect("browsed table listed");
+    assert_eq!(item.kind, "table");
+    assert!(
+        tables
+            .iter()
+            .all(|t| t.schema != "pg_catalog" && t.schema != "information_schema"),
+        "system schemas must be excluded"
+    );
+
+    let page1 = run_table_page(&cs, "public", "query_console_items", 0).expect("page 1");
+    assert_eq!(page1.rows.len(), 200);
+    assert!(!page1.truncated);
+    assert_eq!(page1.columns, vec!["id".to_owned(), "label".to_owned()]);
+
+    let page2 = run_table_page(&cs, "public", "query_console_items", 200).expect("page 2");
+    assert_eq!(page2.rows.len(), 50);
+
+    let missing = run_table_page(&cs, "public", "does_not_exist", 0);
+    assert!(missing.is_err(), "unknown table must fail");
+}
+
+#[test]
+fn query_console_read_only_blocks_writes_and_cap_applies() {
+    if std::env::var("RUN_DOCKER_TESTS").ok().as_deref() != Some("1") {
+        return;
+    }
+
+    let pg = DockerPostgres::start();
+    let cs = pg.url();
+    let mut client = Client::connect(&cs, NoTls).expect("connect");
+    client
+        .batch_execute(
+            "CREATE TABLE query_cap_items (id bigint PRIMARY KEY); \
+             INSERT INTO query_cap_items SELECT g FROM generate_series(1, 501) g;",
+        )
+        .expect("seed table");
+    drop(client);
+
+    let blocked = run_sql_query(&cs, "INSERT INTO query_cap_items VALUES (9999)", true);
+    assert!(blocked.is_err(), "read-only session must reject INSERT");
+
+    let select = run_sql_query(&cs, "SELECT * FROM query_cap_items", true).expect("select");
+    assert_eq!(select.rows.len(), 500);
+    assert!(select.truncated, "result must be flagged as truncated");
+
+    let write = run_sql_query(&cs, "INSERT INTO query_cap_items VALUES (9999)", false)
+        .expect("write allowed with read_only off");
+    assert_eq!(write.rows.len(), 0);
 }
 
 #[test]
