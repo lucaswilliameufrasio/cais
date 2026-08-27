@@ -69,7 +69,7 @@ where
     let parsed = parse_database_url(base_url)?;
 
     let mut client =
-        Client::connect(base_url, NoTls).context("failed to connect to the shared database")?;
+        connect_client(base_url).context("failed to connect to the shared database")?;
     let mut steps = Vec::new();
     push_step(
         &mut steps,
@@ -143,7 +143,7 @@ where
     let parsed = parse_database_url(base_url)?;
 
     let mut client =
-        Client::connect(base_url, NoTls).context("failed to connect to the shared database")?;
+        connect_client(base_url).context("failed to connect to the shared database")?;
     let mut steps = Vec::new();
     push_step(
         &mut steps,
@@ -183,7 +183,7 @@ where
     // Schema-level grants and default privileges must run inside the target database
     let target_url = target_url(base_url, &request.database_name)?;
     let mut target_client =
-        Client::connect(&target_url, NoTls).context("failed to connect to target database")?;
+        connect_client(&target_url).context("failed to connect to target database")?;
     let grants_applied =
         apply_schema_grants(&mut target_client, &request.username, &mut steps, &mut emit)?;
 
@@ -235,7 +235,7 @@ where
     let parsed = parse_database_url(base_url)?;
 
     let mut client =
-        Client::connect(base_url, NoTls).context("failed to connect to the shared database")?;
+        connect_client(base_url).context("failed to connect to the shared database")?;
     push_step(
         &mut Vec::new(),
         &mut emit,
@@ -322,8 +322,8 @@ where
                 &mut emit,
             )?;
             let target_url = target_url(base_url, &request.database_name)?;
-            let mut target_client = Client::connect(&target_url, NoTls)
-                .context("failed to connect to target database")?;
+            let mut target_client =
+                connect_client(&target_url).context("failed to connect to target database")?;
             let ga_applied = apply_schema_grants(
                 &mut target_client,
                 extra_username,
@@ -479,6 +479,28 @@ fn target_url(base_url: &str, database_name: &str) -> Result<String> {
     Ok(url.to_string())
 }
 
+/// Connects to `url` enforcing the shared CONNECT_TIMEOUT so unreachable hosts
+/// (dropped packets, firewall) fail fast instead of hanging the caller on the
+/// operating system's default TCP timeout.
+fn connect_client(url: &str) -> Result<Client> {
+    let mut config: postgres::Config = url
+        .parse()
+        .context("connection string is not a valid DATABASE_URL")?;
+    config.connect_timeout(CONNECT_TIMEOUT);
+    Ok(config.connect(NoTls)?)
+}
+
+/// Appends libpq's `connect_timeout` to a connection string handed to an
+/// external tool (pg_restore), which would otherwise wait on the OS TCP
+/// timeout when the target host is unreachable.
+fn with_connect_timeout_param(url: &str) -> Result<String> {
+    let mut parsed = Url::parse(url).context("invalid connection URL")?;
+    parsed
+        .query_pairs_mut()
+        .append_pair("connect_timeout", &CONNECT_TIMEOUT.as_secs().to_string());
+    Ok(parsed.to_string())
+}
+
 fn grant_connect_on_database(
     client: &mut Client,
     database_name: &str,
@@ -619,8 +641,7 @@ pub fn check_pg_tools() -> PgToolBackend {
 }
 
 pub fn detect_source_version(source_cs: &str) -> Result<String> {
-    let mut client =
-        Client::connect(source_cs, NoTls).context("failed to connect to source database")?;
+    let mut client = connect_client(source_cs).context("failed to connect to source database")?;
     let row = client
         .query_one("SELECT version()", &[])
         .context("failed to query source version")?;
@@ -632,8 +653,8 @@ pub fn detect_source_version(source_cs: &str) -> Result<String> {
 /// databases are excluded because they are cluster implementation details,
 /// not application databases.
 pub fn discover_databases(instance_cs: &str) -> Result<Vec<DiscoveredDatabase>> {
-    let mut client = Client::connect(instance_cs, NoTls)
-        .context("failed to connect while discovering databases")?;
+    let mut client =
+        connect_client(instance_cs).context("failed to connect while discovering databases")?;
     let rows = client.query(
         "SELECT datname, pg_get_userbyid(datdba), pg_encoding_to_char(encoding), \
                 dattablespace::regclass::text, datconnlimit \
@@ -682,7 +703,7 @@ pub fn resolve_docker_image(backend: &PgToolBackend, source_cs: Option<&str>) ->
 /// hypertables fails because the extension is missing from the plain
 /// postgres:<major>-alpine image.
 fn detect_timescale_installed(source_cs: &str) -> bool {
-    let Ok(mut client) = Client::connect(source_cs, NoTls) else {
+    let Ok(mut client) = connect_client(source_cs) else {
         return false;
     };
     let found = client
@@ -959,7 +980,7 @@ where
 
     let admin_url = dest_base_url;
     let mut admin_client =
-        Client::connect(admin_url, NoTls).context("failed to connect to destination cluster")?;
+        connect_client(admin_url).context("failed to connect to destination cluster")?;
 
     let db_exists = admin_client
         .query_opt(
@@ -986,7 +1007,7 @@ where
         .batch_execute(&create_query)
         .context("failed to create destination database")?;
 
-    let dest_url = target_url(dest_base_url, dest_db_name)?;
+    let dest_url = with_connect_timeout_param(&target_url(dest_base_url, dest_db_name)?)?;
     push_step(
         &mut Vec::new(),
         emit,
@@ -1640,8 +1661,8 @@ where
         format!("Decrypted. Checking if '{dest_db_name}' exists on target..."),
     );
 
-    let mut admin_client = Client::connect(dest_base_url, NoTls)
-        .context("failed to connect to destination cluster")?;
+    let mut admin_client =
+        connect_client(dest_base_url).context("failed to connect to destination cluster")?;
 
     let db_exists = admin_client
         .query_opt(
@@ -1703,7 +1724,7 @@ where
             .context("failed to create destination database")?;
     }
 
-    let dest_url = target_url(dest_base_url, dest_db_name)?;
+    let dest_url = with_connect_timeout_param(&target_url(dest_base_url, dest_db_name)?)?;
     push_step(
         &mut Vec::new(),
         emit,
@@ -1860,7 +1881,7 @@ where
             }
             Err(error) => {
                 let cleanup = (|| -> Result<()> {
-                    let mut admin = Client::connect(dest_base_url, NoTls)
+                    let mut admin = connect_client(dest_base_url)
                         .context("failed to connect for batch restore cleanup")?;
                     for outcome in &outcomes {
                         drop_database(&mut admin, &outcome.database_name)?;
@@ -1900,7 +1921,7 @@ pub fn mask_connection_string(value: &str) -> String {
 }
 
 pub fn fetch_active_queries(url: &str) -> Result<Vec<ActiveQuery>> {
-    let mut client = Client::connect(url, NoTls).context("failed to connect")?;
+    let mut client = connect_client(url).context("failed to connect")?;
     let rows = client
         .query(
             "SELECT pid, usename, datname, COALESCE(client_addr::text, 'local'),
@@ -1931,7 +1952,7 @@ pub fn fetch_active_queries(url: &str) -> Result<Vec<ActiveQuery>> {
 }
 
 pub fn kill_query(url: &str, pid: i32) -> Result<String> {
-    let mut client = Client::connect(url, NoTls).context("failed to connect")?;
+    let mut client = connect_client(url).context("failed to connect")?;
     let result = client
         .query_one("SELECT pg_terminate_backend($1)", &[&pid])
         .context("failed to terminate query")?;
@@ -1976,7 +1997,7 @@ pub fn is_connect_timeout(error: &str) -> bool {
 /// base URI user). The role must exist and the connecting user must have
 /// privileges to alter it.
 pub fn rotate_role_password(admin_cs: &str, role_name: &str, new_password: &str) -> Result<()> {
-    let mut client = Client::connect(admin_cs, NoTls)
+    let mut client = connect_client(admin_cs)
         .context("failed to connect to instance while rotating role password")?;
     let query = format!(
         "ALTER ROLE \"{}\" WITH PASSWORD '{}'",
