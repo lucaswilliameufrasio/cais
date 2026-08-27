@@ -218,6 +218,19 @@ table.table td, .card table td {
 }
 .inst-summary { color: var(--muted); font-size: 12px; white-space: nowrap; }
 
+/* Per-instance database filter shown when a card is expanded */
+.db-filter {
+  margin: 10px 16px 0;
+  width: calc(100% - 32px);
+  font: inherit;
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+}
+.db-filter:focus { outline: none; border-color: var(--accent); }
+
 .empty { color: var(--muted); padding: 24px 0; text-align: center; }
 
 /* Modal */

@@ -421,12 +421,28 @@ function instanceCard(inst) {
       tbody,
     ]);
 
+    // Filters the rows directly in the DOM so the input never loses focus.
+    const dbFilter = el('input', {
+      class: 'db-filter',
+      type: 'search',
+      placeholder: 'Filtrar bancos por nome, aplicação ou role...',
+      autocomplete: 'off',
+    });
+    dbFilter.addEventListener('input', () => {
+      const query = dbFilter.value.trim().toLowerCase();
+      for (const row of tbody.rows) {
+        const match = !query || row.textContent.toLowerCase().includes(query);
+        row.style.display = match ? '' : 'none';
+      }
+    });
+
     const foot = el('div', { class: 'card-foot' }, [
+      el('button', { class: 'ghost', type: 'button', onclick: () => openBackupModal(inst.name), text: 'Backup' }),
       el('button', { class: 'ghost', type: 'button', onclick: () => openAdoptModal(inst.name), text: 'Adicionar banco existente' }),
       el('button', { class: 'primary', type: 'button', onclick: () => openProvisionModal(inst.name), text: '+ Provisionar banco nesta instância' }),
     ]);
 
-    children.push(table, foot);
+    children.push(dbFilter, table, foot);
   }
 
   return el('div', { class: 'card' + (expanded ? ' expanded' : '') }, children);
@@ -889,21 +905,23 @@ async function openAdoptModal(instanceName) {
 // Migrate wizard
 // ---------------------------------------------------------------------------
 
-$('#btn-migrate').addEventListener('click', () => {
+$('#btn-migrate').addEventListener('click', openMigrateModal);
+
+function openMigrateModal() {
   if (!dashboard.instances.length) {
     return setStatus('Adicione uma instância antes de migrar.');
   }
-  const sources = buildSourceOptions();
-  const options = sources
-    .map((source, index) => `<div class="source-item" data-index="${index}">${escapeHtml(source.label)}</div>`)
-    .join('');
 
   openModal(`
     <h2>Migrar banco</h2>
     <div class="wizard-step">
-      <p class="hint">1. Fonte (o banco que será migrado)</p>
-      <div id="mg-sources">${options}</div>
-      <p class="hint">2. Instância destino</p>
+      <p class="hint">1. Instância de origem</p>
+      <select id="mg-src-inst">
+        ${dashboard.instances.map((instance) => `<option value="${escapeHtml(instance.name)}">${escapeHtml(instance.name)}</option>`).join('')}
+      </select>
+      <p class="hint">2. Fonte (o banco que será migrado)</p>
+      <div id="mg-sources"></div>
+      <p class="hint">3. Instância destino</p>
       <select id="mg-dest">
         ${dashboard.instances.map((instance) => `<option value="${escapeHtml(instance.name)}">${escapeHtml(instance.name)}</option>`).join('')}
       </select>
@@ -919,16 +937,25 @@ $('#btn-migrate').addEventListener('click', () => {
   `);
 
   let selectedSource = null;
-  const items = $('#mg-sources').querySelectorAll('.source-item');
-  for (const item of items) {
-    item.addEventListener('click', () => {
-      for (const sibling of items) {
-        sibling.classList.remove('selected');
-      }
-      item.classList.add('selected');
-      selectedSource = sources[Number(item.dataset.index)].value;
-    });
-  }
+  const renderSources = (instanceName) => {
+    selectedSource = null;
+    const box = $('#mg-sources');
+    box.innerHTML = '';
+    for (const source of buildSourceOptionsFor(instanceName)) {
+      const item = el('div', { class: 'source-item', text: source.label });
+      item.addEventListener('click', () => {
+        for (const sibling of box.querySelectorAll('.source-item')) {
+          sibling.classList.remove('selected');
+        }
+        item.classList.add('selected');
+        selectedSource = source.value;
+      });
+      box.appendChild(item);
+    }
+  };
+
+  renderSources($('#mg-src-inst').value);
+  $('#mg-src-inst').addEventListener('change', (e) => renderSources(e.target.value));
 
   $('#mg-start').addEventListener('click', async () => {
     if (!selectedSource) return setStatus('Selecione a fonte.');
@@ -948,20 +975,20 @@ $('#btn-migrate').addEventListener('click', () => {
     }
   });
   $('#mg-cancel').addEventListener('click', closeModal);
-});
+}
 
-function buildSourceOptions() {
+function buildSourceOptionsFor(instanceName) {
+  const inst = dashboard.instances.find((entry) => entry.name === instanceName);
   const opts = [];
-  for (const inst of dashboard.instances) {
-    for (const db of inst.databases) {
-      if (db.kind === 'db') {
-        opts.push({ value: { kind: 'db', id: db.id }, label: `${db.database_name} (owner) @ ${inst.name}` });
-      } else {
-        opts.push({ value: { kind: 'user', id: db.id }, label: `${db.database_name} (${db.role_or_username}) @ ${inst.name}` });
-      }
+  if (!inst) return opts;
+  for (const db of inst.databases) {
+    if (db.kind === 'db') {
+      opts.push({ value: { kind: 'db', id: db.id }, label: `${db.database_name} (owner)` });
+    } else {
+      opts.push({ value: { kind: 'user', id: db.id }, label: `${db.database_name} (${db.role_or_username})` });
     }
-    opts.push({ value: { kind: 'instance', name: inst.name }, label: `${inst.name} (base URL)` });
   }
+  opts.push({ value: { kind: 'instance', name: inst.name }, label: `${inst.name} (base URL)` });
   return opts;
 }
 
@@ -969,25 +996,28 @@ function buildSourceOptions() {
 // Backup
 // ---------------------------------------------------------------------------
 
-$('#btn-backup').addEventListener('click', () => {
+$('#btn-backup').addEventListener('click', () => openBackupModal());
+
+function openBackupModal(preselectInstance = null) {
   if (!dashboard.instances.length) {
     return setStatus('Adicione uma instância antes de criar um backup.');
   }
-  const sources = buildSourceOptions();
-  const options = sources
-    .map((source, index) => `<div class="source-item" data-index="${index}">${escapeHtml(source.label)}</div>`)
+  const instanceOptions = dashboard.instances
+    .map((instance) => `<option value="${escapeHtml(instance.name)}"${instance.name === preselectInstance ? ' selected' : ''}>${escapeHtml(instance.name)}</option>`)
     .join('');
 
   openModal(`
     <h2>Novo backup</h2>
     <div class="wizard-step">
-      <p class="hint">1. Fonte</p>
-      <div id="bk-sources">${options}</div>
+      <p class="hint">1. Instância de origem</p>
+      <select id="bk-src-inst">${instanceOptions}</select>
+      <p class="hint">2. Fonte</p>
+      <div id="bk-sources"></div>
       <div id="bk-db-wrap">
-        <p class="hint">2. Bancos da instância</p>
+        <p class="hint">3. Bancos da instância</p>
         <div id="bk-dbs" class="checkboxes"></div>
       </div>
-      <p class="hint">3. Opções</p>
+      <p class="hint">4. Opções</p>
       <div id="bk-config" class="checkboxes">
         <label><input id="bk-globals" type="checkbox" checked> Incluir roles e membros do cluster</label>
         <label><input id="bk-passwords" type="checkbox"> Incluir hashes de senha de roles</label>
@@ -1001,17 +1031,26 @@ $('#btn-backup').addEventListener('click', () => {
   `);
 
   let selectedSource = null;
-  const items = $('#bk-sources').querySelectorAll('.source-item');
-  for (const item of items) {
-    item.addEventListener('click', () => {
-      for (const sibling of items) {
-        sibling.classList.remove('selected');
-      }
-      item.classList.add('selected');
-      selectedSource = sources[Number(item.dataset.index)].value;
-      updateBackupDbs(selectedSource);
-    });
-  }
+  const renderSources = (instanceName) => {
+    selectedSource = null;
+    const box = $('#bk-sources');
+    box.innerHTML = '';
+    for (const source of buildSourceOptionsFor(instanceName)) {
+      const item = el('div', { class: 'source-item', text: source.label });
+      item.addEventListener('click', () => {
+        for (const sibling of box.querySelectorAll('.source-item')) {
+          sibling.classList.remove('selected');
+        }
+        item.classList.add('selected');
+        selectedSource = source.value;
+        updateBackupDbs(selectedSource);
+      });
+      box.appendChild(item);
+    }
+  };
+
+  renderSources($('#bk-src-inst').value);
+  $('#bk-src-inst').addEventListener('change', (e) => renderSources(e.target.value));
 
   async function updateBackupDbs(source) {
     const wrap = $('#bk-db-wrap');
@@ -1022,15 +1061,16 @@ $('#btn-backup').addEventListener('click', () => {
       return;
     }
     wrap.classList.remove('hidden');
+    box.innerHTML = '<p class="hint">Descobrindo bancos...</p>';
     try {
       const dbs = await apiPost('/api/discover', { source });
       box.innerHTML = '';
-      dbs.forEach((db) => {
+      for (const db of dbs) {
         box.appendChild(el('label', {}, [
           el('input', { type: 'checkbox', value: db.name, checked: true }),
           el('span', { text: `${db.name} (owner: ${db.owner})` }),
         ]));
-      });
+      }
     } catch (e) {
       box.innerHTML = `<span class="error">${escapeHtml(e.message)}</span>`;
     }
@@ -1057,7 +1097,7 @@ $('#btn-backup').addEventListener('click', () => {
     }
   });
   $('#bk-cancel').addEventListener('click', closeModal);
-});
+}
 
 // ---------------------------------------------------------------------------
 // Restore
