@@ -34,7 +34,6 @@
         <button id="btn-migrate" class="ghost">Migrar</button>
         <button id="btn-backup" class="ghost">Backup</button>
         <button id="btn-restore" class="ghost">Restaurar</button>
-        <button id="btn-health" class="ghost">Health</button>
         <button id="btn-backups" class="ghost">Backups</button>
         <button id="btn-add-instance" class="primary">+ Instância</button>
         <button id="btn-lock" class="danger">Bloquear</button>
@@ -42,6 +41,10 @@
     </header>
     <p id="status-bar" class="status"></p>
     <p id="totals" class="totals"></p>
+    <div class="inst-toolbar">
+      <input id="instance-filter" type="search" placeholder="Filtrar por nome da instância ou host..." autocomplete="off">
+      <div id="inst-pagination" class="pagination"></div>
+    </div>
     <div id="instance-cards" class="cards"></div>
   </section>
 

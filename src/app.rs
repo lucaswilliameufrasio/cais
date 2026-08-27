@@ -637,6 +637,7 @@ impl App {
             ),
             extra_username,
             extra_application_name: extra_app_name,
+            dedicated_owner: true,
         };
 
         let instance_name = self.selected_instance.clone().unwrap_or_default();

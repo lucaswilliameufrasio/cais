@@ -71,12 +71,13 @@ cargo run -- serve --no-browser                   # do not auto-open the browser
 
 What you can do in the browser:
 
-- **Dashboard grouped by instance** — each instance is a card listing every provisioned database (owner + extra users) with health checks
-- **Provision** new databases in an instance (owner role + optional extra user) and copy the generated connection string
+- **Paginated instance list** — instances only (name, host, saved-database counts) with a filter box; click an instance to expand its provisioned databases (owner + extra users)
+- **Per-instance health check** — run on demand from the expanded instance card, never in bulk
+- **Provision** new databases in an instance — dedicated owner role is optional (reuse the base URL user as owner) plus an optional extra user — and copy the generated connection string
 - **Migrate** a database between instances
 - **Backup** a database or an entire instance (select databases, include globals/passwords)
 - **Restore** from an encrypted backup, with a preview of instance bundles (`DBP2`)
-- Manage instances and saved connections (view/copy/rename/delete)
+- Manage instances (add, rotate base credential, remove with its catalog entries) and saved connections (view/copy/rename/delete)
 
 ### Security model
 

@@ -69,6 +69,11 @@ pub struct ProvisionFullRequest {
     pub application_name: String,
     pub extra_username: Option<String>,
     pub extra_application_name: Option<String>,
+    /// When true (default), a dedicated `{db}_owner` role is created and owns
+    /// the database. When false, no new role is created — the database is
+    /// owned by the base URL user and the saved connection string reuses the
+    /// instance base credentials.
+    pub dedicated_owner: bool,
 }
 
 #[derive(Debug, Clone)]

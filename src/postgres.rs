@@ -251,31 +251,53 @@ where
         &mut Vec::new(),
         &mut emit,
     )?;
-    let role_name = format!("{}_owner", request.database_name);
-    let generated_password = crypto::generate_password()?;
-    let role_created = ensure_role(
-        &mut client,
-        &role_name,
-        &generated_password,
-        &mut Vec::new(),
-        &mut emit,
-    )?;
-    set_owner(
-        &mut client,
-        &request.database_name,
-        &role_name,
-        &mut Vec::new(),
-        &mut emit,
-    )?;
 
-    let database_connection_string = build_connection_string(
-        &parsed.host,
-        parsed.port,
-        &request.database_name,
-        &role_name,
-        &generated_password,
-        &application_name,
-    );
+    let (role_name, role_created, database_connection_string) = if request.dedicated_owner {
+        let role_name = format!("{}_owner", request.database_name);
+        let generated_password = crypto::generate_password()?;
+        let role_created = ensure_role(
+            &mut client,
+            &role_name,
+            &generated_password,
+            &mut Vec::new(),
+            &mut emit,
+        )?;
+        set_owner(
+            &mut client,
+            &request.database_name,
+            &role_name,
+            &mut Vec::new(),
+            &mut emit,
+        )?;
+
+        let cs = build_connection_string(
+            &parsed.host,
+            parsed.port,
+            &request.database_name,
+            &role_name,
+            &generated_password,
+            &application_name,
+        );
+        (role_name, role_created, cs)
+    } else {
+        // No dedicated role: the database is owned by the base URL user and
+        // the saved connection string reuses the instance base credentials.
+        push_step(
+            &mut Vec::new(),
+            &mut emit,
+            format!(
+                "Using base URL user {} as owner (no dedicated role)",
+                parsed.username
+            ),
+        );
+        let cs = database_connection_string(base_url, &request.database_name)?;
+        push_step(
+            &mut Vec::new(),
+            &mut emit,
+            "Constructed new connection string".to_owned(),
+        );
+        (parsed.username.clone(), false, cs)
+    };
 
     let (extra_username, extra_connection_string, extra_role_created, extra_grants_applied) =
         if let Some(ref extra_username) = request.extra_username {

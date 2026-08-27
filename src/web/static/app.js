@@ -49,6 +49,11 @@ const apiDelete = (p) => api(p, { method: 'DELETE' });
 
 let dashboard = { instances: [], totals: { databases: 0, extra_users: 0 } };
 
+// Instance list pagination/filter/expand state.
+const INSTANCES_PER_PAGE = 10;
+let instancePage = 1;
+let expandedInstance = null;
+
 // ---------------------------------------------------------------------------
 // DOM helpers
 // ---------------------------------------------------------------------------
@@ -310,48 +315,121 @@ function healthBadge(health) {
 }
 
 function renderDashboard() {
+  renderInstanceList();
+  renderPagination();
+}
+
+function filteredInstances() {
+  const query = ($('#instance-filter').value || '').trim().toLowerCase();
+  if (!query) return dashboard.instances;
+  const matches = [];
+  for (const inst of dashboard.instances) {
+    if (inst.name.toLowerCase().includes(query) || hostLabel(inst).toLowerCase().includes(query)) {
+      matches.push(inst);
+    }
+  }
+  return matches;
+}
+
+function renderInstanceList() {
   const container = $('#instance-cards');
   container.innerHTML = '';
   if (!dashboard.instances.length) {
     container.appendChild(el('p', { class: 'empty', text: 'Nenhuma instância. Clique em "+ Instância" para começar.' }));
     return;
   }
-  for (const inst of dashboard.instances) {
+  const instances = filteredInstances();
+  if (!instances.length) {
+    container.appendChild(el('p', { class: 'empty', text: 'Nenhuma instância corresponde ao filtro.' }));
+    return;
+  }
+  const pageCount = Math.max(1, Math.ceil(instances.length / INSTANCES_PER_PAGE));
+  if (instancePage > pageCount) instancePage = pageCount;
+  const start = (instancePage - 1) * INSTANCES_PER_PAGE;
+  for (const inst of instances.slice(start, start + INSTANCES_PER_PAGE)) {
     container.appendChild(instanceCard(inst));
   }
 }
 
+function renderPagination() {
+  const box = $('#inst-pagination');
+  box.innerHTML = '';
+  const total = filteredInstances().length;
+  if (total <= INSTANCES_PER_PAGE) return;
+  const pageCount = Math.ceil(total / INSTANCES_PER_PAGE);
+  const goto = (page) => {
+    instancePage = Math.min(pageCount, Math.max(1, page));
+    renderInstanceList();
+    renderPagination();
+  };
+  box.appendChild(el('button', {
+    class: 'small ghost',
+    type: 'button',
+    text: '←',
+    disabled: instancePage <= 1 ? 'disabled' : null,
+    onclick: () => goto(instancePage - 1),
+  }));
+  box.appendChild(el('span', { class: 'page-info', text: `Página ${instancePage} de ${pageCount} · ${total} instância(s)` }));
+  box.appendChild(el('button', {
+    class: 'small ghost',
+    type: 'button',
+    text: '→',
+    disabled: instancePage >= pageCount ? 'disabled' : null,
+    onclick: () => goto(instancePage + 1),
+  }));
+}
+
+function toggleInstance(name) {
+  expandedInstance = expandedInstance === name ? null : name;
+  renderInstanceList();
+}
+
 function instanceCard(inst) {
-  const head = el('div', { class: 'card-head' }, [
+  const expanded = expandedInstance === inst.name;
+  const dbCount = inst.databases.filter((d) => d.kind === 'db').length;
+  const userCount = inst.databases.filter((d) => d.kind === 'user').length;
+  const summary = `${dbCount} banco(s) · ${userCount} usuário(s) extra(s)`;
+
+  const stop = (fn) => (e) => { e.stopPropagation(); fn(); };
+  const head = el('div', { class: 'card-head clickable', onclick: () => toggleInstance(inst.name) }, [
+    el('span', { class: 'caret', text: expanded ? '▾' : '▸' }),
     el('span', { class: 'inst-name', text: inst.name }),
     healthBadge(inst.health),
+    el('span', { class: 'inst-summary', text: summary }),
     el('span', { class: 'inst-host', text: hostLabel(inst) }),
     el('div', { class: 'inst-actions' }, [
-      el('button', { class: 'small ghost', type: 'button', onclick: () => revealInstanceUrl(inst.name), text: 'URL base' }),
-      el('button', { class: 'small ghost', type: 'button', onclick: () => rotateInstance(inst.name), text: 'Rotacionar' }),
+      el('button', { class: 'small ghost', type: 'button', onclick: stop(() => testInstance(inst.name)), text: 'Testar' }),
+      el('button', { class: 'small ghost', type: 'button', onclick: stop(() => revealInstanceUrl(inst.name)), text: 'URL base' }),
+      el('button', { class: 'small ghost', type: 'button', onclick: stop(() => rotateInstance(inst.name)), text: 'Rotacionar' }),
+      el('button', { class: 'small danger', type: 'button', onclick: stop(() => removeInstance(inst.name)), text: 'Remover' }),
     ]),
   ]);
 
-  const tbody = el('tbody');
-  for (const db of inst.databases) {
-    tbody.appendChild(dbRow(inst.name, db));
-  }
-  const table = el('table', {}, [
-    el('thead', {}, [
-      el('tr', {}, [
-        el('th', { text: 'Banco' }), el('th', { text: 'Aplicação' }),
-        el('th', { text: 'Role' }), el('th', { text: '' }),
+  const children = [head];
+  if (expanded) {
+    const tbody = el('tbody');
+    for (const db of inst.databases) {
+      tbody.appendChild(dbRow(inst.name, db));
+    }
+    const table = el('table', {}, [
+      el('thead', {}, [
+        el('tr', {}, [
+          el('th', { text: 'Banco' }), el('th', { text: 'Aplicação' }),
+          el('th', { text: 'Role' }), el('th', { text: '' }),
+        ]),
       ]),
-    ]),
-    tbody,
-  ]);
+      tbody,
+    ]);
 
-  const foot = el('div', { class: 'card-foot' }, [
-    el('button', { class: 'ghost', type: 'button', onclick: () => openAdoptModal(inst.name), text: 'Adicionar banco existente' }),
-    el('button', { class: 'primary', type: 'button', onclick: () => openProvisionModal(inst.name), text: '+ Provisionar banco nesta instância' }),
-  ]);
+    const foot = el('div', { class: 'card-foot' }, [
+      el('button', { class: 'ghost', type: 'button', onclick: () => openAdoptModal(inst.name), text: 'Adicionar banco existente' }),
+      el('button', { class: 'primary', type: 'button', onclick: () => openProvisionModal(inst.name), text: '+ Provisionar banco nesta instância' }),
+    ]);
 
-  return el('div', { class: 'card' }, [head, table, foot]);
+    children.push(table, foot);
+  }
+
+  return el('div', { class: 'card' + (expanded ? ' expanded' : '') }, children);
 }
 
 function hostLabel(inst) {
@@ -416,9 +494,11 @@ async function revealConnection(db) {
   }
 }
 
-async function testConnection(db) {
+// Opens the standard health-check modal and renders the outcome of `probe`
+// (a promise resolving to a HealthInfo-like object) inside it.
+function openHealthCheckModal(title, probe) {
   openModal(`
-    <h2>Testar conexão — ${escapeHtml(db.database_name)}</h2>
+    <h2>Testar conexão — ${escapeHtml(title)}</h2>
     <div class="health-check" id="hc-status" data-state="checking">
       <span class="spinner" id="hc-spinner"></span>
       <span id="hc-label">Verificando conexão...</span>
@@ -443,8 +523,7 @@ async function testConnection(db) {
     }
   };
 
-  try {
-    const info = await api(`/api/connections/${db.kind}/${db.id}/health`, { method: 'POST' });
+  Promise.resolve(probe).then((info) => {
     if (info.status === 'ok') {
       showResult(
         'ok',
@@ -456,16 +535,64 @@ async function testConnection(db) {
     } else {
       showResult('error', 'Falha na conexão', escapeHtml(info.error || ''));
     }
-  } catch (error) {
+  }).catch((error) => {
     const timedOut = error.message === 'Tempo esgotado aguardando o servidor.';
     showResult(
       timedOut ? 'timeout' : 'error',
       timedOut ? 'Tempo esgotado' : 'Falha na conexão',
       escapeHtml(error.message),
     );
-  }
+  });
 
   $('#hc-close').addEventListener('click', closeModal);
+}
+
+async function testConnection(db) {
+  openHealthCheckModal(
+    db.database_name,
+    api(`/api/connections/${db.kind}/${db.id}/health`, { method: 'POST' }),
+  );
+}
+
+// On-demand health check for a single instance. Updates the card badge with
+// the outcome and shows the details in a modal.
+async function testInstance(name) {
+  const inst = dashboard.instances.find((entry) => entry.name === name);
+  if (inst) {
+    inst.health = { status: 'checking' };
+    renderInstanceList();
+  }
+  try {
+    const info = await api(`/api/instances/${encodeURIComponent(name)}/health`, { method: 'POST' });
+    if (inst) {
+      inst.health = info;
+      renderInstanceList();
+    }
+    openHealthCheckModal(name, Promise.resolve(info));
+  } catch (error) {
+    if (inst) {
+      inst.health = { status: 'error', error: error.message };
+      renderInstanceList();
+    }
+    setStatus(error.message);
+  }
+}
+
+async function removeInstance(name) {
+  const confirmed = await confirmModalCountdown(
+    'Remover instância',
+    `Remover a instância ${name} e todas as conexões salvas dela (bancos e usuários extras)? Apenas o catálogo local é removido — nada é apagado no servidor PostgreSQL.`,
+    'Remover',
+  );
+  if (!confirmed) return;
+  try {
+    await apiDelete(`/api/instances/${encodeURIComponent(name)}`);
+    if (expandedInstance === name) expandedInstance = null;
+    await loadDashboard();
+    setStatus(`Instância '${name}' removida do catálogo.`);
+  } catch (e) {
+    setStatus(e.message);
+  }
 }
 
 async function rotateConnection(db) {
@@ -624,20 +751,13 @@ $('#btn-add-instance').addEventListener('click', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Health
+// Instance filter
 // ---------------------------------------------------------------------------
 
-$('#btn-health').addEventListener('click', async () => {
-  setStatus('Verificando conexões...');
-  try {
-    await apiPost('/api/health', {});
-    setTimeout(async () => {
-      await loadDashboard();
-      setStatus('Health check concluído.');
-    }, 1200);
-  } catch (e) {
-    setStatus(e.message);
-  }
+$('#instance-filter').addEventListener('input', () => {
+  instancePage = 1;
+  renderInstanceList();
+  renderPagination();
 });
 
 // ---------------------------------------------------------------------------
@@ -656,6 +776,11 @@ function openProvisionModal(instanceName) {
         Nome da aplicação (opcional)
         <input id="pv-app" type="text" placeholder="se vazio, usa o nome do banco">
       </label>
+      <label class="check-row">
+        <input id="pv-dedicated" type="checkbox" checked>
+        <span>Criar role owner dedicada ({banco}_owner)</span>
+      </label>
+      <p class="hint">Desmarque para o banco pertencer ao usuário da URL base — nenhuma role nova é criada e a conexão salva reutiliza as credenciais da instância.</p>
       <label>
         Usuário extra (opcional)
         <input id="pv-extra-user" type="text" placeholder="ex.: orders_worker">
@@ -664,7 +789,7 @@ function openProvisionModal(instanceName) {
         App name do usuário extra (opcional)
         <input id="pv-extra-app" type="text" placeholder="se vazio, usa o nome do banco">
       </label>
-      <p class="hint">Cria banco + role owner + opcional role extra, salva no catálogo e gera connection strings.</p>
+      <p class="hint">Cria o banco no catálogo e gera connection strings. A role owner dedicada é opcional.</p>
       <div class="form-actions">
         <button id="pv-cancel" class="ghost">Cancelar</button>
         <button id="pv-start" class="primary">Provisionar</button>
@@ -678,6 +803,7 @@ function openProvisionModal(instanceName) {
       application_name: $('#pv-app').value.trim() || null,
       extra_username: $('#pv-extra-user').value.trim() || null,
       extra_application_name: $('#pv-extra-app').value.trim() || null,
+      dedicated_owner: $('#pv-dedicated').checked,
     };
     if (!body.database_name) return setStatus('Informe o nome do banco.');
     try {

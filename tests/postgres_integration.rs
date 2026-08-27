@@ -2,12 +2,14 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use cais::models::{
-    BackupConfig, ConflictPolicy, ExtraUserProvisionRequest, PgToolBackend, ProvisionRequest,
+    BackupConfig, ConflictPolicy, ExtraUserProvisionRequest, PgToolBackend, ProvisionFullRequest,
+    ProvisionRequest,
 };
 use cais::postgres::{
     InstanceBackupContext, backup_instance_with_progress, check_pg_tools,
     migrate_database_with_progress, provision_database_with_progress,
-    provision_extra_user_with_progress, resolve_docker_image, restore_instance_with_progress,
+    provision_extra_user_with_progress, provision_full_with_progress, resolve_docker_image,
+    restore_instance_with_progress,
 };
 use postgres::{Client, NoTls};
 
@@ -233,6 +235,43 @@ fn provision_existing_role_rotates_password_so_connection_works() {
     // The role pre-existed, so the password must have been rotated for the
     // returned connection string to be usable.
     Client::connect(&second.connection_string, NoTls).expect("connect with rotated credentials");
+}
+
+#[test]
+fn provision_full_without_dedicated_owner_reuses_base_user() {
+    if std::env::var("RUN_DOCKER_TESTS").ok().as_deref() != Some("1") {
+        return;
+    }
+
+    let pg = DockerPostgres::start();
+    let request = ProvisionFullRequest {
+        database_name: "legacy_db".into(),
+        application_name: "legacy_db".into(),
+        extra_username: None,
+        extra_application_name: None,
+        dedicated_owner: false,
+    };
+    let outcome = provision_full_with_progress(&pg.url(), &request, |_| {}).expect("provision");
+
+    assert!(outcome.database_created);
+    assert!(!outcome.role_created);
+    assert_eq!(outcome.role_name, "postgres");
+
+    let mut client = Client::connect(&pg.url(), NoTls).expect("connect");
+    let owner_role = client
+        .query_opt(
+            "SELECT 1 FROM pg_roles WHERE rolname = 'legacy_db_owner'",
+            &[],
+        )
+        .expect("query roles");
+    assert!(
+        owner_role.is_none(),
+        "no dedicated owner role should be created"
+    );
+
+    // The returned connection string reuses the base credentials and works.
+    Client::connect(&outcome.database_connection_string, NoTls)
+        .expect("connect with returned connection string");
 }
 
 #[test]

@@ -262,6 +262,8 @@ struct ProvisionRequest {
     application_name: Option<String>,
     extra_username: Option<String>,
     extra_application_name: Option<String>,
+    #[serde(default = "default_true")]
+    dedicated_owner: bool,
 }
 
 #[derive(Deserialize)]
@@ -809,6 +811,51 @@ async fn delete_connection(
     Ok(Json(json!({ "ok": true })))
 }
 
+/// Tests a single instance base URI on demand and caches the result under
+/// `instance:{name}` so the dashboard badge shows the last known state.
+/// Always responds 200 so the UI can read the per-instance outcome.
+async fn post_instance_health(
+    Session { key, .. }: Session,
+    State(state): State<Arc<WebState>>,
+    Path(name): Path<String>,
+) -> Result<Json<HealthInfo>, ApiError> {
+    let cs = {
+        let storage = state.storage.lock().unwrap();
+        let secret = storage
+            .load_instance_secret(&name)?
+            .ok_or_else(|| ApiError::not_found(format!("instance '{name}' not found")))?;
+        decrypt_connection(key.as_ref().as_slice(), &secret.encrypted)?
+    };
+    let probe = tokio::task::spawn_blocking(move || postgres::check_connection_health(&cs))
+        .await
+        .map_err(|error| ApiError::from(anyhow::anyhow!("health check task failed: {error}")))?;
+    let info = match probe {
+        Ok((latency_ms, version)) => HealthInfo {
+            status: "ok".to_owned(),
+            latency_ms: Some(latency_ms),
+            version: Some(version),
+            error: None,
+            timed_out: false,
+        },
+        Err(error) => {
+            let message = format!("{error:#}");
+            HealthInfo {
+                status: "error".to_owned(),
+                latency_ms: None,
+                version: None,
+                error: Some(message.clone()),
+                timed_out: postgres::is_connect_timeout(&message),
+            }
+        }
+    };
+    state
+        .health
+        .lock()
+        .unwrap()
+        .insert(format!("instance:{name}"), info.clone());
+    Ok(Json(info))
+}
+
 // ---------------------------------------------------------------------------
 // Handlers: instances
 // ---------------------------------------------------------------------------
@@ -846,9 +893,9 @@ async fn delete_instance(
     State(state): State<Arc<WebState>>,
     Path(name): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let storage = state.storage.lock().unwrap();
+    let mut storage = state.storage.lock().unwrap();
     storage
-        .delete_instance(&name)
+        .delete_instance_cascade(&name)
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
     Ok(Json(json!({ "ok": true })))
 }
@@ -941,81 +988,6 @@ async fn post_discover(
             })
             .collect(),
     ))
-}
-
-async fn post_health(
-    Session { key, .. }: Session,
-    State(state): State<Arc<WebState>>,
-) -> Result<Json<Value>, ApiError> {
-    let key = key.as_ref().as_slice().to_vec();
-    let mut targets: Vec<(String, String)> = Vec::new();
-
-    {
-        let storage = state.storage.lock().unwrap();
-        for name in storage.list_instances()? {
-            if let Some(secret) = storage.load_instance_secret(&name)?
-                && let Ok(cs) = decrypt_connection(&key, &secret.encrypted)
-            {
-                targets.push((format!("instance:{name}"), cs));
-            }
-        }
-        for record in storage.list_saved_connections()? {
-            let id = match &record {
-                SavedConnectionRecord::Database(r) => format!("conn:db:{}", r.id),
-                SavedConnectionRecord::ExtraUser(r) => format!("conn:user:{}", r.id),
-                SavedConnectionRecord::Instance { name, .. } => {
-                    format!("conn:instance:{name}")
-                }
-            };
-            if let Ok(cs) = decrypt_connection(&key, record_encrypted(&record)) {
-                targets.push((id, cs));
-            }
-        }
-    }
-
-    {
-        let mut map = state.health.lock().unwrap();
-        for (id, _) in &targets {
-            map.insert(
-                id.clone(),
-                HealthInfo {
-                    status: "checking".to_owned(),
-                    ..Default::default()
-                },
-            );
-        }
-    }
-
-    for (id, cs) in &targets {
-        let map = state.health.clone();
-        let id = id.clone();
-        let cs = cs.clone();
-        std::thread::spawn(move || {
-            let result = postgres::check_connection_health(&cs);
-            let mut map = map.lock().unwrap();
-            map.insert(
-                id,
-                match result {
-                    Ok((latency_ms, version)) => HealthInfo {
-                        status: "ok".to_owned(),
-                        latency_ms: Some(latency_ms),
-                        version: Some(version),
-                        error: None,
-                        timed_out: false,
-                    },
-                    Err(e) => HealthInfo {
-                        status: "error".to_owned(),
-                        latency_ms: None,
-                        version: None,
-                        error: Some(format!("{e:#}")),
-                        timed_out: postgres::is_connect_timeout(&format!("{e:#}")),
-                    },
-                },
-            );
-        });
-    }
-
-    Ok(Json(json!({ "ok": true, "targets": targets.len() })))
 }
 
 // ---------------------------------------------------------------------------
@@ -1132,6 +1104,7 @@ async fn post_provision(
         ),
         extra_username,
         extra_application_name: extra_app_name,
+        dedicated_owner: req.dedicated_owner,
     };
 
     let op_key = key.clone();
@@ -1611,10 +1584,10 @@ pub fn router(state: Arc<WebState>) -> Router {
         )
         .route("/api/instances", post(post_instances))
         .route("/api/instances/{name}", delete(delete_instance))
+        .route("/api/instances/{name}/health", post(post_instance_health))
         .route("/api/instances/{name}/rotate", post(post_rotate_instance))
         .route("/api/adopt", post(post_adopt))
         .route("/api/discover", post(post_discover))
-        .route("/api/health", post(post_health))
         .route("/api/provision", post(post_provision))
         .route("/api/migrate", post(post_migrate))
         .route("/api/backup", post(post_backup))
@@ -1810,6 +1783,32 @@ mod tests {
                 .expect("handler returns health info");
         assert_eq!(result.0.status, "error");
         assert!(!result.0.timed_out);
+    }
+
+    #[tokio::test]
+    async fn instance_health_reports_error_instead_of_panicking() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open_at(dir.path().join("data.sqlite")).unwrap();
+        let key = b"01234567890123456789012345678901";
+        let inst_enc = crypto::encrypt(key, b"postgresql://u:p@127.0.0.1:1/postgres").unwrap();
+        storage.save_instance_secret("dev", &inst_enc).unwrap();
+        let state = Arc::new(WebState::from_storage(storage).unwrap());
+        let result = post_instance_health(test_session(key), State(state), Path("dev".to_owned()))
+            .await
+            .expect("handler returns health info");
+        assert_eq!(result.0.status, "error");
+        assert!(!result.0.timed_out);
+    }
+
+    #[tokio::test]
+    async fn instance_health_fails_for_unknown_instance() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open_at(dir.path().join("data.sqlite")).unwrap();
+        let key = b"01234567890123456789012345678901";
+        let state = Arc::new(WebState::from_storage(storage).unwrap());
+        let result =
+            post_instance_health(test_session(key), State(state), Path("ghost".to_owned())).await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]

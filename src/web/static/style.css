@@ -184,6 +184,40 @@ table.table td, .card table td {
 }
 .card-foot button { flex: 1; }
 
+/* Instance list toolbar (filter + pagination) */
+.inst-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin: 0 0 12px;
+}
+.inst-toolbar input {
+  flex: 1;
+  min-width: 220px;
+  font: inherit;
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+}
+.inst-toolbar input:focus { outline: none; border-color: var(--accent); }
+.pagination { display: flex; align-items: center; gap: 8px; }
+.pagination .page-info { font-size: 13px; color: var(--muted); }
+
+/* Collapsed instance rows */
+.card-head.clickable { cursor: pointer; user-select: none; }
+.card-head.clickable:hover { background: rgba(79, 140, 255, 0.06); }
+.caret {
+  display: inline-block;
+  width: 14px;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}
+.inst-summary { color: var(--muted); font-size: 12px; white-space: nowrap; }
+
 .empty { color: var(--muted); padding: 24px 0; text-align: center; }
 
 /* Modal */
@@ -232,6 +266,7 @@ table.table td, .card table td {
 
 .checkboxes { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
 .checkboxes label { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text); }
+.check-row { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text); }
 
 .logs {
   font-family: var(--mono);

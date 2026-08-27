@@ -399,6 +399,24 @@ impl Storage {
         Ok(())
     }
 
+    /// Removes an instance and every catalog record that belongs to it in a
+    /// single transaction. Only catalog data is removed — nothing is dropped
+    /// from the actual PostgreSQL server.
+    pub fn delete_instance_cascade(&mut self, name: &str) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM provisioned_extra_users WHERE environment_name = ?1",
+            params![name],
+        )?;
+        tx.execute(
+            "DELETE FROM provisioned_databases WHERE environment_name = ?1",
+            params![name],
+        )?;
+        tx.execute("DELETE FROM environments WHERE name = ?1", params![name])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn save_provisioned_database(
         &self,
         instance_name: &str,
@@ -1238,5 +1256,79 @@ mod tests {
         let updated = storage.list_provisioned_extra_users().expect("list");
         let plaintext = crypto::decrypt(key, &updated[0].encrypted).expect("decrypt");
         assert_eq!(plaintext.as_slice(), b"new-cs");
+    }
+
+    #[test]
+    fn delete_instance_cascade_removes_instance_and_catalog_entries() {
+        let dir = tempdir().expect("dir");
+        let mut storage = Storage::open_at(dir.path().join("data.sqlite")).expect("storage");
+        let key = b"01234567890123456789012345678901";
+        let inst_enc = crypto::encrypt(key, b"postgresql://u:p@h/postgres").expect("encrypt");
+        storage
+            .save_instance_secret("legacy", &inst_enc)
+            .expect("save instance");
+
+        let db_enc = crypto::encrypt(key, b"postgresql://u:p@h/orders").expect("encrypt");
+        storage
+            .save_provisioned_database(
+                "legacy",
+                &ProvisionOutcome {
+                    database_name: "orders".into(),
+                    application_name: "orders".into(),
+                    role_name: "orders_owner".into(),
+                    connection_string: "cs".into(),
+                    database_created: true,
+                    role_created: true,
+                },
+                &db_enc,
+            )
+            .expect("save db");
+
+        let user_enc = crypto::encrypt(key, b"postgresql://u:p@h/orders").expect("encrypt");
+        storage
+            .save_provisioned_extra_user(
+                "legacy",
+                &ExtraUserProvisionOutcome {
+                    database_name: "orders".into(),
+                    username: "orders_worker".into(),
+                    application_name: "orders".into(),
+                    connection_string: "cs".into(),
+                    role_created: true,
+                    grants_applied: true,
+                },
+                &user_enc,
+            )
+            .expect("save user");
+
+        storage
+            .delete_instance_cascade("legacy")
+            .expect("cascade delete");
+
+        assert!(
+            storage
+                .load_instance_secret("legacy")
+                .expect("load")
+                .is_none(),
+            "instance secret must be removed"
+        );
+        assert!(
+            storage
+                .list_provisioned_databases()
+                .expect("list")
+                .is_empty(),
+            "provisioned databases must be removed"
+        );
+        assert!(
+            storage
+                .list_provisioned_extra_users()
+                .expect("list")
+                .is_empty(),
+            "provisioned extra users must be removed"
+        );
+
+        // The name becomes free again for re-registration.
+        storage
+            .save_instance_secret("legacy", &inst_enc)
+            .expect("re-save instance under the same name");
     }
 }
