@@ -14,27 +14,46 @@ async function api(path, options = {}) {
   if (options.body !== undefined && !headers['Content-Type']) {
     headers['Content-Type'] = 'application/json';
   }
-  if (token) headers['Authorization'] = 'Bearer ' + token;
+  if (token) {
+    headers['Authorization'] = 'Bearer ' + token;
+  }
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const external = options.signal || null;
+  const forwardAbort = () => controller.abort();
+  if (external) {
+    if (external.aborted) {
+      controller.abort();
+    } else {
+      external.addEventListener('abort', forwardAbort);
+    }
+  }
   let res;
   try {
     res = await fetch(path, { ...options, headers, signal: controller.signal });
   } catch (e) {
     if (e && e.name === 'AbortError') {
+      if (external && external.aborted) {
+        throw new Error('__cancelled__');
+      }
       throw new Error('Tempo esgotado aguardando o servidor.');
     }
     throw e;
   } finally {
     clearTimeout(timeout);
+    if (external) {
+      external.removeEventListener('abort', forwardAbort);
+    }
   }
   if (res.status === 401) {
     lockLocal();
     throw new Error('Sessão expirada. Desbloqueie novamente.');
   }
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || ('Erro ' + res.status));
+  if (!res.ok) {
+    throw new Error(data.error || ('Erro ' + res.status));
+  }
   return data;
 }
 
@@ -62,13 +81,20 @@ const $ = (sel) => document.querySelector(sel);
 const el = (tag, attrs = {}, children = []) => {
   const node = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs)) {
-    if (k === 'text') node.textContent = v;
-    else if (k === 'html') node.innerHTML = v;
-    else if (k.startsWith('on') && typeof v === 'function') node.addEventListener(k.slice(2), v);
-    else if (v !== null && v !== undefined) node.setAttribute(k, v);
+    if (k === 'text') {
+      node.textContent = v;
+    } else if (k === 'html') {
+      node.innerHTML = v;
+    } else if (k.startsWith('on') && typeof v === 'function') {
+      node.addEventListener(k.slice(2), v);
+    } else if (v !== null && v !== undefined) {
+      node.setAttribute(k, v);
+    }
   }
   for (const child of [].concat(children)) {
-    if (child) node.appendChild(typeof child === 'string' ? document.createTextNode(child) : child);
+    if (child) {
+      node.appendChild(typeof child === 'string' ? document.createTextNode(child) : child);
+    }
   }
   return node;
 };
@@ -82,7 +108,9 @@ function escapeHtml(value) {
 function showView(id) {
   document.querySelectorAll('.view').forEach((v) => v.classList.add('hidden'));
   const view = document.getElementById(id);
-  if (view) view.classList.remove('hidden');
+  if (view) {
+    view.classList.remove('hidden');
+  }
 }
 
 function setStatus(msg) {
@@ -116,16 +144,26 @@ async function copyText(text) {
 // keep hitting the server every 800ms forever.
 const opPollTimers = new Set();
 
+// AbortController of the health check currently shown in the modal. Closing
+// the modal (X, overlay, Esc or the Cancel button) aborts it.
+let activeHealthCheck = null;
+
 function openModal(html) {
   $('#modal-body').innerHTML = html;
   $('#modal-overlay').classList.remove('hidden');
   const firstInput = $('#modal-body input, #modal-body select');
-  if (firstInput) firstInput.focus();
+  if (firstInput) {
+    firstInput.focus();
+  }
 }
 
 function closeModal() {
   opPollTimers.forEach((t) => clearInterval(t));
   opPollTimers.clear();
+  if (activeHealthCheck) {
+    activeHealthCheck.abort();
+    activeHealthCheck = null;
+  }
   $('#modal-overlay').classList.add('hidden');
   $('#modal-body').innerHTML = '';
 }
@@ -266,7 +304,9 @@ $('#unlock-form').addEventListener('submit', async (e) => {
 
 $('#btn-lock').addEventListener('click', async () => {
   try {
-    if (token) await apiPost('/api/lock', {});
+    if (token) {
+      await apiPost('/api/lock', {});
+    }
   } catch { /* ignore */ }
   lockLocal();
   const status = await apiGet('/api/status');
@@ -283,7 +323,9 @@ function lockLocal() {
 // ---------------------------------------------------------------------------
 
 async function loadDashboard(showOverlay = true) {
-  if (showOverlay) showLoading('Carregando painel...');
+  if (showOverlay) {
+    showLoading('Carregando painel...');
+  }
   try {
     dashboard = await apiGet('/api/dashboard');
   } catch (e) {
@@ -321,7 +363,9 @@ function renderDashboard() {
 
 function filteredInstances() {
   const query = ($('#instance-filter').value || '').trim().toLowerCase();
-  if (!query) return dashboard.instances;
+  if (!query) {
+    return dashboard.instances;
+  }
   const matches = [];
   for (const inst of dashboard.instances) {
     if (inst.name.toLowerCase().includes(query) || hostLabel(inst).toLowerCase().includes(query)) {
@@ -344,7 +388,9 @@ function renderInstanceList() {
     return;
   }
   const pageCount = Math.max(1, Math.ceil(instances.length / INSTANCES_PER_PAGE));
-  if (instancePage > pageCount) instancePage = pageCount;
+  if (instancePage > pageCount) {
+    instancePage = pageCount;
+  }
   const start = (instancePage - 1) * INSTANCES_PER_PAGE;
   for (const inst of instances.slice(start, start + INSTANCES_PER_PAGE)) {
     container.appendChild(instanceCard(inst));
@@ -355,7 +401,9 @@ function renderPagination() {
   const box = $('#inst-pagination');
   box.innerHTML = '';
   const total = filteredInstances().length;
-  if (total <= INSTANCES_PER_PAGE) return;
+  if (total <= INSTANCES_PER_PAGE) {
+    return;
+  }
   const pageCount = Math.ceil(total / INSTANCES_PER_PAGE);
   const goto = (page) => {
     instancePage = Math.min(pageCount, Math.max(1, page));
@@ -449,7 +497,9 @@ function instanceCard(inst) {
 }
 
 function hostLabel(inst) {
-  if (inst.host) return `${inst.host}:${inst.port}  /  ${inst.base_database || ''}`;
+  if (inst.host) {
+    return `${inst.host}:${inst.port}  /  ${inst.base_database || ''}`;
+  }
   return 'host desconhecido';
 }
 
@@ -510,9 +560,11 @@ async function revealConnection(db) {
   }
 }
 
-// Opens the standard health-check modal and renders the outcome of `probe`
-// (a promise resolving to a HealthInfo-like object) inside it.
-function openHealthCheckModal(title, probe) {
+// Opens the health-check modal right away and renders the outcome of `run`
+// (called with the AbortController's signal) inside it. The button reads
+// "Cancelar" while the check is running — closing the modal aborts it — and
+// becomes "Fechar" once a result is shown.
+function openHealthCheckModal(title, controller, run) {
   openModal(`
     <h2>Testar conexão — ${escapeHtml(title)}</h2>
     <div class="health-check" id="hc-status" data-state="checking">
@@ -521,9 +573,10 @@ function openHealthCheckModal(title, probe) {
     </div>
     <div id="hc-detail" class="hint"></div>
     <div class="form-actions">
-      <button id="hc-close" class="ghost">Fechar</button>
+      <button id="hc-cancel" class="ghost">Cancelar</button>
     </div>
   `);
+  activeHealthCheck = controller;
 
   const statusBox = $('#hc-status');
   const spinner = $('#hc-spinner');
@@ -531,67 +584,84 @@ function openHealthCheckModal(title, probe) {
   const detail = $('#hc-detail');
 
   const showResult = (state, message, detailHtml) => {
+    activeHealthCheck = null;
     statusBox.dataset.state = state;
     label.textContent = message;
     detail.innerHTML = detailHtml || '';
-    if (state !== 'checking') {
-      spinner.classList.add('hidden');
-    }
+    spinner.classList.add('hidden');
+    $('#hc-cancel').textContent = 'Fechar';
   };
 
-  Promise.resolve(probe).then((info) => {
-    if (info.status === 'ok') {
-      showResult(
-        'ok',
-        `Conexão OK (${info.latency_ms}ms)`,
-        info.version ? `<div class="cs">${escapeHtml(info.version)}</div>` : '',
-      );
-    } else if (info.timed_out) {
-      showResult('timeout', 'Tempo esgotado', escapeHtml(info.error || ''));
-    } else {
-      showResult('error', 'Falha na conexão', escapeHtml(info.error || ''));
-    }
-  }).catch((error) => {
-    const timedOut = error.message === 'Tempo esgotado aguardando o servidor.';
-    showResult(
-      timedOut ? 'timeout' : 'error',
-      timedOut ? 'Tempo esgotado' : 'Falha na conexão',
-      escapeHtml(error.message),
-    );
-  });
+  $('#hc-cancel').addEventListener('click', closeModal);
 
-  $('#hc-close').addEventListener('click', closeModal);
+  Promise.resolve()
+    .then(() => run(controller.signal))
+    .then((info) => {
+      if (controller.signal.aborted) {
+        return;
+      }
+      if (info.status === 'ok') {
+        showResult(
+          'ok',
+          `Conexão OK (${info.latency_ms}ms)`,
+          info.version ? `<div class="cs">${escapeHtml(info.version)}</div>` : '',
+        );
+      } else if (info.timed_out) {
+        showResult('timeout', 'Tempo esgotado', escapeHtml(info.error || ''));
+      } else {
+        showResult('error', 'Falha na conexão', escapeHtml(info.error || ''));
+      }
+    })
+    .catch((error) => {
+      if (controller.signal.aborted) {
+        return;
+      }
+      const timedOut = error.message === 'Tempo esgotado aguardando o servidor.';
+      showResult(
+        timedOut ? 'timeout' : 'error',
+        timedOut ? 'Tempo esgotado' : 'Falha na conexão',
+        escapeHtml(error.message),
+      );
+    });
 }
 
-async function testConnection(db) {
-  openHealthCheckModal(
-    db.database_name,
-    api(`/api/connections/${db.kind}/${db.id}/health`, { method: 'POST' }),
+function testConnection(db) {
+  const controller = new AbortController();
+  openHealthCheckModal(db.database_name, controller, (signal) =>
+    api(`/api/connections/${db.kind}/${db.id}/health`, { method: 'POST', signal }),
   );
 }
 
-// On-demand health check for a single instance. Updates the card badge with
-// the outcome and shows the details in a modal.
-async function testInstance(name) {
+// On-demand health check for a single instance. Opens the modal immediately
+// (cancellable while the check runs) and updates the card badge with the
+// outcome.
+function testInstance(name) {
   const inst = dashboard.instances.find((entry) => entry.name === name);
+  const controller = new AbortController();
+  const previous = inst && inst.health && inst.health.status ? inst.health : { status: 'unknown' };
   if (inst) {
     inst.health = { status: 'checking' };
     renderInstanceList();
   }
-  try {
-    const info = await api(`/api/instances/${encodeURIComponent(name)}/health`, { method: 'POST' });
-    if (inst) {
-      inst.health = info;
-      renderInstanceList();
+  openHealthCheckModal(name, controller, async (signal) => {
+    try {
+      const info = await api(`/api/instances/${encodeURIComponent(name)}/health`, { method: 'POST', signal });
+      if (inst) {
+        inst.health = info;
+        renderInstanceList();
+      }
+      return info;
+    } catch (error) {
+      if (inst) {
+        inst.health = controller.signal.aborted ? previous : { status: 'error', error: error.message };
+        renderInstanceList();
+      }
+      if (controller.signal.aborted) {
+        setStatus('Verificação cancelada.');
+      }
+      throw error;
     }
-    openHealthCheckModal(name, Promise.resolve(info));
-  } catch (error) {
-    if (inst) {
-      inst.health = { status: 'error', error: error.message };
-      renderInstanceList();
-    }
-    setStatus(error.message);
-  }
+  });
 }
 
 async function removeInstance(name) {
@@ -600,10 +670,14 @@ async function removeInstance(name) {
     `Remover a instância ${name} e todas as conexões salvas dela (bancos e usuários extras)? Apenas o catálogo local é removido — nada é apagado no servidor PostgreSQL.`,
     'Remover',
   );
-  if (!confirmed) return;
+  if (!confirmed) {
+    return;
+  }
   try {
     await apiDelete(`/api/instances/${encodeURIComponent(name)}`);
-    if (expandedInstance === name) expandedInstance = null;
+    if (expandedInstance === name) {
+      expandedInstance = null;
+    }
     await loadDashboard();
     setStatus(`Instância '${name}' removida do catálogo.`);
   } catch (e) {
@@ -617,7 +691,9 @@ async function rotateConnection(db) {
     `Rotacionar a senha de ${db.role_or_username} (${db.database_name})? A senha atual é invalidada imediatamente — serviços que a usam vão falhar até serem atualizados.`,
     'Rotacionar',
   );
-  if (!confirmed) return;
+  if (!confirmed) {
+    return;
+  }
   try {
     const data = await api(`/api/connections/${db.kind}/${db.id}/rotate`, { method: 'POST' });
     showRotatedCredential(data.connection_string, `${db.database_name} · ${data.role_name}`);
@@ -633,7 +709,9 @@ async function rotateInstance(name) {
     `Rotacionar a senha do usuário base da instância ${name}? A base DATABASE_URL salva no catálogo será atualizada com a nova senha.`,
     'Rotacionar',
   );
-  if (!confirmed) return;
+  if (!confirmed) {
+    return;
+  }
   try {
     const data = await api(`/api/instances/${encodeURIComponent(name)}/rotate`, { method: 'POST' });
     showRotatedCredential(data.connection_string, name);
@@ -696,7 +774,9 @@ async function editName(db) {
   `);
   $('#en-save').addEventListener('click', async () => {
     const name = $('#en-name').value.trim();
-    if (!name) return setStatus('Nome não pode ser vazio.');
+    if (!name) {
+      return setStatus('Nome não pode ser vazio.');
+    }
     try {
       await apiPut(`/api/connections/${db.kind}/${db.id}/name`, { name });
       closeModal();
@@ -716,7 +796,9 @@ async function deleteConnection(instanceName, db) {
     `Excluir a conexão ${db.database_name} (${db.role_or_username}) da instância ${instanceName}? Isso não remove o banco do PostgreSQL.`,
     'Excluir',
   );
-  if (!ok) return;
+  if (!ok) {
+    return;
+  }
   try {
     await apiDelete(`/api/connections/${db.kind}/${db.id}`);
     await loadDashboard();
@@ -752,7 +834,9 @@ $('#btn-add-instance').addEventListener('click', () => {
   $('#ai-save').addEventListener('click', async () => {
     const name = $('#ai-name').value.trim();
     const url = $('#ai-url').value.trim();
-    if (!name || !url) return setStatus('Preencha nome e URL.');
+    if (!name || !url) {
+      return setStatus('Preencha nome e URL.');
+    }
     try {
       const info = await apiPost('/api/instances', { name, url });
       closeModal();
@@ -821,7 +905,9 @@ function openProvisionModal(instanceName) {
       extra_application_name: $('#pv-extra-app').value.trim() || null,
       dedicated_owner: $('#pv-dedicated').checked,
     };
-    if (!body.database_name) return setStatus('Informe o nome do banco.');
+    if (!body.database_name) {
+      return setStatus('Informe o nome do banco.');
+    }
     try {
       const data = await apiPost('/api/provision', body);
       closeModal();
@@ -958,10 +1044,14 @@ function openMigrateModal() {
   $('#mg-src-inst').addEventListener('change', (e) => renderSources(e.target.value));
 
   $('#mg-start').addEventListener('click', async () => {
-    if (!selectedSource) return setStatus('Selecione a fonte.');
+    if (!selectedSource) {
+      return setStatus('Selecione a fonte.');
+    }
     const destInstance = $('#mg-dest').value;
     const destDbName = $('#mg-db').value.trim();
-    if (!destDbName) return setStatus('Informe o nome do banco no destino.');
+    if (!destDbName) {
+      return setStatus('Informe o nome do banco no destino.');
+    }
     try {
       const data = await apiPost('/api/migrate', {
         source: selectedSource,
@@ -980,7 +1070,9 @@ function openMigrateModal() {
 function buildSourceOptionsFor(instanceName) {
   const inst = dashboard.instances.find((entry) => entry.name === instanceName);
   const opts = [];
-  if (!inst) return opts;
+  if (!inst) {
+    return opts;
+  }
   for (const db of inst.databases) {
     if (db.kind === 'db') {
       opts.push({ value: { kind: 'db', id: db.id }, label: `${db.database_name} (owner)` });
@@ -1077,7 +1169,9 @@ function openBackupModal(preselectInstance = null) {
   }
 
   $('#bk-start').addEventListener('click', async () => {
-    if (!selectedSource) return setStatus('Selecione a fonte.');
+    if (!selectedSource) {
+      return setStatus('Selecione a fonte.');
+    }
     const databases = Array.from($('#bk-dbs').querySelectorAll('input[type=checkbox]:checked')).map((i) => i.value);
     if (selectedSource.kind === 'instance' && !databases.length) {
       return setStatus('Selecione ao menos um banco.');
@@ -1255,8 +1349,12 @@ function openRestoreFor(filename) {
 }
 
 function formatBytes(size) {
-  if (size < 1024) return `${size} B`;
-  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  if (size < 1024) {
+    return `${size} B`;
+  }
+  if (size < 1024 * 1024) {
+    return `${(size / 1024).toFixed(1)} KB`;
+  }
   return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 }
 
@@ -1345,9 +1443,15 @@ function renderOperationResult(result) {
       html += `<p class="hint">${v.database_names.join(', ')}</p>`;
       break;
     case 'restore':
-      if (v.restored.length) html += `<p><strong>Restaurados:</strong> ${escapeHtml(v.restored.join(', '))}</p>`;
-      if (v.skipped.length) html += `<p class="hint">Pulados (já existiam): ${escapeHtml(v.skipped.join(', '))}</p>`;
-      if (!v.restored.length && !v.skipped.length) html += '<p>Nada a restaurar.</p>';
+      if (v.restored.length) {
+        html += `<p><strong>Restaurados:</strong> ${escapeHtml(v.restored.join(', '))}</p>`;
+      }
+      if (v.skipped.length) {
+        html += `<p class="hint">Pulados (já existiam): ${escapeHtml(v.skipped.join(', '))}</p>`;
+      }
+      if (!v.restored.length && !v.skipped.length) {
+        html += '<p>Nada a restaurar.</p>';
+      }
       break;
     default:
       html += '<p>Operação concluída.</p>';
@@ -1368,7 +1472,9 @@ function renderOperationResult(result) {
 
 $('#modal-close').addEventListener('click', closeModal);
 $('#modal-overlay').addEventListener('click', (e) => {
-  if (e.target === $('#modal-overlay')) closeModal();
+  if (e.target === $('#modal-overlay')) {
+    closeModal();
+  }
 });
 
 document.addEventListener('keydown', (e) => {
