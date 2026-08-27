@@ -48,7 +48,7 @@ pub fn serve(host: &str, port: u16, open_browser: bool) -> Result<()> {
     runtime.block_on(async {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
+            .with_graceful_shutdown(shutdown_signal(state.clone()))
             .await?;
         Ok::<(), anyhow::Error>(())
     })?;
@@ -57,7 +57,7 @@ pub fn serve(host: &str, port: u16, open_browser: bool) -> Result<()> {
     Ok(())
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(state: Arc<WebState>) {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
@@ -80,6 +80,12 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
     println!("\nShutting down, wiping session keys...");
+    state.wipe_sessions();
+    // Browsers keep idle keep-alive connections open, so waiting for axum's
+    // graceful drain would stall the shutdown forever (and further Ctrl+C
+    // hits are swallowed by the installed handler). All secrets live in
+    // memory only, so exiting the process right now is the safest shutdown.
+    std::process::exit(0);
 }
 
 fn open_in_browser(url: &str) {
