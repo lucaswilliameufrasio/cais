@@ -728,6 +728,7 @@ impl App {
                 &dest_base_url,
                 &dest_db_name,
                 &backend,
+                false,
                 &mut |step| {
                     let _ = tx.send(WorkerEvent::Log(step.to_owned()));
                 },

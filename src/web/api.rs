@@ -271,6 +271,8 @@ struct MigrateRequest {
     source: SourceRef,
     dest_instance: String,
     dest_db_name: String,
+    #[serde(default)]
+    replace_existing: bool,
 }
 
 #[derive(Deserialize)]
@@ -1319,6 +1321,7 @@ async fn post_migrate(
                 &dest_base_url,
                 &dest_db_name,
                 &backend,
+                req.replace_existing,
                 &mut |step| log(step),
             )
             .map_err(|e| e.to_string());

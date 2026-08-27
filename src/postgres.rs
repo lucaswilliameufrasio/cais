@@ -1045,6 +1045,7 @@ pub fn migrate_database_with_progress<F>(
     dest_base_url: &str,
     dest_db_name: &str,
     backend: &PgToolBackend,
+    replace_existing: bool,
     emit: &mut F,
 ) -> Result<ProvisionFullOutcome>
 where
@@ -1129,7 +1130,21 @@ where
         .is_some();
 
     if db_exists {
-        anyhow::bail!("database '{dest_db_name}' already exists on the target cluster");
+        if !replace_existing {
+            anyhow::bail!("database '{dest_db_name}' already exists on the target cluster");
+        }
+        push_step(
+            &mut Vec::new(),
+            emit,
+            format!("Replace policy: dropping existing database '{dest_db_name}' on target..."),
+        );
+        let drop_query = format!(
+            "DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)",
+            escape_ident(dest_db_name)
+        );
+        admin_client
+            .batch_execute(&drop_query)
+            .context("failed to drop existing target database (replace)")?;
     }
 
     push_step(
@@ -2332,6 +2347,7 @@ mod tests {
             "postgres://user:pass@localhost:0/dest",
             "test_db",
             &PgToolBackend::NotFound,
+            false,
             &mut |_| {},
         )
         .expect_err("should fail with NotFound");

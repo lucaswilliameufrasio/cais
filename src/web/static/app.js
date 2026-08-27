@@ -1016,6 +1016,10 @@ function openMigrateModal() {
         Nome do banco no destino
         <input id="mg-db" type="text" placeholder="ex.: orders_clone">
       </label>
+      <label class="check-row">
+        <input id="mg-replace" type="checkbox">
+        <span>Substituir se o banco já existir no destino (DROP DATABASE WITH FORCE)</span>
+      </label>
       <div class="form-actions">
         <button id="mg-cancel" class="ghost">Cancelar</button>
         <button id="mg-start" class="primary">Migrar</button>
@@ -1058,6 +1062,7 @@ function openMigrateModal() {
         source: selectedSource,
         dest_instance: destInstance,
         dest_db_name: destDbName,
+        replace_existing: $('#mg-replace').checked,
       });
       closeModal();
       startOperation(data.operation_id);

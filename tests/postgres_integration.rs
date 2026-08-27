@@ -573,6 +573,7 @@ fn migrate_database_via_docker() {
         &PgToolBackend::Docker {
             image: docker_image,
         },
+        false,
         &mut |_| {},
     )
     .expect("migration via Docker should succeed");
@@ -634,6 +635,7 @@ fn migrate_database_via_native() {
         &dest.url(),
         dest_db_name,
         &pg_tool_backend,
+        false,
         &mut |_| {},
     )
     .expect("migration via native should succeed");
@@ -706,6 +708,7 @@ fn migrate_database_dest_already_exists() {
         &dest.url(),
         dest_db_name,
         &migrate_backend,
+        false,
         &mut |_| {},
     )
     .expect_err("should fail when dest database already exists");
@@ -714,6 +717,85 @@ fn migrate_database_dest_already_exists() {
         err.to_string().contains("already exists"),
         "expected 'already exists' error, got: {err}"
     );
+}
+
+#[test]
+fn migrate_replace_existing_drops_target_database() {
+    if std::env::var("RUN_DOCKER_TESTS").ok().as_deref() != Some("1") {
+        return;
+    }
+
+    let source = DockerPostgres::start();
+    let dest = DockerPostgres::start();
+
+    let db_name = "replace_source";
+    {
+        let mut client = Client::connect(&source.url(), NoTls).expect("connect source");
+        client
+            .batch_execute(&format!("CREATE DATABASE \"{db_name}\""))
+            .expect("create source db");
+    }
+    {
+        let source_db_url = source.db_url(db_name);
+        let mut client = Client::connect(&source_db_url, NoTls).expect("connect source db");
+        client
+            .batch_execute("CREATE TABLE items (id SERIAL PRIMARY KEY, marker TEXT)")
+            .expect("create table");
+        client
+            .execute("INSERT INTO items (marker) VALUES ($1)", &[&"fresh_copy"])
+            .expect("insert");
+    }
+
+    let dest_db_name = "premature_target";
+    {
+        let mut client = Client::connect(&dest.url(), NoTls).expect("connect dest");
+        client
+            .batch_execute(&format!("CREATE DATABASE \"{dest_db_name}\""))
+            .expect("pre-create target db");
+    }
+    {
+        let dest_db_url = dest.db_url(dest_db_name);
+        let mut client = Client::connect(&dest_db_url, NoTls).expect("connect premature db");
+        client
+            .batch_execute("CREATE TABLE leftover_marker (id int)")
+            .expect("create junk table in premature target");
+    }
+
+    let source_cs = source.db_url(db_name);
+    let source_version =
+        cais::postgres::detect_source_version(&source_cs).expect("detect source version");
+    let major = cais::postgres::extract_pg_major_version(&source_version);
+    let migrate_backend = PgToolBackend::Docker {
+        image: format!("postgres:{major}-alpine"),
+    };
+
+    let outcome = migrate_database_with_progress(
+        &source_cs,
+        &dest.url(),
+        dest_db_name,
+        &migrate_backend,
+        true,
+        &mut |_| {},
+    )
+    .expect("migration with replace_existing should succeed");
+
+    assert!(outcome.database_created, "database must be recreated");
+
+    let dest_db_url = dest.db_url(dest_db_name);
+    let mut client = Client::connect(&dest_db_url, NoTls).expect("connect replaced db");
+    let rows = client
+        .query("SELECT marker FROM items ORDER BY id", &[])
+        .expect("query replaced db");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, String>(0), "fresh_copy");
+
+    let leftover = client
+        .query_opt(
+            "SELECT 1 FROM information_schema.tables WHERE table_name = 'leftover_marker'",
+            &[],
+        )
+        .expect("check junk table gone");
+    assert!(leftover.is_none(), "junk table must be dropped by replace");
 }
 
 #[test]
@@ -753,6 +835,7 @@ fn migrate_database_17_to_18_via_docker() {
         &PgToolBackend::Docker {
             image: image.to_owned(),
         },
+        false,
         &mut |_| {},
     )
     .expect("17→18 migration via Docker");
