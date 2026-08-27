@@ -199,6 +199,20 @@ The SQLite database is stored in the platform app data directory:
 
 The master password is **never stored**.
 
+### Forgot the master password?
+
+There is no recovery by design — the password only exists in your head. Run:
+
+```bash
+cais reset
+```
+
+It moves the vault database and the encrypted backups aside under timestamped
+`.old-…` names, so the next launch starts a fresh first-run setup. The moved
+files stay on disk but cannot be opened without the old password. The actual
+PostgreSQL servers are untouched — re-add the instance with its base URL and
+use "Adicionar banco existente" to bring the databases back into the catalog.
+
 ## Testing
 
 ```bash

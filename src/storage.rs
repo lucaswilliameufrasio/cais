@@ -836,6 +836,53 @@ pub fn display_database_path() -> Result<String> {
     Ok(database_path()?.display().to_string())
 }
 
+/// Result of a vault reset: every `(from, to)` pair that was moved aside.
+pub struct VaultReset {
+    pub moved: Vec<(PathBuf, PathBuf)>,
+}
+
+/// Moves the vault database (and any SQLite side files) plus the encrypted
+/// backups directory aside under a timestamped `.old-` suffix, so the next
+/// launch starts a fresh first-run setup. Paths that do not exist are
+/// skipped. The moved files cannot be opened again without the old master
+/// password — that is the point.
+pub fn reset_vault_at(data_dir: &std::path::Path) -> Result<VaultReset> {
+    let suffix = format!(".old-{}", chrono::Local::now().format("%Y%m%dT%H%M%S"));
+    let mut moved = Vec::new();
+
+    let database = data_dir.join("data.sqlite");
+    if database.exists() {
+        let target = data_dir.join(format!("data.sqlite{suffix}"));
+        fs::rename(&database, &target)
+            .with_context(|| format!("failed to move {}", database.display()))?;
+        moved.push((database, target));
+    }
+    for side in ["-wal", "-shm"] {
+        let side_file = data_dir.join(format!("data.sqlite{side}"));
+        if side_file.exists() {
+            let target = data_dir.join(format!("data.sqlite{side}{suffix}"));
+            fs::rename(&side_file, &target)
+                .with_context(|| format!("failed to move {}", side_file.display()))?;
+            moved.push((side_file, target));
+        }
+    }
+    let backups = data_dir.join("backups");
+    if backups.is_dir() {
+        let target = data_dir.join(format!("backups{suffix}"));
+        fs::rename(&backups, &target)
+            .with_context(|| format!("failed to move {}", backups.display()))?;
+        moved.push((backups, target));
+    }
+    Ok(VaultReset { moved })
+}
+
+/// Resets the real application data directory.
+pub fn reset_vault() -> Result<VaultReset> {
+    let project_dirs = ProjectDirs::from("com", "lucaseufrasiojcpm", "cais")
+        .context("failed to resolve app data directory")?;
+    reset_vault_at(project_dirs.data_dir())
+}
+
 fn bool_to_int(value: bool) -> i64 {
     if value { 1 } else { 0 }
 }
@@ -867,6 +914,7 @@ fn connection_sort_key(record: &SavedConnectionRecord) -> (String, String, u8, S
 #[cfg(test)]
 mod tests {
     use super::Storage;
+    use super::reset_vault_at;
     use crate::crypto;
     use crate::models::{ExtraUserProvisionOutcome, ProvisionOutcome, SavedConnectionRecord};
     use tempfile::tempdir;
@@ -1330,5 +1378,49 @@ mod tests {
         storage
             .save_instance_secret("legacy", &inst_enc)
             .expect("re-save instance under the same name");
+    }
+
+    #[test]
+    fn reset_vault_moves_database_and_backups_aside() {
+        let dir = tempdir().expect("dir");
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        let storage = Storage::open_at(data_dir.join("data.sqlite")).expect("storage");
+        storage.initialize_master_password("hunter2").expect("init");
+        drop(storage);
+
+        let backups = data_dir.join("backups");
+        std::fs::create_dir_all(&backups).expect("backups dir");
+        std::fs::write(backups.join("dump.pgdump.enc"), b"cipher").expect("backup file");
+
+        let reset = reset_vault_at(&data_dir).expect("reset");
+        assert_eq!(reset.moved.len(), 2, "db and backups must be moved");
+
+        assert!(
+            !data_dir.join("data.sqlite").exists(),
+            "vault database must be gone from the original path"
+        );
+        assert!(!backups.exists(), "backups dir must be gone");
+        for (from, to) in &reset.moved {
+            assert!(
+                to.exists(),
+                "{} must exist at its new location",
+                to.display()
+            );
+            let _ = from;
+        }
+
+        let fresh = Storage::open_at(data_dir.join("data.sqlite")).expect("fresh storage");
+        assert!(
+            !fresh.is_initialized().expect("initialized check"),
+            "next launch must start a fresh first-run setup"
+        );
+    }
+
+    #[test]
+    fn reset_vault_with_empty_directory_reports_nothing() {
+        let dir = tempdir().expect("dir");
+        let reset = reset_vault_at(dir.path()).expect("reset");
+        assert!(reset.moved.is_empty(), "nothing exists to move");
     }
 }
