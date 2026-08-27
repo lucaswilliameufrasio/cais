@@ -140,6 +140,55 @@ function confirmModal(title, message, confirmLabel = 'Confirmar') {
   });
 }
 
+// Destructive-action confirmation with a safety countdown: the confirm button
+// stays disabled until `seconds` have passed, so accidental clicks cannot
+// delete or rotate credentials immediately.
+function confirmModalCountdown(title, message, confirmLabel = 'Confirmar', seconds = 5) {
+  return new Promise((resolve) => {
+    openModal(`
+      <h2>${escapeHtml(title)}</h2>
+      <p class="hint">${escapeHtml(message)}</p>
+      <p id="cm-countdown" class="countdown"></p>
+      <div class="form-actions">
+        <button id="cm-cancel" class="ghost">Cancelar</button>
+        <button id="cm-ok" class="danger" disabled>${escapeHtml(confirmLabel)}</button>
+      </div>
+    `);
+    const okButton = $('#cm-ok');
+    const countdown = $('#cm-countdown');
+    let remaining = seconds;
+    countdown.textContent = `Confirmação em ${remaining}s`;
+
+    const timer = setInterval(() => {
+      if (!okButton.isConnected) {
+        clearInterval(timer);
+        resolve(false);
+        return;
+      }
+      remaining -= 1;
+      if (remaining <= 0) {
+        clearInterval(timer);
+        countdown.textContent = '';
+        okButton.disabled = false;
+        okButton.textContent = confirmLabel;
+        return;
+      }
+      countdown.textContent = `Confirmação em ${remaining}s`;
+    }, 1000);
+
+    okButton.addEventListener('click', () => {
+      clearInterval(timer);
+      closeModal();
+      resolve(true);
+    });
+    $('#cm-cancel').addEventListener('click', () => {
+      clearInterval(timer);
+      closeModal();
+      resolve(false);
+    });
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Unlock / first run
 // ---------------------------------------------------------------------------
@@ -420,7 +469,7 @@ async function testConnection(db) {
 }
 
 async function rotateConnection(db) {
-  const confirmed = await confirmModal(
+  const confirmed = await confirmModalCountdown(
     'Rotacionar credencial',
     `Rotacionar a senha de ${db.role_or_username} (${db.database_name})? A senha atual é invalidada imediatamente — serviços que a usam vão falhar até serem atualizados.`,
     'Rotacionar',
@@ -436,7 +485,7 @@ async function rotateConnection(db) {
 }
 
 async function rotateInstance(name) {
-  const confirmed = await confirmModal(
+  const confirmed = await confirmModalCountdown(
     'Rotacionar credencial da instância',
     `Rotacionar a senha do usuário base da instância ${name}? A base DATABASE_URL salva no catálogo será atualizada com a nova senha.`,
     'Rotacionar',
@@ -519,7 +568,7 @@ async function editName(db) {
 }
 
 async function deleteConnection(instanceName, db) {
-  const ok = await confirmModal(
+  const ok = await confirmModalCountdown(
     'Excluir conexão',
     `Excluir a conexão ${db.database_name} (${db.role_or_username}) da instância ${instanceName}? Isso não remove o banco do PostgreSQL.`,
     'Excluir',

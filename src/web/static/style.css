@@ -57,6 +57,7 @@ button.link:hover { text-decoration: underline; }
 
 .error { color: var(--err); }
 .hint { color: var(--muted); font-size: 13px; }
+.countdown { color: var(--warn); font-size: 14px; font-weight: 600; margin: 4px 0; }
 
 /* Auth */
 .auth-box {
