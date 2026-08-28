@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
+use percent_encoding::utf8_percent_encode;
 use postgres::{Client, NoTls, SimpleQueryMessage};
-use url::{Host, Url, form_urlencoded::byte_serialize};
+use url::{Host, Url};
 
 use crate::crypto;
 use crate::models::{
@@ -10,6 +11,11 @@ use crate::models::{
     SqlQueryResult, TablespaceMode,
 };
 use crate::validation::{normalize_application_name, validate_database_name};
+
+/// Percent-encodes every non-alphanumeric byte. Over-encodes on purpose:
+/// values always survive URL parsing (form-urlencoded's `+` for space does
+/// not — parsers treat `+` literally outside query strings).
+const URL_VALUE_SET: &percent_encoding::AsciiSet = percent_encoding::NON_ALPHANUMERIC;
 
 pub fn parse_database_url(raw: &str) -> Result<ParsedDatabaseUrl> {
     let url = Url::parse(raw).context("base DATABASE_URL is not a valid URI")?;
@@ -596,8 +602,9 @@ fn build_connection_string(
     password: &str,
     application_name: &str,
 ) -> String {
-    let encoded_password: String = byte_serialize(password.as_bytes()).collect();
-    let encoded_application_name: String = byte_serialize(application_name.as_bytes()).collect();
+    let encoded_password: String = utf8_percent_encode(password, URL_VALUE_SET).to_string();
+    let encoded_application_name: String =
+        utf8_percent_encode(application_name, URL_VALUE_SET).to_string();
     format!(
         "postgresql://{}:{}@{}:{}/{}?application_name={}",
         role_name, encoded_password, host, port, database_name, encoded_application_name

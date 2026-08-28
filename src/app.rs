@@ -346,8 +346,12 @@ enum OperationResult {
 
 impl App {
     pub fn new() -> Result<Self> {
-        let storage = Storage::open()?;
+        Self::with_storage(Storage::open()?)
+    }
 
+    /// Builds the app on top of an already-open vault. Used by tests to run
+    /// the state machine against a temporary storage file.
+    pub fn with_storage(storage: Storage) -> Result<Self> {
         let (machine_id, hostname) = storage.ensure_machine_identity()?;
 
         let screen = if storage.is_initialized()? {
@@ -1475,7 +1479,9 @@ impl App {
     }
 
     fn percent_encode_password(pass: &str) -> String {
-        url::form_urlencoded::byte_serialize(pass.as_bytes()).collect()
+        use percent_encoding::utf8_percent_encode;
+        const URL_VALUE_SET: &percent_encoding::AsciiSet = percent_encoding::NON_ALPHANUMERIC;
+        utf8_percent_encode(pass, URL_VALUE_SET).to_string()
     }
 
     pub fn trigger_health_checks(&self) {
@@ -1683,6 +1689,262 @@ pub fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) -> Resul
 #[cfg(test)]
 mod tests {
     use super::TextField;
+    use super::*;
+    use crate::models::{ProvisionOutcome, SavedConnectionRecord};
+    use crate::storage::Storage;
+    use tempfile::tempdir;
+
+    fn temp_app() -> (App, tempfile::TempDir) {
+        let dir = tempdir().expect("tempdir");
+        let storage = Storage::open_at(dir.path().join("vault.sqlite")).expect("storage");
+        let app = App::with_storage(storage).expect("app");
+        (app, dir)
+    }
+
+    fn initialized_app() -> (App, tempfile::TempDir) {
+        let (mut app, dir) = temp_app();
+        app.first_run_password.value = "master-pass".to_owned();
+        app.first_run_confirm.value = "master-pass".to_owned();
+        app.start_first_run().expect("first run");
+        (app, dir)
+    }
+
+    #[test]
+    fn fresh_app_starts_on_first_run_and_validates_passwords() {
+        let (mut app, _dir) = temp_app();
+        assert_eq!(app.screen, Screen::FirstRun);
+        assert!(app.key.is_none(), "fresh app must be locked");
+
+        app.first_run_password.value = "master-pass".to_owned();
+        app.first_run_confirm.value = String::new();
+        assert!(
+            app.start_first_run().is_err(),
+            "mismatched confirm must fail"
+        );
+        assert_eq!(app.screen, Screen::FirstRun);
+
+        app.first_run_confirm.value = "master-pass".to_owned();
+        app.start_first_run().expect("matching passwords");
+        assert_eq!(app.screen, Screen::Home);
+        assert!(app.key.is_some(), "session key must be set after first run");
+        assert!(
+            app.storage.is_initialized().expect("initialized check"),
+            "vault must be initialized on disk"
+        );
+    }
+
+    #[test]
+    fn unlock_rejects_wrong_password_and_accepts_the_right_one() {
+        let (_app, dir) = initialized_app();
+        let path = dir.path().join("vault.sqlite");
+
+        // Simulate a restart: a new App on the same vault starts locked.
+        let mut restarted =
+            App::with_storage(Storage::open_at(path).expect("reopen")).expect("app");
+        assert_eq!(restarted.screen, Screen::Unlock);
+        assert!(restarted.session_key().is_err(), "must be locked");
+
+        restarted.unlock_password.value = "wrong".to_owned();
+        assert!(restarted.unlock().is_err());
+        assert_eq!(restarted.screen, Screen::Unlock, "failed unlock stays put");
+
+        restarted.unlock_password.value = "master-pass".to_owned();
+        restarted.unlock().expect("correct password");
+        assert_eq!(restarted.screen, Screen::Home);
+        assert!(!restarted.session_key().expect("session key").is_empty());
+    }
+
+    #[test]
+    fn add_instance_requires_unlocked_vault_and_persists() {
+        let (mut app, _dir) = temp_app();
+        app.instance_name_field.value = "prod".to_owned();
+        app.instance_url_field.value =
+            "postgresql://admin:pw@db.example.com:5432/postgres".to_owned();
+        let err = app.add_instance().expect_err("locked app must refuse");
+        assert!(err.to_string().contains("app is locked"));
+
+        let (mut app, _dir) = initialized_app();
+        app.instance_name_field.value = "prod".to_owned();
+        app.instance_url_field.value =
+            "postgresql://admin:pw@db.example.com:5432/postgres".to_owned();
+        app.add_instance().expect("add instance");
+        assert_eq!(app.screen, Screen::ManageInstances);
+        assert!(app.instances.contains(&"prod".to_owned()));
+
+        let secret = app
+            .storage
+            .load_instance_secret("prod")
+            .expect("load secret")
+            .expect("secret exists");
+        let plaintext =
+            crypto::decrypt(app.session_key().expect("key"), &secret.encrypted).expect("decrypt");
+        assert_eq!(
+            String::from_utf8(plaintext.to_vec()).expect("utf8"),
+            "postgresql://admin:pw@db.example.com:5432/postgres"
+        );
+    }
+
+    #[test]
+    fn delete_instance_refuses_until_catalog_entries_are_gone() {
+        let (mut app, _dir) = initialized_app();
+        let key = app.session_key().expect("key").to_vec();
+        let encrypted = crypto::encrypt(&key, b"postgresql://u:p@h/postgres").expect("encrypt");
+        app.storage
+            .save_instance_secret("legacy", &encrypted)
+            .expect("save instance");
+        let db_enc = crypto::encrypt(&key, b"postgresql://u:p@h/orders").expect("encrypt");
+        app.storage
+            .save_provisioned_database(
+                "legacy",
+                &ProvisionOutcome {
+                    database_name: "orders".into(),
+                    application_name: "orders".into(),
+                    role_name: "orders_owner".into(),
+                    connection_string: "cs".into(),
+                    database_created: true,
+                    role_created: true,
+                },
+                &db_enc,
+            )
+            .expect("save db");
+        app.load_instances().expect("load instances");
+        app.selected_instance_idx = 0;
+        app.confirming_delete_instance = true;
+
+        assert!(
+            app.delete_instance().is_err(),
+            "instance with catalog entries must not be deleted"
+        );
+
+        let id = app.storage.list_provisioned_databases().expect("list")[0].id;
+        app.storage
+            .delete_provisioned_database(id)
+            .expect("delete catalog entry");
+        app.delete_instance().expect("delete now succeeds");
+        assert!(
+            !app.instances.contains(&"legacy".to_owned()),
+            "instance must be gone from the list"
+        );
+        assert!(!app.confirming_delete_instance);
+        assert_eq!(app.selected_instance, None, "selection must be cleared");
+    }
+
+    #[test]
+    fn build_url_from_wizard_variants() {
+        let (mut app, _dir) = initialized_app();
+
+        app.wizard_host.value = "db.example.com".to_owned();
+        app.wizard_database.value = "postgres".to_owned();
+        assert_eq!(
+            app.build_url_from_wizard(),
+            "postgresql://db.example.com/postgres",
+            "default port and empty auth are omitted"
+        );
+
+        app.wizard_port.value = "5433".to_owned();
+        app.wizard_username.value = "admin".to_owned();
+        app.wizard_password.value = "p@ss word".to_owned();
+        app.wizard_ssl_mode.value = "REQUIRE".to_owned();
+        assert_eq!(
+            app.build_url_from_wizard(),
+            "postgresql://admin:p%40ss%20word@db.example.com:5433/postgres?sslmode=require"
+        );
+    }
+
+    #[test]
+    fn add_instance_from_wizard_validates_and_saves_round_trip() {
+        let (mut app, _dir) = initialized_app();
+
+        assert!(
+            app.add_instance_from_wizard().is_err(),
+            "empty name must fail"
+        );
+        app.wizard_instance_name.value = "wizard-prd".to_owned();
+        assert!(
+            app.add_instance_from_wizard().is_err(),
+            "host/database-less URL must fail"
+        );
+
+        app.wizard_host.value = "db.internal".to_owned();
+        app.wizard_port.value = "5432".to_owned();
+        app.wizard_username.value = "admin".to_owned();
+        app.wizard_password.value = "s3cret!".to_owned();
+        app.wizard_database.value = "postgres".to_owned();
+        app.add_instance_from_wizard().expect("happy path");
+        assert_eq!(app.screen, Screen::ManageInstances);
+        assert!(app.instances.contains(&"wizard-prd".to_owned()));
+        assert!(
+            app.wizard_host.value.is_empty(),
+            "wizard must be cleared after adding"
+        );
+
+        let secret = app
+            .storage
+            .load_instance_secret("wizard-prd")
+            .expect("load")
+            .expect("exists");
+        let plaintext =
+            crypto::decrypt(app.session_key().expect("key"), &secret.encrypted).expect("decrypt");
+        assert_eq!(
+            String::from_utf8(plaintext.to_vec()).expect("utf8"),
+            "postgresql://admin:s3cret%21@db.internal/postgres"
+        );
+    }
+
+    #[test]
+    fn migrate_sources_cover_connections_and_instances() {
+        let (mut app, _dir) = initialized_app();
+        let key = app.session_key().expect("key").to_vec();
+        let encrypted = crypto::encrypt(&key, b"postgresql://u:p@h/postgres").expect("encrypt");
+        app.storage
+            .save_instance_secret("prod", &encrypted)
+            .expect("save instance");
+        let db_enc = crypto::encrypt(&key, b"postgresql://u:p@h/orders").expect("encrypt");
+        app.storage
+            .save_provisioned_database(
+                "prod",
+                &ProvisionOutcome {
+                    database_name: "orders".into(),
+                    application_name: "orders".into(),
+                    role_name: "orders_owner".into(),
+                    connection_string: "cs".into(),
+                    database_created: true,
+                    role_created: true,
+                },
+                &db_enc,
+            )
+            .expect("save db");
+
+        app.migrate_source_list_state.select(None);
+        app.sync_migrate_source_selection().expect("sync");
+        assert_eq!(
+            app.migrate_source_list_state.selected(),
+            Some(0),
+            "empty selection clamps to first"
+        );
+
+        let sources = app.migrate_sources().expect("sources");
+        assert_eq!(sources.len(), 2, "one connection + one instance");
+        assert!(matches!(sources[0], SavedConnectionRecord::Database(_)));
+        assert!(matches!(
+            sources[sources.len() - 1],
+            SavedConnectionRecord::Instance { .. }
+        ));
+
+        let selected = app.migrate_selected_source().expect("selected");
+        assert!(selected.is_some(), "clamped selection yields a record");
+    }
+
+    #[test]
+    fn push_log_keeps_only_the_last_twenty_entries() {
+        let (mut app, _dir) = temp_app();
+        for i in 0..25 {
+            app.push_log(format!("log-{i}"));
+        }
+        assert_eq!(app.logs.len(), 20);
+        assert_eq!(app.logs[0], "log-5", "oldest entries must be dropped");
+        assert_eq!(app.logs[19], "log-24");
+    }
 
     #[test]
     fn new_field_is_empty_and_cursor_at_start() {

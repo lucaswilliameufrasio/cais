@@ -389,6 +389,7 @@ dependencies = [
  "crossterm",
  "directories",
  "http-body-util",
+ "percent-encoding",
  "postgres",
  "ratatui",
  "regex",
