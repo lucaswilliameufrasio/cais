@@ -73,6 +73,9 @@ jobs:
 
       - run: cargo test --locked --lib
 
+      - name: Web API tests
+        run: cargo test --locked --test web_api
+
       - name: Build docs
         run: cargo doc --locked --no-deps
 
