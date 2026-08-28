@@ -1239,3 +1239,157 @@ fn resolve_docker_image_detects_timescaledb() {
     let ts_image = resolve_docker_image(&backend, Some(&ts.url()));
     assert_eq!(ts_image, "timescale/timescaledb:latest-pg18");
 }
+
+/// Reproduces the cross-TimescaleDB-version failure: a dump taken on an old
+/// TimescaleDB (whose _timescaledb_catalog.chunk still has schema_name/
+/// table_name columns) must restore into a newer TimescaleDB where those
+/// columns are gone, because migrate filters the internal catalog from the
+/// restore list. Hypertable metadata does not migrate (TimescaleDB
+/// limitation); the chunk data must land as plain tables on the target.
+#[test]
+fn migrate_between_timescaledb_versions_skips_internal_catalog() {
+    if std::env::var("RUN_DOCKER_TESTS").ok().as_deref() != Some("1") {
+        return;
+    }
+
+    const SOURCE_TAG: &str = "timescale/timescaledb:2.11.2-pg16";
+    const TARGET_TAG: &str = "timescale/timescaledb:2.17.2-pg16";
+
+    let source = DockerPostgres::start_with_tag(SOURCE_TAG);
+    let dest = DockerPostgres::start_with_tag(TARGET_TAG);
+
+    // Guard against image tag drift: the premise is that the source catalog
+    // still has schema_name and the target no longer does.
+    let chunk_columns = |url: &str| -> Vec<String> {
+        let mut client = Client::connect(url, NoTls).expect("connect");
+        client
+            .batch_execute("CREATE EXTENSION IF NOT EXISTS timescaledb;")
+            .expect("create extension");
+        let rows = client
+            .query(
+                "SELECT column_name FROM information_schema.columns \
+                 WHERE table_schema = '_timescaledb_catalog' AND table_name = 'chunk'",
+                &[],
+            )
+            .expect("chunk columns");
+        rows.iter().map(|row| row.get::<_, String>(0)).collect()
+    };
+
+    let source_cs = source.url();
+    let source_columns = chunk_columns(&source_cs);
+    if !source_columns.iter().any(|c| c == "schema_name") {
+        eprintln!("SKIP: {SOURCE_TAG} no longer matches the old catalog layout");
+        return;
+    }
+    let target_columns = chunk_columns(&dest.url());
+    if target_columns.iter().any(|c| c == "schema_name") {
+        eprintln!("SKIP: {TARGET_TAG} still matches the old catalog layout");
+        return;
+    }
+
+    {
+        let mut client = Client::connect(&source_cs, NoTls).expect("connect source");
+        client
+            .batch_execute("CREATE DATABASE api_gateway;")
+            .expect("create source db");
+    }
+    {
+        let source_db = source.db_url("api_gateway");
+        let mut client = Client::connect(&source_db, NoTls).expect("connect source db");
+        client
+            .batch_execute(
+                "CREATE EXTENSION IF NOT EXISTS timescaledb; \
+                 CREATE TABLE conditions (\
+                     time TIMESTAMPTZ NOT NULL, \
+                     device TEXT, \
+                     temperature DOUBLE PRECISION\
+                 ); \
+                 SELECT create_hypertable('conditions', 'time');",
+            )
+            .expect("create hypertable");
+        for (device, temperature) in [("sensor-1", 21.5), ("sensor-2", 22.5), ("sensor-3", 23.5)] {
+            client
+                .execute(
+                    "INSERT INTO conditions (time, device, temperature) VALUES (now(), $1, $2)",
+                    &[&device, &temperature],
+                )
+                .expect("insert row");
+        }
+    }
+
+    migrate_database_with_progress(
+        &source.db_url("api_gateway"),
+        &dest.url(),
+        "api_gateway",
+        &PgToolBackend::Docker {
+            image: SOURCE_TAG.to_owned(),
+        },
+        true,
+        &mut |_| {},
+    )
+    .expect("cross-version migration must succeed with the filtered catalog");
+
+    // The hypertable parent exists on the target, and the chunk data landed
+    // in _timescaledb_internal as plain tables.
+    let target_db = dest.db_url("api_gateway");
+    let mut client = Client::connect(&target_db, NoTls).expect("connect target db");
+    client
+        .query_one(
+            "SELECT 1 FROM information_schema.tables WHERE table_name = 'conditions'",
+            &[],
+        )
+        .expect("parent table exists");
+
+    let chunks: Vec<String> = client
+        .query(
+            "SELECT table_name FROM information_schema.tables \
+             WHERE table_schema = '_timescaledb_internal' AND table_name LIKE '\\_hyper%'",
+            &[],
+        )
+        .expect("list chunks")
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect();
+    assert!(!chunks.is_empty(), "at least one chunk table must exist");
+
+    let mut restored_rows = 0i64;
+    for chunk in &chunks {
+        let count = client
+            .query_one(&format!("SELECT count(*) FROM \"{chunk}\""), &[])
+            .expect("count chunk rows")
+            .get::<_, i64>(0);
+        restored_rows += count;
+    }
+    assert_eq!(
+        restored_rows, 3,
+        "all hypertable rows must be on the target"
+    );
+}
+
+#[test]
+fn rotate_base_url_password_round_trip() {
+    if std::env::var("RUN_DOCKER_TESTS").ok().as_deref() != Some("1") {
+        return;
+    }
+
+    let pg = DockerPostgres::start();
+    let old_url = pg.url();
+
+    let new_url = cais::postgres::rotate_base_url_password(&old_url).expect("rotate");
+    assert_ne!(old_url, new_url);
+
+    // The old credentials stop working; the new ones connect.
+    assert!(
+        Client::connect(&old_url, NoTls).is_err(),
+        "old URL must fail"
+    );
+    let mut client = Client::connect(&new_url, NoTls).expect("new URL must work");
+    client
+        .query_one("SELECT 1", &[])
+        .expect("query with rotated credentials");
+
+    // Rotating again from the rotated URL keeps working.
+    let newest_url = cais::postgres::rotate_base_url_password(&new_url).expect("rotate again");
+    assert!(Client::connect(&new_url, NoTls).is_err());
+    Client::connect(&newest_url, NoTls).expect("newest URL works");
+}

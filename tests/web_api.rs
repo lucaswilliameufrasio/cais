@@ -170,3 +170,95 @@ async fn init_rejected_when_already_initialized() {
         "body: {body}"
     );
 }
+
+#[tokio::test]
+async fn workspaces_keep_vaults_isolated() {
+    let (app, _dir) = build_app();
+
+    // Unlock workspace alpha and add an instance to it.
+    let (status, body) = request(
+        &app,
+        "POST",
+        "/api/init",
+        Some(r#"{"workspace":"alpha","password":"alpha-pass","confirm":"alpha-pass"}"#),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let alpha_token = body["token"].as_str().unwrap().to_owned();
+
+    let (status, _) = request(
+        &app,
+        "POST",
+        "/api/instances",
+        Some(r#"{"name":"prod","url":"postgresql://admin:pw@db.example.com:5432/postgres"}"#),
+        Some(&alpha_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = request(&app, "GET", "/api/dashboard", None, Some(&alpha_token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["instances"].as_array().unwrap().len(), 1);
+
+    // Switch to a brand-new workspace beta: it must see an empty vault.
+    let _ = request(&app, "POST", "/api/lock", Some("{}"), Some(&alpha_token)).await;
+    let (status, body) = request(
+        &app,
+        "POST",
+        "/api/init",
+        Some(r#"{"workspace":"beta","password":"beta-pass","confirm":"beta-pass"}"#),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let beta_token = body["token"].as_str().unwrap().to_owned();
+
+    let (status, body) = request(&app, "GET", "/api/dashboard", None, Some(&beta_token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["instances"].as_array().unwrap().len(),
+        0,
+        "beta must not see alpha's instances"
+    );
+
+    // Alpha's password does not open beta, and vice versa.
+    let _ = request(&app, "POST", "/api/lock", Some("{}"), Some(&beta_token)).await;
+    let (status, _) = request(
+        &app,
+        "POST",
+        "/api/unlock",
+        Some(r#"{"workspace":"beta","password":"alpha-pass"}"#),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, _) = request(
+        &app,
+        "POST",
+        "/api/unlock",
+        Some(r#"{"workspace":"alpha","password":"beta-pass"}"#),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Unlocking alpha again brings its vault back untouched.
+    let (status, body) = request(
+        &app,
+        "POST",
+        "/api/unlock",
+        Some(r#"{"workspace":"alpha","password":"alpha-pass"}"#),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let alpha_token = body["token"].as_str().unwrap().to_owned();
+
+    let (status, body) = request(&app, "GET", "/api/dashboard", None, Some(&alpha_token)).await;
+    assert_eq!(status, StatusCode::OK);
+    let instances = body["instances"].as_array().unwrap();
+    assert_eq!(instances.len(), 1);
+    assert_eq!(instances[0]["name"], "prod");
+}
