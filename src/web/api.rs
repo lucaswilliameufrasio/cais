@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -22,10 +22,12 @@ use crate::models::{
     SavedConnectionRecord, TablespaceMode,
 };
 use crate::postgres;
+use crate::storage;
+use crate::storage::Storage;
 use crate::storage::backup_directory;
 use crate::validation::{normalize_application_name, validate_database_name};
 use crate::web::ops::{OperationResult, OperationStatus};
-use crate::web::state::{HealthInfo, WebState};
+use crate::web::state::{HealthInfo, WebState, WorkspaceInfo};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -81,6 +83,7 @@ impl IntoResponse for ApiError {
 
 pub struct Session {
     pub key: Arc<Zeroizing<Vec<u8>>>,
+    pub workspace: String,
     pub token: String,
 }
 
@@ -93,10 +96,14 @@ impl FromRequestParts<Arc<WebState>> for Session {
     ) -> Result<Self, Self::Rejection> {
         let token = parse_bearer(parts.headers.get(header::AUTHORIZATION))
             .ok_or_else(|| ApiError::unauthorized("missing or malformed Authorization header"))?;
-        let key = state
-            .session_key(&token)
+        let record = state
+            .session_record(&token)
             .ok_or_else(|| ApiError::unauthorized("session expired or invalid"))?;
-        Ok(Session { key, token })
+        Ok(Session {
+            key: record.key,
+            workspace: record.workspace,
+            token,
+        })
     }
 }
 
@@ -238,12 +245,14 @@ fn save_provision_outcome(
 
 #[derive(Deserialize)]
 struct InitRequest {
+    workspace: String,
     password: String,
     confirm: String,
 }
 
 #[derive(Deserialize)]
 struct UnlockRequest {
+    workspace: String,
     password: String,
 }
 
@@ -480,7 +489,6 @@ async fn favicon() -> Response {
 
 async fn get_status(State(state): State<Arc<WebState>>) -> Result<Json<Value>, ApiError> {
     Ok(Json(json!({
-        "initialized": state.is_initialized()?,
         "tool_backend": match &state.pg_tool_backend {
             PgToolBackend::Native { dump_ver, restore_ver } => json!({
                 "mode": "native",
@@ -499,9 +507,9 @@ async fn post_init(
     State(state): State<Arc<WebState>>,
     Json(req): Json<InitRequest>,
 ) -> Result<Json<TokenResponse>, ApiError> {
-    if state.is_initialized()? {
-        return Err(ApiError::bad_request("already initialized; unlock instead"));
-    }
+    let workspace = req.workspace.trim();
+    storage::validate_workspace_name(workspace)
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
     if req.password.is_empty() {
         return Err(ApiError::bad_request("master password cannot be empty"));
     }
@@ -510,7 +518,9 @@ async fn post_init(
             "password confirmation does not match",
         ));
     }
-    let token = state.initialize(&req.password)?;
+    let token = state
+        .initialize(workspace, &req.password)
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
     Ok(Json(TokenResponse { token }))
 }
 
@@ -518,13 +528,16 @@ async fn post_unlock(
     State(state): State<Arc<WebState>>,
     Json(req): Json<UnlockRequest>,
 ) -> Result<Json<TokenResponse>, ApiError> {
-    if !state.is_initialized()? {
-        return Err(ApiError::bad_request(
-            "not initialized; complete first-run setup",
-        ));
+    let workspace = req.workspace.trim();
+    storage::validate_workspace_name(workspace)
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    let vault_file = storage::workspace_file(&state.workspaces_dir, workspace)
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    if !vault_file.exists() {
+        return Err(ApiError::unauthorized("invalid master password"));
     }
     let token = state
-        .create_session(&req.password)
+        .create_session(workspace, &req.password)
         .map_err(|_| ApiError::unauthorized("invalid master password"))?;
     Ok(Json(TokenResponse { token }))
 }
@@ -541,9 +554,12 @@ async fn post_lock(
 // Handlers: dashboard
 // ---------------------------------------------------------------------------
 
-fn build_dashboard(state: &WebState, key: &[u8]) -> Result<Dashboard> {
-    let storage = state.storage.lock().unwrap();
-    let health = state.health.lock().unwrap();
+fn build_dashboard(
+    storage: &Mutex<Storage>,
+    health: &HashMap<String, HealthInfo>,
+    key: &[u8],
+) -> Result<Dashboard> {
+    let storage = storage.lock().unwrap();
     let mut instances: HashMap<String, DashboardInstance> = HashMap::new();
 
     for name in storage.list_instances()? {
@@ -624,8 +640,6 @@ fn build_dashboard(state: &WebState, key: &[u8]) -> Result<Dashboard> {
             grants_applied: Some(record.grants_applied),
         });
     }
-    drop(health);
-    drop(storage);
 
     let mut instances: Vec<DashboardInstance> = instances.into_values().collect();
     instances.sort_by(|a, b| a.name.cmp(&b.name));
@@ -652,10 +666,16 @@ fn build_dashboard(state: &WebState, key: &[u8]) -> Result<Dashboard> {
 }
 
 async fn get_dashboard(
-    Session { key, .. }: Session,
+    Session { key, workspace, .. }: Session,
     State(state): State<Arc<WebState>>,
 ) -> Result<Json<Dashboard>, ApiError> {
-    Ok(Json(build_dashboard(&state, key.as_ref().as_slice())?))
+    let storage = state.storage_for(&workspace)?;
+    let health = state.health.lock().unwrap();
+    Ok(Json(build_dashboard(
+        &storage,
+        &health,
+        key.as_ref().as_slice(),
+    )?))
 }
 
 // ---------------------------------------------------------------------------
@@ -663,12 +683,13 @@ async fn get_dashboard(
 // ---------------------------------------------------------------------------
 
 async fn get_connection(
-    Session { key, .. }: Session,
+    Session { key, workspace, .. }: Session,
     State(state): State<Arc<WebState>>,
     Path((kind, id)): Path<(String, i64)>,
 ) -> Result<Json<ConnectionString>, ApiError> {
     let kind = connection_kind(&kind)?;
-    let storage = state.storage.lock().unwrap();
+    let storage = state.storage_for(&workspace)?;
+    let storage = storage.lock().unwrap();
     let record = find_connection(&storage, &kind, id)?;
     let cs = decrypt_connection(key.as_ref().as_slice(), record_encrypted(&record))?;
     Ok(Json(ConnectionString {
@@ -677,11 +698,12 @@ async fn get_connection(
 }
 
 async fn get_instance_connection(
-    Session { key, .. }: Session,
+    Session { key, workspace, .. }: Session,
     State(state): State<Arc<WebState>>,
     Path(name): Path<String>,
 ) -> Result<Json<ConnectionString>, ApiError> {
-    let storage = state.storage.lock().unwrap();
+    let storage = state.storage_for(&workspace)?;
+    let storage = storage.lock().unwrap();
     let secret = storage
         .load_instance_secret(&name)?
         .ok_or_else(|| ApiError::not_found(format!("no saved base URI for instance '{name}'")))?;
@@ -694,13 +716,14 @@ async fn get_instance_connection(
 /// Tests a single saved connection without touching the shared health cache.
 /// Always responds 200 so the UI can read the per-connection outcome.
 async fn post_connection_health(
-    Session { key, .. }: Session,
+    Session { key, workspace, .. }: Session,
     State(state): State<Arc<WebState>>,
     Path((kind, id)): Path<(String, i64)>,
 ) -> Result<Json<HealthInfo>, ApiError> {
     let kind = connection_kind(&kind)?;
     let cs = {
-        let storage = state.storage.lock().unwrap();
+        let storage = state.storage_for(&workspace)?;
+        let storage = storage.lock().unwrap();
         let record = find_connection(&storage, &kind, id)?;
         decrypt_connection(key.as_ref().as_slice(), record_encrypted(&record))?
     };
@@ -729,7 +752,7 @@ async fn post_connection_health(
 }
 
 async fn put_connection_name(
-    Session { .. }: Session,
+    Session { workspace, .. }: Session,
     State(state): State<Arc<WebState>>,
     Path((kind, id)): Path<(String, i64)>,
     Json(req): Json<NameRequest>,
@@ -738,7 +761,8 @@ async fn put_connection_name(
     if name.is_empty() {
         return Err(ApiError::bad_request("application name cannot be empty"));
     }
-    let storage = state.storage.lock().unwrap();
+    let storage = state.storage_for(&workspace)?;
+    let storage = storage.lock().unwrap();
     match connection_kind(&kind)? {
         ConnectionKind::Db => storage.update_database_application_name(id, &name)?,
         ConnectionKind::User => storage.update_extra_user_application_name(id, &name)?,
@@ -749,13 +773,14 @@ async fn put_connection_name(
 /// Rotates the password of a saved database owner or extra-user role on its
 /// instance and updates the catalog with the new connection string.
 async fn post_rotate_connection(
-    Session { key, .. }: Session,
+    Session { key, workspace, .. }: Session,
     State(state): State<Arc<WebState>>,
     Path((kind, id)): Path<(String, i64)>,
 ) -> Result<Json<Value>, ApiError> {
     let kind = connection_kind(&kind)?;
     let (instance_name, database_name, application_name, role_name) = {
-        let storage = state.storage.lock().unwrap();
+        let storage = state.storage_for(&workspace)?;
+        let storage = storage.lock().unwrap();
         let record = find_connection(&storage, &kind, id)?;
         match &record {
             SavedConnectionRecord::Database(r) => (
@@ -775,7 +800,8 @@ async fn post_rotate_connection(
     };
 
     let base_url = {
-        let storage = state.storage.lock().unwrap();
+        let storage = state.storage_for(&workspace)?;
+        let storage = storage.lock().unwrap();
         let secret = storage
             .load_instance_secret(&instance_name)?
             .ok_or_else(|| {
@@ -796,7 +822,8 @@ async fn post_rotate_connection(
     .map_err(ApiError::from)?;
 
     let encrypted = crypto::encrypt(key.as_ref().as_slice(), new_cs.as_bytes())?;
-    let storage = state.storage.lock().unwrap();
+    let storage = state.storage_for(&workspace)?;
+    let storage = storage.lock().unwrap();
     match kind {
         ConnectionKind::Db => storage.update_database_connection(id, &encrypted)?,
         ConnectionKind::User => storage.update_extra_user_connection(id, &encrypted)?,
@@ -813,12 +840,13 @@ async fn post_rotate_connection(
 /// Rotates the password of an instance's base URI user and updates the saved
 /// base DATABASE_URL in the catalog.
 async fn post_rotate_instance(
-    Session { key, .. }: Session,
+    Session { key, workspace, .. }: Session,
     State(state): State<Arc<WebState>>,
     Path(name): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     let base_url = {
-        let storage = state.storage.lock().unwrap();
+        let storage = state.storage_for(&workspace)?;
+        let storage = storage.lock().unwrap();
         let secret = storage.load_instance_secret(&name)?.ok_or_else(|| {
             ApiError::bad_request(format!("no saved base URI for instance '{name}'"))
         })?;
@@ -830,8 +858,8 @@ async fn post_rotate_instance(
             .map_err(|error| ApiError::from(anyhow::anyhow!("rotate task failed: {error}")))?
             .map_err(ApiError::from)?;
     let encrypted = crypto::encrypt(key.as_ref().as_slice(), new_url.as_bytes())?;
-    state
-        .storage
+    let storage = state.storage_for(&workspace)?;
+    storage
         .lock()
         .unwrap()
         .save_instance_secret(&name, &encrypted)?;
@@ -842,11 +870,12 @@ async fn post_rotate_instance(
 }
 
 async fn delete_connection(
-    Session { .. }: Session,
+    Session { workspace, .. }: Session,
     State(state): State<Arc<WebState>>,
     Path((kind, id)): Path<(String, i64)>,
 ) -> Result<Json<Value>, ApiError> {
-    let storage = state.storage.lock().unwrap();
+    let storage = state.storage_for(&workspace)?;
+    let storage = storage.lock().unwrap();
     match connection_kind(&kind)? {
         ConnectionKind::Db => storage.delete_provisioned_database(id)?,
         ConnectionKind::User => storage.delete_provisioned_extra_user(id)?,
@@ -858,12 +887,13 @@ async fn delete_connection(
 /// `instance:{name}` so the dashboard badge shows the last known state.
 /// Always responds 200 so the UI can read the per-instance outcome.
 async fn post_instance_health(
-    Session { key, .. }: Session,
+    Session { key, workspace, .. }: Session,
     State(state): State<Arc<WebState>>,
     Path(name): Path<String>,
 ) -> Result<Json<HealthInfo>, ApiError> {
     let cs = {
-        let storage = state.storage.lock().unwrap();
+        let storage = state.storage_for(&workspace)?;
+        let storage = storage.lock().unwrap();
         let secret = storage
             .load_instance_secret(&name)?
             .ok_or_else(|| ApiError::not_found(format!("instance '{name}' not found")))?;
@@ -904,7 +934,7 @@ async fn post_instance_health(
 // ---------------------------------------------------------------------------
 
 async fn post_instances(
-    Session { key, .. }: Session,
+    Session { key, workspace, .. }: Session,
     State(state): State<Arc<WebState>>,
     Json(req): Json<InstanceRequest>,
 ) -> Result<Json<InstanceInfo>, ApiError> {
@@ -918,8 +948,8 @@ async fn post_instances(
     }
     let parsed = postgres::parse_database_url(&raw_url)?;
     let encrypted = crypto::encrypt(key.as_ref().as_slice(), raw_url.as_bytes())?;
-    state
-        .storage
+    let storage = state.storage_for(&workspace)?;
+    storage
         .lock()
         .unwrap()
         .save_instance_secret(&name, &encrypted)?;
@@ -932,11 +962,12 @@ async fn post_instances(
 }
 
 async fn delete_instance(
-    Session { .. }: Session,
+    Session { workspace, .. }: Session,
     State(state): State<Arc<WebState>>,
     Path(name): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let mut storage = state.storage.lock().unwrap();
+    let storage = state.storage_for(&workspace)?;
+    let mut storage = storage.lock().unwrap();
     storage
         .delete_instance_cascade(&name)
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
@@ -947,7 +978,7 @@ async fn delete_instance(
 /// connection string reuses the instance base URI credentials, pointing at the
 /// target database. The database must exist and accept connections.
 async fn post_adopt(
-    Session { key, .. }: Session,
+    Session { key, workspace, .. }: Session,
     State(state): State<Arc<WebState>>,
     Json(req): Json<AdoptRequest>,
 ) -> Result<Json<Value>, ApiError> {
@@ -963,7 +994,8 @@ async fn post_adopt(
     );
 
     let base_url = {
-        let storage = state.storage.lock().unwrap();
+        let storage = state.storage_for(&workspace)?;
+        let storage = storage.lock().unwrap();
         let secret = storage
             .load_instance_secret(&instance_name)?
             .ok_or_else(|| {
@@ -995,11 +1027,11 @@ async fn post_adopt(
         database_created: false,
         role_created: false,
     };
-    state.storage.lock().unwrap().save_provisioned_database(
-        &instance_name,
-        &outcome,
-        &encrypted,
-    )?;
+    let storage = state.storage_for(&workspace)?;
+    storage
+        .lock()
+        .unwrap()
+        .save_provisioned_database(&instance_name, &outcome, &encrypted)?;
 
     Ok(Json(json!({
         "database_name": database_name,
@@ -1010,11 +1042,14 @@ async fn post_adopt(
 }
 
 async fn post_discover(
-    Session { key, .. }: Session,
+    Session { key, workspace, .. }: Session,
     State(state): State<Arc<WebState>>,
     Json(req): Json<DiscoverRequest>,
 ) -> Result<Json<Vec<DiscoveredDb>>, ApiError> {
-    let source_cs = resolve_source_cs(&state, key.as_ref().as_slice(), &req.source)?;
+    let source_cs = {
+        let storage = state.storage_for(&workspace)?;
+        resolve_source_cs(&storage, key.as_ref().as_slice(), &req.source)?
+    };
     let discovered = tokio::task::spawn_blocking(move || postgres::discover_databases(&source_cs))
         .await
         .map_err(|error| ApiError::from(anyhow::anyhow!("discover task failed: {error}")))?
@@ -1064,11 +1099,14 @@ fn query_rows_response(result: anyhow::Result<crate::models::SqlQueryResult>) ->
 }
 
 async fn post_query_tables(
-    Session { key, .. }: Session,
+    Session { key, workspace, .. }: Session,
     State(state): State<Arc<WebState>>,
     Json(req): Json<QueryTablesRequest>,
 ) -> Result<Json<Vec<QueryTableInfo>>, ApiError> {
-    let cs = resolve_source_cs(&state, key.as_ref().as_slice(), &req.source)?;
+    let cs = {
+        let storage = state.storage_for(&workspace)?;
+        resolve_source_cs(&storage, key.as_ref().as_slice(), &req.source)?
+    };
     let tables = tokio::task::spawn_blocking(move || postgres::list_database_tables(&cs))
         .await
         .map_err(|error| ApiError::from(anyhow::anyhow!("tables task failed: {error}")))?
@@ -1088,7 +1126,7 @@ async fn post_query_tables(
 }
 
 async fn post_query_data(
-    Session { key, .. }: Session,
+    Session { key, workspace, .. }: Session,
     State(state): State<Arc<WebState>>,
     Json(req): Json<QueryDataRequest>,
 ) -> Result<Json<QueryRowsResponse>, ApiError> {
@@ -1100,7 +1138,10 @@ async fn post_query_data(
     if req.offset < 0 {
         return Err(ApiError::bad_request("offset cannot be negative"));
     }
-    let cs = resolve_source_cs(&state, key.as_ref().as_slice(), &req.source)?;
+    let cs = {
+        let storage = state.storage_for(&workspace)?;
+        resolve_source_cs(&storage, key.as_ref().as_slice(), &req.source)?
+    };
     let result = tokio::task::spawn_blocking(move || {
         postgres::run_table_page(&cs, &schema, &table, req.offset)
     })
@@ -1110,16 +1151,42 @@ async fn post_query_data(
 }
 
 async fn post_query_run(
-    Session { key, .. }: Session,
+    Session { key, workspace, .. }: Session,
     State(state): State<Arc<WebState>>,
     Json(req): Json<QueryRunRequest>,
 ) -> Result<Json<QueryRowsResponse>, ApiError> {
-    let cs = resolve_source_cs(&state, key.as_ref().as_slice(), &req.source)?;
+    let cs = {
+        let storage = state.storage_for(&workspace)?;
+        resolve_source_cs(&storage, key.as_ref().as_slice(), &req.source)?
+    };
     let result =
         tokio::task::spawn_blocking(move || postgres::run_sql_query(&cs, &req.sql, req.read_only))
             .await
             .map_err(|error| ApiError::from(anyhow::anyhow!("query task failed: {error}")))?;
     Ok(Json(query_rows_response(result)))
+}
+
+// ---------------------------------------------------------------------------
+// Handlers: workspaces (public — used before unlock)
+// ---------------------------------------------------------------------------
+
+async fn get_workspaces(
+    State(state): State<Arc<WebState>>,
+) -> Result<Json<Vec<WorkspaceInfo>>, ApiError> {
+    Ok(Json(state.workspaces()?))
+}
+
+async fn delete_workspace(
+    State(state): State<Arc<WebState>>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let existed = state
+        .delete_workspace(&name)
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    if !existed {
+        return Err(ApiError::not_found(format!("workspace '{name}' not found")));
+    }
+    Ok(Json(json!({ "ok": true })))
 }
 
 // ---------------------------------------------------------------------------
@@ -1135,11 +1202,11 @@ struct ResolvedSource {
 }
 
 fn resolve_source(
-    state: &WebState,
+    storage: &Mutex<Storage>,
     key: &[u8],
     source: &SourceRef,
 ) -> Result<ResolvedSource, ApiError> {
-    let storage = state.storage.lock().unwrap();
+    let storage = storage.lock().unwrap();
     let resolved = match source {
         SourceRef::Db { id } => {
             let record = find_connection(&storage, &ConnectionKind::Db, *id)?;
@@ -1182,12 +1249,15 @@ fn resolve_source(
             }
         }
     };
-    drop(storage);
     Ok(resolved)
 }
 
-fn resolve_source_cs(state: &WebState, key: &[u8], source: &SourceRef) -> Result<String, ApiError> {
-    Ok(resolve_source(state, key, source)?.cs)
+fn resolve_source_cs(
+    storage: &Mutex<Storage>,
+    key: &[u8],
+    source: &SourceRef,
+) -> Result<String, ApiError> {
+    Ok(resolve_source(storage, key, source)?.cs)
 }
 
 // ---------------------------------------------------------------------------
@@ -1195,7 +1265,7 @@ fn resolve_source_cs(state: &WebState, key: &[u8], source: &SourceRef) -> Result
 // ---------------------------------------------------------------------------
 
 async fn post_provision(
-    Session { key, .. }: Session,
+    Session { key, workspace, .. }: Session,
     State(state): State<Arc<WebState>>,
     Json(req): Json<ProvisionRequest>,
 ) -> Result<Json<Value>, ApiError> {
@@ -1219,7 +1289,8 @@ async fn post_provision(
         .or_else(|| extra_username.as_ref().map(|_| database_name.clone()));
 
     let base_url = {
-        let storage = state.storage.lock().unwrap();
+        let storage = state.storage_for(&workspace)?;
+        let storage = storage.lock().unwrap();
         let secret = storage
             .load_instance_secret(&instance_name)?
             .ok_or_else(|| {
@@ -1240,7 +1311,7 @@ async fn post_provision(
     };
 
     let op_key = key.clone();
-    let storage = state.storage.clone();
+    let storage = state.storage_for(&workspace)?.clone();
     let op_instance = instance_name.clone();
     let id = state.ops.spawn(
         format!("Starting provisioning for database '{database_name}'"),
@@ -1277,11 +1348,14 @@ async fn post_provision(
 }
 
 async fn post_migrate(
-    Session { key, .. }: Session,
+    Session { key, workspace, .. }: Session,
     State(state): State<Arc<WebState>>,
     Json(req): Json<MigrateRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let source_cs = resolve_source_cs(&state, key.as_ref().as_slice(), &req.source)?;
+    let source_cs = {
+        let storage = state.storage_for(&workspace)?;
+        resolve_source_cs(&storage, key.as_ref().as_slice(), &req.source)?
+    };
     let dest_instance = req.dest_instance.trim().to_owned();
     let dest_db_name = req.dest_db_name.trim().to_owned();
     if dest_instance.is_empty() {
@@ -1297,7 +1371,8 @@ async fn post_migrate(
     validate_database_name(&dest_db_name).map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
 
     let dest_base_url = {
-        let storage = state.storage.lock().unwrap();
+        let storage = state.storage_for(&workspace)?;
+        let storage = storage.lock().unwrap();
         let secret = storage
             .load_instance_secret(&dest_instance)?
             .ok_or_else(|| {
@@ -1308,7 +1383,7 @@ async fn post_migrate(
 
     let backend = resolved_backend(&state, Some(&source_cs));
     let op_key = key.clone();
-    let storage = state.storage.clone();
+    let storage = state.storage_for(&workspace)?.clone();
     let op_instance = dest_instance.clone();
     let id = state.ops.spawn(
         format!("Starting migration to '{dest_db_name}' in {dest_instance}"),
@@ -1351,11 +1426,12 @@ async fn post_migrate(
 }
 
 async fn post_backup(
-    Session { key, .. }: Session,
+    Session { key, workspace, .. }: Session,
     State(state): State<Arc<WebState>>,
     Json(req): Json<BackupRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let source = resolve_source(&state, key.as_ref().as_slice(), &req.source)?;
+    let storage = state.storage_for(&workspace)?;
+    let source = resolve_source(&storage, key.as_ref().as_slice(), &req.source)?;
 
     let mut selected_databases = req.databases.clone();
     if source.is_instance && selected_databases.is_empty() {
@@ -1377,8 +1453,11 @@ async fn post_backup(
 
     let backend = resolved_backend(&state, Some(&source.cs));
     let op_key = key.clone();
-    let machine_id = state.machine_id.clone();
-    let hostname = state.hostname.clone();
+    let (machine_id, hostname) = {
+        let vault = state.storage_for(&workspace)?;
+        let guard = vault.lock().unwrap();
+        guard.ensure_machine_identity()?
+    };
     let instance_name = source.instance_name.clone();
     let db_name = source.database_name.clone();
     let app_name = source.application_name.clone();
@@ -1530,7 +1609,7 @@ async fn post_restore_preview(
 }
 
 async fn post_restore(
-    Session { key, .. }: Session,
+    Session { key, workspace, .. }: Session,
     State(state): State<Arc<WebState>>,
     Json(req): Json<RestoreRequest>,
 ) -> Result<Json<Value>, ApiError> {
@@ -1545,7 +1624,8 @@ async fn post_restore(
         ));
     }
     let dest_base_url = {
-        let storage = state.storage.lock().unwrap();
+        let storage = state.storage_for(&workspace)?;
+        let storage = storage.lock().unwrap();
         let secret = storage
             .load_instance_secret(&dest_instance)?
             .ok_or_else(|| {
@@ -1580,7 +1660,7 @@ async fn post_restore(
 
     let backend = resolved_backend(&state, Some(&dest_base_url));
     let op_key = key.clone();
-    let storage = state.storage.clone();
+    let storage = state.storage_for(&workspace)?.clone();
     let op_instance = dest_instance.clone();
     let start_msg = format!(
         "Starting restore of '{}' to '{dest_db_name}' in {dest_instance}",
@@ -1691,6 +1771,8 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/style.css", get(style_css))
         .route("/favicon.svg", get(favicon))
         .route("/api/status", get(get_status))
+        .route("/api/workspaces", get(get_workspaces))
+        .route("/api/workspaces/{name}", delete(delete_workspace))
         .route("/api/init", post(post_init))
         .route("/api/unlock", post(post_unlock))
         .route("/api/lock", post(post_lock))
@@ -1771,23 +1853,29 @@ mod tests {
     #[test]
     fn router_builds_without_route_conflicts() {
         let dir = tempdir().unwrap();
-        let storage = Storage::open_at(dir.path().join("data.sqlite")).unwrap();
-        let state = Arc::new(WebState::from_storage(storage).unwrap());
+        let state = Arc::new(WebState::open_at(dir.path()).unwrap());
         let _app = router(state);
     }
 
     #[test]
     fn dashboard_groups_connections_under_instances() {
         let dir = tempdir().unwrap();
-        let storage = Storage::open_at(dir.path().join("data.sqlite")).unwrap();
+        let storage =
+            Mutex::new(Storage::open_at(dir.path().join("workspaces").join("dev.sqlite")).unwrap());
         let key = b"01234567890123456789012345678901";
 
         let inst_enc =
             crypto::encrypt(key, b"postgresql://admin:pw@db.example.com:5432/postgres").unwrap();
-        storage.save_instance_secret("prod", &inst_enc).unwrap();
+        storage
+            .lock()
+            .unwrap()
+            .save_instance_secret("prod", &inst_enc)
+            .unwrap();
 
         let db_enc = crypto::encrypt(key, b"postgresql://o:p@h/orders").unwrap();
         storage
+            .lock()
+            .unwrap()
             .save_provisioned_database(
                 "prod",
                 &ProvisionOutcome {
@@ -1804,6 +1892,8 @@ mod tests {
 
         let user_enc = crypto::encrypt(key, b"postgresql://w:p@h/orders").unwrap();
         storage
+            .lock()
+            .unwrap()
             .save_provisioned_extra_user(
                 "prod",
                 &ExtraUserProvisionOutcome {
@@ -1818,8 +1908,8 @@ mod tests {
             )
             .unwrap();
 
-        let state = WebState::from_storage(storage).unwrap();
-        let dash = build_dashboard(&state, key).unwrap();
+        let health = std::collections::HashMap::new();
+        let dash = build_dashboard(&storage, &health, key).unwrap();
 
         assert_eq!(dash.instances.len(), 1);
         let inst = &dash.instances[0];
@@ -1839,66 +1929,90 @@ mod tests {
     #[test]
     fn dashboard_lists_instances_without_connections() {
         let dir = tempdir().unwrap();
-        let storage = Storage::open_at(dir.path().join("data.sqlite")).unwrap();
+        let storage =
+            Mutex::new(Storage::open_at(dir.path().join("workspaces").join("dev.sqlite")).unwrap());
         let key = b"01234567890123456789012345678901";
         let inst_enc = crypto::encrypt(key, b"postgresql://u:p@localhost:5433/shared").unwrap();
-        storage.save_instance_secret("dev", &inst_enc).unwrap();
+        storage
+            .lock()
+            .unwrap()
+            .save_instance_secret("dev", &inst_enc)
+            .unwrap();
 
-        let state = WebState::from_storage(storage).unwrap();
-        let dash = build_dashboard(&state, key).unwrap();
+        let health = std::collections::HashMap::new();
+        let dash = build_dashboard(&storage, &health, key).unwrap();
         assert_eq!(dash.instances.len(), 1);
         assert_eq!(dash.instances[0].name, "dev");
         assert_eq!(dash.instances[0].databases.len(), 0);
     }
 
-    fn test_session(key: &[u8; 32]) -> Session {
+    fn test_session(key: &[u8; 32], workspace: &str) -> Session {
         Session {
             key: Arc::new(Zeroizing::new(key.to_vec())),
+            workspace: workspace.to_owned(),
             token: "test-token".to_owned(),
         }
+    }
+
+    /// Abre um estado de teste com o workspace `dev` já criado. Retorna o
+    /// estado e o vault do workspace para setup de segredos.
+    fn test_state_with_workspace(
+        dir: &tempfile::TempDir,
+    ) -> (Arc<WebState>, std::sync::Arc<std::sync::Mutex<Storage>>) {
+        let state = Arc::new(WebState::open_at(dir.path()).unwrap());
+        let vault = state.storage_for("dev").unwrap();
+        (state, vault)
     }
 
     #[tokio::test]
     async fn discover_returns_error_instead_of_panicking_on_blocking_connect() {
         let dir = tempdir().unwrap();
-        let storage = Storage::open_at(dir.path().join("data.sqlite")).unwrap();
         let key = b"01234567890123456789012345678901";
+        let (state, vault) = test_state_with_workspace(&dir);
         let inst_enc = crypto::encrypt(key, b"postgresql://u:p@127.0.0.1:1/nope").unwrap();
-        storage.save_instance_secret("dev", &inst_enc).unwrap();
-        let state = Arc::new(WebState::from_storage(storage).unwrap());
+        vault
+            .lock()
+            .unwrap()
+            .save_instance_secret("dev", &inst_enc)
+            .unwrap();
         let request = DiscoverRequest {
             source: SourceRef::Instance {
                 name: "dev".to_owned(),
             },
         };
-        let result = post_discover(test_session(key), State(state), Json(request)).await;
+        let result = post_discover(test_session(key, "dev"), State(state), Json(request)).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn adopt_returns_error_instead_of_panicking_on_blocking_connect() {
         let dir = tempdir().unwrap();
-        let storage = Storage::open_at(dir.path().join("data.sqlite")).unwrap();
         let key = b"01234567890123456789012345678901";
+        let (state, vault) = test_state_with_workspace(&dir);
         let inst_enc = crypto::encrypt(key, b"postgresql://u:p@127.0.0.1:1/postgres").unwrap();
-        storage.save_instance_secret("dev", &inst_enc).unwrap();
-        let state = Arc::new(WebState::from_storage(storage).unwrap());
+        vault
+            .lock()
+            .unwrap()
+            .save_instance_secret("dev", &inst_enc)
+            .unwrap();
         let request = AdoptRequest {
             instance_name: "dev".to_owned(),
             database_name: "orders".to_owned(),
             application_name: None,
         };
-        let result = post_adopt(test_session(key), State(state), Json(request)).await;
+        let result = post_adopt(test_session(key, "dev"), State(state), Json(request)).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn connection_health_reports_error_instead_of_panicking() {
         let dir = tempdir().unwrap();
-        let storage = Storage::open_at(dir.path().join("data.sqlite")).unwrap();
         let key = b"01234567890123456789012345678901";
+        let (state, vault) = test_state_with_workspace(&dir);
         let enc = crypto::encrypt(key, b"postgresql://u:p@127.0.0.1:1/orders").unwrap();
-        storage
+        vault
+            .lock()
+            .unwrap()
             .save_provisioned_database(
                 "prod",
                 &ProvisionOutcome {
@@ -1912,11 +2026,13 @@ mod tests {
                 &enc,
             )
             .unwrap();
-        let state = Arc::new(WebState::from_storage(storage).unwrap());
-        let result =
-            post_connection_health(test_session(key), State(state), Path(("db".to_owned(), 1)))
-                .await
-                .expect("handler returns health info");
+        let result = post_connection_health(
+            test_session(key, "dev"),
+            State(state),
+            Path(("db".to_owned(), 1)),
+        )
+        .await
+        .expect("handler returns health info");
         assert_eq!(result.0.status, "error");
         assert!(!result.0.timed_out);
     }
@@ -1924,14 +2040,21 @@ mod tests {
     #[tokio::test]
     async fn instance_health_reports_error_instead_of_panicking() {
         let dir = tempdir().unwrap();
-        let storage = Storage::open_at(dir.path().join("data.sqlite")).unwrap();
         let key = b"01234567890123456789012345678901";
+        let (state, vault) = test_state_with_workspace(&dir);
         let inst_enc = crypto::encrypt(key, b"postgresql://u:p@127.0.0.1:1/postgres").unwrap();
-        storage.save_instance_secret("dev", &inst_enc).unwrap();
-        let state = Arc::new(WebState::from_storage(storage).unwrap());
-        let result = post_instance_health(test_session(key), State(state), Path("dev".to_owned()))
-            .await
-            .expect("handler returns health info");
+        vault
+            .lock()
+            .unwrap()
+            .save_instance_secret("dev", &inst_enc)
+            .unwrap();
+        let result = post_instance_health(
+            test_session(key, "dev"),
+            State(state),
+            Path("dev".to_owned()),
+        )
+        .await
+        .expect("handler returns health info");
         assert_eq!(result.0.status, "error");
         assert!(!result.0.timed_out);
     }
@@ -1939,39 +2062,48 @@ mod tests {
     #[tokio::test]
     async fn instance_health_fails_for_unknown_instance() {
         let dir = tempdir().unwrap();
-        let storage = Storage::open_at(dir.path().join("data.sqlite")).unwrap();
         let key = b"01234567890123456789012345678901";
-        let state = Arc::new(WebState::from_storage(storage).unwrap());
-        let result =
-            post_instance_health(test_session(key), State(state), Path("ghost".to_owned())).await;
+        let (state, _vault) = test_state_with_workspace(&dir);
+        let result = post_instance_health(
+            test_session(key, "dev"),
+            State(state),
+            Path("ghost".to_owned()),
+        )
+        .await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn query_tables_fails_for_unreachable_source() {
         let dir = tempdir().unwrap();
-        let storage = Storage::open_at(dir.path().join("data.sqlite")).unwrap();
         let key = b"01234567890123456789012345678901";
+        let (state, vault) = test_state_with_workspace(&dir);
         let inst_enc = crypto::encrypt(key, b"postgresql://u:p@127.0.0.1:1/postgres").unwrap();
-        storage.save_instance_secret("dev", &inst_enc).unwrap();
-        let state = Arc::new(WebState::from_storage(storage).unwrap());
+        vault
+            .lock()
+            .unwrap()
+            .save_instance_secret("dev", &inst_enc)
+            .unwrap();
         let request = QueryTablesRequest {
             source: SourceRef::Instance {
                 name: "dev".to_owned(),
             },
         };
-        let result = post_query_tables(test_session(key), State(state), Json(request)).await;
+        let result = post_query_tables(test_session(key, "dev"), State(state), Json(request)).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn query_data_rejects_negative_offset() {
         let dir = tempdir().unwrap();
-        let storage = Storage::open_at(dir.path().join("data.sqlite")).unwrap();
         let key = b"01234567890123456789012345678901";
+        let (state, vault) = test_state_with_workspace(&dir);
         let inst_enc = crypto::encrypt(key, b"postgresql://u:p@127.0.0.1:1/postgres").unwrap();
-        storage.save_instance_secret("dev", &inst_enc).unwrap();
-        let state = Arc::new(WebState::from_storage(storage).unwrap());
+        vault
+            .lock()
+            .unwrap()
+            .save_instance_secret("dev", &inst_enc)
+            .unwrap();
         let request = QueryDataRequest {
             source: SourceRef::Instance {
                 name: "dev".to_owned(),
@@ -1980,18 +2112,21 @@ mod tests {
             table: "orders".to_owned(),
             offset: -1,
         };
-        let result = post_query_data(test_session(key), State(state), Json(request)).await;
+        let result = post_query_data(test_session(key, "dev"), State(state), Json(request)).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn query_run_reports_sql_errors_in_error_field() {
         let dir = tempdir().unwrap();
-        let storage = Storage::open_at(dir.path().join("data.sqlite")).unwrap();
         let key = b"01234567890123456789012345678901";
+        let (state, vault) = test_state_with_workspace(&dir);
         let inst_enc = crypto::encrypt(key, b"postgresql://u:p@127.0.0.1:1/postgres").unwrap();
-        storage.save_instance_secret("dev", &inst_enc).unwrap();
-        let state = Arc::new(WebState::from_storage(storage).unwrap());
+        vault
+            .lock()
+            .unwrap()
+            .save_instance_secret("dev", &inst_enc)
+            .unwrap();
         let request = QueryRunRequest {
             source: SourceRef::Instance {
                 name: "dev".to_owned(),
@@ -1999,7 +2134,7 @@ mod tests {
             sql: "SELECT 1".to_owned(),
             read_only: true,
         };
-        let result = post_query_run(test_session(key), State(state), Json(request))
+        let result = post_query_run(test_session(key, "dev"), State(state), Json(request))
             .await
             .expect("handler responds even when the connection fails");
         assert!(result.0.error.is_some());
@@ -2009,12 +2144,18 @@ mod tests {
     #[tokio::test]
     async fn rotate_connection_returns_error_instead_of_panicking_on_blocking_connect() {
         let dir = tempdir().unwrap();
-        let storage = Storage::open_at(dir.path().join("data.sqlite")).unwrap();
         let key = b"01234567890123456789012345678901";
+        let (state, vault) = test_state_with_workspace(&dir);
         let inst_enc = crypto::encrypt(key, b"postgresql://u:p@127.0.0.1:1/postgres").unwrap();
-        storage.save_instance_secret("dev", &inst_enc).unwrap();
+        vault
+            .lock()
+            .unwrap()
+            .save_instance_secret("dev", &inst_enc)
+            .unwrap();
         let enc = crypto::encrypt(key, b"postgresql://u:p@127.0.0.1:1/orders").unwrap();
-        storage
+        vault
+            .lock()
+            .unwrap()
             .save_provisioned_database(
                 "dev",
                 &ProvisionOutcome {
@@ -2028,23 +2169,32 @@ mod tests {
                 &enc,
             )
             .unwrap();
-        let state = Arc::new(WebState::from_storage(storage).unwrap());
-        let result =
-            post_rotate_connection(test_session(key), State(state), Path(("db".to_owned(), 1)))
-                .await;
+        let result = post_rotate_connection(
+            test_session(key, "dev"),
+            State(state),
+            Path(("db".to_owned(), 1)),
+        )
+        .await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn rotate_instance_returns_error_instead_of_panicking_on_blocking_connect() {
         let dir = tempdir().unwrap();
-        let storage = Storage::open_at(dir.path().join("data.sqlite")).unwrap();
         let key = b"01234567890123456789012345678901";
+        let (state, vault) = test_state_with_workspace(&dir);
         let inst_enc = crypto::encrypt(key, b"postgresql://u:p@127.0.0.1:1/postgres").unwrap();
-        storage.save_instance_secret("dev", &inst_enc).unwrap();
-        let state = Arc::new(WebState::from_storage(storage).unwrap());
-        let result =
-            post_rotate_instance(test_session(key), State(state), Path("dev".to_owned())).await;
+        vault
+            .lock()
+            .unwrap()
+            .save_instance_secret("dev", &inst_enc)
+            .unwrap();
+        let result = post_rotate_instance(
+            test_session(key, "dev"),
+            State(state),
+            Path("dev".to_owned()),
+        )
+        .await;
         assert!(result.is_err());
     }
 }

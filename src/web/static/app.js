@@ -236,19 +236,16 @@ function confirmModalCountdown(title, message, confirmLabel = 'Confirmar', secon
 // Unlock / first run
 // ---------------------------------------------------------------------------
 
+const WORKSPACE_KEY = 'cais_workspace';
+let workspacesCache = [];
+let newWorkspaceMode = false;
+
 async function boot() {
-  let status;
   try {
-    status = await apiGet('/api/status');
+    await apiGet('/api/status');
   } catch (e) {
     setStatus('Falha ao consultar o servidor: ' + e.message);
     return;
-  }
-
-  if (status.initialized) {
-    showUnlock(false);
-  } else {
-    showUnlock(true);
   }
 
   if (token) {
@@ -256,43 +253,139 @@ async function boot() {
       await loadDashboard();
       return;
     } catch {
-      showUnlock(status.initialized);
+      // Token inválido ou servidor reiniciado — cai no unlock abaixo.
     }
+  }
+  await showUnlock();
+}
+
+async function showUnlock() {
+  showView('view-unlock');
+  $('#unlock-submit').textContent = 'Desbloquear';
+  $('#field-password').value = '';
+  $('#field-confirm').value = '';
+  $('#field-new-workspace').value = '';
+  $('#unlock-error').classList.add('hidden');
+  exitNewWorkspaceMode();
+  try {
+    await refreshWorkspaces();
+  } catch {
+    workspacesCache = [];
+    syncUnlockMode();
   }
 }
 
-function showUnlock(firstRun) {
-  showView('view-unlock');
-  $('#unlock-submit').textContent = firstRun ? 'Criar senha mestra' : 'Desbloquear';
-  $('#unlock-subtitle').textContent = firstRun
-    ? 'Primeira execução. Crie a senha mestra que criptografa todos os segredos.'
-    : 'Digite a senha mestra para desbloquear o cofre.';
-  $('#field-confirm-wrap').classList.toggle('hidden', !firstRun);
-  $('#field-password').value = '';
-  $('#field-confirm').value = '';
-  $('#unlock-error').classList.add('hidden');
-  $('#field-password').focus();
+async function refreshWorkspaces() {
+  workspacesCache = await apiGet('/api/workspaces');
+  const select = $('#field-workspace');
+  select.innerHTML = '';
+  for (const ws of workspacesCache) {
+    const suffix = ws.initialized ? '' : ' (sem senha)';
+    select.appendChild(el('option', { value: ws.name, text: ws.name + suffix }));
+  }
+  const stored = localStorage.getItem(WORKSPACE_KEY);
+  const names = workspacesCache.map((ws) => ws.name);
+  const target = names.includes(stored) ? stored : names[0];
+  if (target !== undefined) {
+    select.value = target;
+  }
+  if (!names.length) {
+    enterNewWorkspaceMode();
+  }
+  syncUnlockMode();
 }
+
+function selectedWorkspaceInfo() {
+  const name = $('#field-workspace').value;
+  return workspacesCache.find((ws) => ws.name === name) || null;
+}
+
+function syncUnlockMode() {
+  const info = selectedWorkspaceInfo();
+  const needsInit = newWorkspaceMode || !info || !info.initialized;
+  $('#field-confirm-wrap').classList.toggle('hidden', !needsInit);
+  $('#workspace-select-wrap').classList.toggle('hidden', newWorkspaceMode);
+  $('#btn-new-workspace').classList.toggle('hidden', newWorkspaceMode);
+  $('#btn-cancel-new-workspace').classList.toggle('hidden', !newWorkspaceMode);
+  const submitLabel = needsInit ? 'Criar workspace' : 'Desbloquear';
+  $('#unlock-submit').textContent = submitLabel;
+  $('#unlock-subtitle').textContent = newWorkspaceMode
+    ? 'Novo workspace: escolha um nome e crie a senha mestra dele.'
+    : needsInit
+      ? `Workspace ${info ? info.name : ''} ainda não tem senha. Defina a senha mestra dele.`
+      : 'Digite a senha mestra para desbloquear o cofre.';
+}
+
+function enterNewWorkspaceMode() {
+  newWorkspaceMode = true;
+  $('#field-new-workspace-wrap').classList.remove('hidden');
+  syncUnlockMode();
+  $('#field-new-workspace').focus();
+}
+
+function exitNewWorkspaceMode() {
+  newWorkspaceMode = false;
+  $('#field-new-workspace-wrap').classList.add('hidden');
+  syncUnlockMode();
+}
+
+$('#btn-new-workspace').addEventListener('click', () => enterNewWorkspaceMode());
+$('#btn-cancel-new-workspace').addEventListener('click', () => exitNewWorkspaceMode());
+$('#field-workspace').addEventListener('change', syncUnlockMode);
+
+$('#btn-remove-workspace').addEventListener('click', async () => {
+  const name = $('#field-workspace').value;
+  if (!name) {
+    return;
+  }
+  const ok = await confirmModalCountdown(
+    'Remover workspace',
+    `Remover o workspace ${name}? Todas as instâncias e conexões salvas nele serão apagadas definitivamente. Nada nos servidores PostgreSQL é afetado.`,
+    'Remover',
+  );
+  if (!ok) {
+    return;
+  }
+  try {
+    await apiDelete('/api/workspaces/' + encodeURIComponent(name));
+    if (localStorage.getItem(WORKSPACE_KEY) === name) {
+      localStorage.removeItem(WORKSPACE_KEY);
+    }
+    setStatus(`Workspace '${name}' removido.`);
+    await refreshWorkspaces();
+  } catch (e) {
+    setStatus(e.message);
+  }
+});
 
 $('#unlock-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const password = $('#field-password').value;
-  const firstRun = !$('#field-confirm-wrap').classList.contains('hidden');
+  const workspace = newWorkspaceMode
+    ? $('#field-new-workspace').value.trim()
+    : $('#field-workspace').value;
+  const info = workspacesCache.find((ws) => ws.name === workspace);
+  const needsInit = newWorkspaceMode || !info || !info.initialized;
   const errEl = $('#unlock-error');
   const submitBtn = $('#unlock-submit');
   errEl.classList.add('hidden');
   submitBtn.disabled = true;
   const originalLabel = submitBtn.textContent;
-  submitBtn.textContent = firstRun ? 'Criando senha...' : 'Desbloqueando...';
+  submitBtn.textContent = needsInit ? 'Criando workspace...' : 'Desbloqueando...';
   try {
     let tokenResp;
-    if (firstRun) {
-      tokenResp = await apiPost('/api/init', { password, confirm: $('#field-confirm').value });
+    if (needsInit) {
+      tokenResp = await apiPost('/api/init', {
+        workspace,
+        password,
+        confirm: $('#field-confirm').value,
+      });
     } else {
-      tokenResp = await apiPost('/api/unlock', { password });
+      tokenResp = await apiPost('/api/unlock', { workspace, password });
     }
     token = tokenResp.token;
     localStorage.setItem(TOKEN_KEY, token);
+    localStorage.setItem(WORKSPACE_KEY, workspace);
     await loadDashboard();
   } catch (err) {
     errEl.textContent = err.message;
@@ -309,13 +402,13 @@ $('#btn-lock').addEventListener('click', async () => {
     }
   } catch { /* ignore */ }
   lockLocal();
-  const status = await apiGet('/api/status');
-  showUnlock(status.initialized);
+  await showUnlock();
 });
 
 function lockLocal() {
   token = '';
   localStorage.removeItem(TOKEN_KEY);
+  localStorage.removeItem(WORKSPACE_KEY);
 }
 
 // ---------------------------------------------------------------------------

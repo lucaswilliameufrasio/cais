@@ -35,7 +35,10 @@ pub struct Storage {
 
 impl Storage {
     pub fn open() -> Result<Self> {
-        Self::open_at(database_path()?)
+        let data_dir = app_data_dir()?;
+        migrate_legacy_vault_at(&data_dir)?;
+        let workspaces = data_dir.join("workspaces");
+        Self::open_at(workspace_file(&workspaces, "default")?)
     }
 
     pub fn open_at(path: PathBuf) -> Result<Self> {
@@ -820,9 +823,101 @@ fn reencrypt_provisioned_extra_users(
 }
 
 fn database_path() -> Result<PathBuf> {
+    Ok(app_data_dir()?.join("data.sqlite"))
+}
+
+/// The application-owned data directory.
+pub fn app_data_dir() -> Result<PathBuf> {
     let project_dirs = ProjectDirs::from("com", "lucaseufrasiojcpm", "cais")
         .context("failed to resolve app data directory")?;
-    Ok(project_dirs.data_dir().join("data.sqlite"))
+    Ok(project_dirs.data_dir().to_path_buf())
+}
+
+/// Validates a workspace name: 1-32 chars, ASCII letters/digits plus `-` and
+/// `_`, starting with a letter or digit. The name becomes the vault filename.
+pub fn validate_workspace_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > 32 {
+        anyhow::bail!("workspace name must be 1-32 characters long");
+    }
+    let first_ok = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric());
+    let all_ok = name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !first_ok || !all_ok {
+        anyhow::bail!(
+            "workspace name may only contain letters, digits, '-' and '_', starting with a letter or digit"
+        );
+    }
+    Ok(())
+}
+
+/// Vault file path of `workspace` inside `workspaces_dir`.
+pub fn workspace_file(workspaces_dir: &std::path::Path, workspace: &str) -> Result<PathBuf> {
+    validate_workspace_name(workspace)?;
+    Ok(workspaces_dir.join(format!("{workspace}.sqlite")))
+}
+
+/// Lists workspace names (file stems) in `workspaces_dir`, sorted.
+pub fn list_workspaces_at(workspaces_dir: &std::path::Path) -> Result<Vec<String>> {
+    if !workspaces_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut names = Vec::new();
+    for entry in fs::read_dir(workspaces_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "sqlite")
+            && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+        {
+            names.push(stem.to_owned());
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+/// Deletes a workspace vault file. Returns whether it existed.
+pub fn delete_workspace_at(workspaces_dir: &std::path::Path, workspace: &str) -> Result<bool> {
+    let file = workspace_file(workspaces_dir, workspace)?;
+    if !file.exists() {
+        return Ok(false);
+    }
+    fs::remove_file(&file)
+        .with_context(|| format!("failed to delete workspace file {}", file.display()))?;
+    Ok(true)
+}
+
+/// Moves the legacy single-vault `data.sqlite` (and SQLite side files) into
+/// the multi-workspace layout as `workspaces/default.sqlite`. Skips silently
+/// when there is no legacy file or when the target already exists.
+pub fn migrate_legacy_vault_at(data_dir: &std::path::Path) -> Result<()> {
+    let legacy = data_dir.join("data.sqlite");
+    if !legacy.exists() {
+        return Ok(());
+    }
+    let workspaces = data_dir.join("workspaces");
+    fs::create_dir_all(&workspaces)
+        .with_context(|| format!("failed to create {}", workspaces.display()))?;
+    let target = workspaces.join("default.sqlite");
+    if target.exists() {
+        return Ok(());
+    }
+    fs::rename(&legacy, &target).with_context(|| {
+        format!(
+            "failed to move {} into the workspaces layout",
+            legacy.display()
+        )
+    })?;
+    for side in ["-wal", "-shm"] {
+        let side_file = data_dir.join(format!("data.sqlite{side}"));
+        if side_file.exists() {
+            let _ = fs::rename(&side_file, workspaces.join(format!("default.sqlite{side}")));
+        }
+    }
+    Ok(())
 }
 
 /// Returns the stable application-owned directory for encrypted backups.
@@ -878,9 +973,7 @@ pub fn reset_vault_at(data_dir: &std::path::Path) -> Result<VaultReset> {
 
 /// Resets the real application data directory.
 pub fn reset_vault() -> Result<VaultReset> {
-    let project_dirs = ProjectDirs::from("com", "lucaseufrasiojcpm", "cais")
-        .context("failed to resolve app data directory")?;
-    reset_vault_at(project_dirs.data_dir())
+    reset_vault_at(&app_data_dir()?)
 }
 
 fn bool_to_int(value: bool) -> i64 {
@@ -913,8 +1006,10 @@ fn connection_sort_key(record: &SavedConnectionRecord) -> (String, String, u8, S
 
 #[cfg(test)]
 mod tests {
-    use super::Storage;
-    use super::reset_vault_at;
+    use super::{
+        Storage, delete_workspace_at, list_workspaces_at, migrate_legacy_vault_at, reset_vault_at,
+        validate_workspace_name, workspace_file,
+    };
     use crate::crypto;
     use crate::models::{ExtraUserProvisionOutcome, ProvisionOutcome, SavedConnectionRecord};
     use tempfile::tempdir;
@@ -1422,5 +1517,98 @@ mod tests {
         let dir = tempdir().expect("dir");
         let reset = reset_vault_at(dir.path()).expect("reset");
         assert!(reset.moved.is_empty(), "nothing exists to move");
+    }
+
+    #[test]
+    fn workspace_name_validation() {
+        assert!(validate_workspace_name("default").is_ok());
+        assert!(validate_workspace_name("prd-2024").is_ok());
+        assert!(validate_workspace_name("a_b").is_ok());
+        assert!(validate_workspace_name("").is_err());
+        assert!(validate_workspace_name(".hidden").is_err());
+        assert!(validate_workspace_name("has space").is_err());
+        assert!(validate_workspace_name("-leading").is_err());
+        assert!(validate_workspace_name(&"x".repeat(33)).is_err());
+    }
+
+    #[test]
+    fn workspaces_list_create_delete_round_trip() {
+        let dir = tempdir().expect("dir");
+        let workspaces = dir.path().join("workspaces");
+
+        assert!(
+            list_workspaces_at(&workspaces)
+                .expect("list empty")
+                .is_empty(),
+            "missing directory lists as empty"
+        );
+
+        Storage::open_at(workspace_file(&workspaces, "default").expect("path")).expect("open");
+        Storage::open_at(workspace_file(&workspaces, "dev").expect("path")).expect("open");
+
+        let mut names = list_workspaces_at(&workspaces).expect("list");
+        assert_eq!(names, vec!["default".to_owned(), "dev".to_owned()]);
+
+        assert!(
+            delete_workspace_at(&workspaces, "dev").expect("delete"),
+            "existing workspace must report deleted"
+        );
+        assert!(
+            !delete_workspace_at(&workspaces, "dev").expect("delete again"),
+            "deleting a missing workspace reports not-existed"
+        );
+        names = list_workspaces_at(&workspaces).expect("list");
+        assert_eq!(names, vec!["default".to_owned()]);
+    }
+
+    #[test]
+    fn migrate_legacy_vault_moves_data_sqlite_to_default_workspace() {
+        let dir = tempdir().expect("dir");
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        let legacy = Storage::open_at(data_dir.join("data.sqlite")).expect("legacy vault");
+        legacy.initialize_master_password("old-pass").expect("init");
+        drop(legacy);
+
+        migrate_legacy_vault_at(&data_dir).expect("migrate");
+
+        let migrated = Storage::open_at(
+            workspace_file(&data_dir.join("workspaces"), "default").expect("path"),
+        )
+        .expect("migrated vault");
+        assert!(
+            migrated.is_initialized().expect("initialized check"),
+            "migrated vault keeps its master password"
+        );
+        assert!(
+            !data_dir.join("data.sqlite").exists(),
+            "legacy file must be moved, not copied"
+        );
+
+        // Running again is a no-op.
+        migrate_legacy_vault_at(&data_dir).expect("migrate twice");
+        let names = list_workspaces_at(&data_dir.join("workspaces")).expect("list");
+        assert_eq!(names, vec!["default".to_owned()]);
+    }
+
+    #[test]
+    fn migrate_legacy_vault_keeps_existing_default_workspace() {
+        let dir = tempdir().expect("dir");
+        let data_dir = dir.path().join("data");
+        let workspaces = data_dir.join("workspaces");
+        std::fs::create_dir_all(&workspaces).expect("workspaces dir");
+        let default = Storage::open_at(workspaces.join("default.sqlite")).expect("default");
+        default
+            .initialize_master_password("new-pass")
+            .expect("init");
+        drop(default);
+        std::fs::write(data_dir.join("data.sqlite"), b"legacy").expect("legacy file");
+
+        migrate_legacy_vault_at(&data_dir).expect("migrate");
+
+        // Legacy file stays untouched because default.sqlite already exists.
+        assert!(data_dir.join("data.sqlite").exists());
+        let reopened = Storage::open_at(workspaces.join("default.sqlite")).expect("default");
+        assert!(reopened.is_initialized().expect("check"));
     }
 }

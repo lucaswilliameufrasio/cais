@@ -7,13 +7,11 @@ use serde_json::Value;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-use cais::storage::Storage;
 use cais::web::state::WebState;
 
 fn build_app() -> (axum::Router, TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let storage = Storage::open_at(dir.path().join("data.sqlite")).unwrap();
-    let state = Arc::new(WebState::from_storage(storage).unwrap());
+    let state = Arc::new(WebState::open_at(dir.path()).unwrap());
     (cais::web::api::router(state), dir)
 }
 
@@ -44,11 +42,45 @@ async fn request(
 }
 
 #[tokio::test]
-async fn status_reports_not_initialized() {
+async fn status_reports_tool_backend() {
     let (app, _dir) = build_app();
     let (status, body) = request(&app, "GET", "/api/status", None, None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["initialized"], false);
+    assert!(body["tool_backend"].is_object());
+}
+
+#[tokio::test]
+async fn workspaces_start_empty_and_support_full_lifecycle() {
+    let (app, _dir) = build_app();
+
+    let (status, body) = request(&app, "GET", "/api/workspaces", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_array().unwrap().len(), 0);
+
+    // Create via init.
+    let (status, body) = request(
+        &app,
+        "POST",
+        "/api/init",
+        Some(r#"{"workspace":"default","password":"secret","confirm":"secret"}"#),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let token = body["token"].as_str().unwrap().to_owned();
+
+    // Cannot remove a workspace with an active session.
+    let (status, _) = request(&app, "DELETE", "/api/workspaces/default", None, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Lock, then removal succeeds.
+    let _ = request(&app, "POST", "/api/lock", Some("{}"), Some(&token)).await;
+    let (status, _) = request(&app, "DELETE", "/api/workspaces/default", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = request(&app, "GET", "/api/workspaces", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_array().unwrap().len(), 0);
 }
 
 #[tokio::test]
@@ -59,7 +91,7 @@ async fn init_unlock_lock_session_lifecycle() {
         &app,
         "POST",
         "/api/init",
-        Some(r#"{"password":"secret","confirm":"secret"}"#),
+        Some(r#"{"workspace":"default","password":"secret","confirm":"secret"}"#),
         None,
     )
     .await;
@@ -89,7 +121,7 @@ async fn init_requires_matching_confirmation() {
         &app,
         "POST",
         "/api/init",
-        Some(r#"{"password":"secret","confirm":"different"}"#),
+        Some(r#"{"workspace":"default","password":"secret","confirm":"different"}"#),
         None,
     )
     .await;
@@ -104,7 +136,7 @@ async fn unlock_rejects_wrong_password() {
         &app,
         "POST",
         "/api/init",
-        Some(r#"{"password":"secret","confirm":"secret"}"#),
+        Some(r#"{"workspace":"default","password":"secret","confirm":"secret"}"#),
         None,
     )
     .await;
@@ -114,7 +146,7 @@ async fn unlock_rejects_wrong_password() {
         &app,
         "POST",
         "/api/unlock",
-        Some(r#"{"password":"wrong"}"#),
+        Some(r#"{"workspace":"default","password":"wrong"}"#),
         None,
     )
     .await;
@@ -124,23 +156,17 @@ async fn unlock_rejects_wrong_password() {
 #[tokio::test]
 async fn init_rejected_when_already_initialized() {
     let (app, _dir) = build_app();
-    let (status, _) = request(
-        &app,
-        "POST",
-        "/api/init",
-        Some(r#"{"password":"secret","confirm":"secret"}"#),
-        None,
-    )
-    .await;
+    let payload = r#"{"workspace":"default","password":"secret","confirm":"secret"}"#;
+    let (status, _) = request(&app, "POST", "/api/init", Some(payload), None).await;
     assert_eq!(status, StatusCode::OK);
 
-    let (status, _) = request(
-        &app,
-        "POST",
-        "/api/init",
-        Some(r#"{"password":"secret","confirm":"secret"}"#),
-        None,
-    )
-    .await;
+    let (status, body) = request(&app, "POST", "/api/init", Some(payload), None).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("already has a master password"),
+        "body: {body}"
+    );
 }

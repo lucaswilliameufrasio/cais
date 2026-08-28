@@ -87,6 +87,9 @@ button.link:hover { text-decoration: underline; }
   border-color: var(--accent);
 }
 .auth-box button { margin-top: 4px; }
+.workspace-row { display: flex; gap: 8px; align-items: center; }
+.workspace-row select, .workspace-row input { flex: 1; min-width: 0; }
+.auth-box .workspace-row button { margin-top: 0; white-space: nowrap; }
 
 /* Cards */
 .cards { display: flex; flex-direction: column; gap: 16px; }

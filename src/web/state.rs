@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -7,7 +8,7 @@ use zeroize::Zeroizing;
 
 use crate::crypto;
 use crate::models::PgToolBackend;
-use crate::storage::Storage;
+use crate::storage::{self, Storage};
 
 use super::ops::OperationRegistry;
 
@@ -29,77 +30,133 @@ fn is_false(value: &bool) -> bool {
     !value
 }
 
+/// A workspace entry as shown on the unlock screen. Names are not secret;
+/// `initialized` tells whether the vault already has a master password.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceInfo {
+    pub name: String,
+    pub initialized: bool,
+}
+
+/// Session-bound authentication record: the decryption key plus which
+/// workspace it belongs to.
+#[derive(Debug, Clone)]
+pub struct SessionRecord {
+    pub key: Arc<Zeroizing<Vec<u8>>>,
+    pub workspace: String,
+}
+
 /// Shared state for the HTTP server. Held behind `Arc` so every handler can
-/// reach the same storage, session map, operation registry and health cache.
+/// reach the same workspace storages, session map, operation registry and
+/// health cache.
 pub struct WebState {
-    pub storage: Arc<Mutex<Storage>>,
-    pub sessions: Mutex<HashMap<String, Arc<Zeroizing<Vec<u8>>>>>,
+    pub workspaces_dir: PathBuf,
+    pub workspace_storages: Mutex<HashMap<String, Arc<Mutex<Storage>>>>,
+    pub sessions: Mutex<HashMap<String, SessionRecord>>,
     pub ops: OperationRegistry,
     pub health: Arc<Mutex<HashMap<String, HealthInfo>>>,
-    pub machine_id: String,
-    pub hostname: String,
     pub pg_tool_backend: PgToolBackend,
 }
 
 impl WebState {
     pub fn new() -> Result<Self> {
-        Self::from_storage(Storage::open()?)
+        Self::open_at(&storage::app_data_dir()?)
     }
 
-    /// Builds state from an already-open storage. Kept public so tests and the
-    /// web server can point at a specific SQLite file.
-    pub fn from_storage(storage: Storage) -> Result<Self> {
-        let (machine_id, hostname) = storage.ensure_machine_identity()?;
+    /// Builds state rooted at `data_dir/workspaces`. Used by tests to point at
+    /// a temporary directory.
+    pub fn open_at(data_dir: &std::path::Path) -> Result<Self> {
+        let workspaces_dir = data_dir.join("workspaces");
+        std::fs::create_dir_all(&workspaces_dir)
+            .with_context(|| format!("failed to create {}", workspaces_dir.display()))?;
         Ok(Self {
-            storage: Arc::new(Mutex::new(storage)),
+            workspaces_dir,
+            workspace_storages: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             ops: OperationRegistry::new(),
             health: Arc::new(Mutex::new(HashMap::new())),
-            machine_id,
-            hostname,
             pg_tool_backend: crate::postgres::check_pg_tools(),
         })
     }
 
-    pub fn is_initialized(&self) -> Result<bool> {
-        self.storage.lock().unwrap().is_initialized()
+    pub fn workspaces(&self) -> Result<Vec<WorkspaceInfo>> {
+        let mut out = Vec::new();
+        for name in storage::list_workspaces_at(&self.workspaces_dir)? {
+            let vault = Storage::open_at(storage::workspace_file(&self.workspaces_dir, &name)?)?;
+            let initialized = vault.is_initialized()?;
+            out.push(WorkspaceInfo { name, initialized });
+        }
+        Ok(out)
     }
 
-    /// Derives a key from the master password and opens a session, returning a
-    /// bearer token. Fails when the password is wrong.
-    pub fn create_session(&self, password: &str) -> Result<String> {
-        let storage = self.storage.lock().unwrap();
-        let config = storage.load_kdf_config()?;
-        let key = crypto::derive_key(password, &config)?;
-        storage.verify_master_password(key.as_slice())?;
-        drop(storage);
+    /// Opens a workspace vault, creating the file if it does not exist yet,
+    /// and caches it. Only called with names that are already validated (or
+    /// validated right after, in `initialize`).
+    pub fn storage_for(&self, workspace: &str) -> Result<Arc<Mutex<Storage>>> {
+        let mut map = self.workspace_storages.lock().unwrap();
+        if let Some(existing) = map.get(workspace) {
+            return Ok(existing.clone());
+        }
+        let vault = Storage::open_at(storage::workspace_file(&self.workspaces_dir, workspace)?)?;
+        let shared = Arc::new(Mutex::new(vault));
+        map.insert(workspace.to_owned(), shared.clone());
+        Ok(shared)
+    }
 
-        let token = new_session_token()?;
-        self.sessions
+    /// Deletes a workspace vault. Refuses while any session is bound to it.
+    /// Returns whether the vault file existed.
+    pub fn delete_workspace(&self, workspace: &str) -> Result<bool> {
+        storage::validate_workspace_name(workspace)?;
+        {
+            let sessions = self.sessions.lock().unwrap();
+            if sessions.values().any(|s| s.workspace == workspace) {
+                anyhow::bail!(
+                    "workspace '{workspace}' has active sessions; lock it before removing"
+                );
+            }
+        }
+        self.workspace_storages.lock().unwrap().remove(workspace);
+        storage::delete_workspace_at(&self.workspaces_dir, workspace)
+    }
+
+    /// Derives a key from the master password and opens a session bound to
+    /// `workspace`, returning a bearer token. Fails when the password is
+    /// wrong.
+    pub fn create_session(&self, workspace: &str, password: &str) -> Result<String> {
+        let vault = self.storage_for(workspace)?;
+        let config = vault.lock().unwrap().load_kdf_config()?;
+        let key = crypto::derive_key(password, &config)?;
+        vault
             .lock()
             .unwrap()
-            .insert(token.clone(), Arc::new(key));
+            .verify_master_password(key.as_slice())?;
+        let token = new_session_token()?;
+        self.sessions.lock().unwrap().insert(
+            token.clone(),
+            SessionRecord {
+                key: Arc::new(key),
+                workspace: workspace.to_owned(),
+            },
+        );
         Ok(token)
     }
 
-    /// Initializes the master password on first run and opens a session.
-    pub fn initialize(&self, password: &str) -> Result<String> {
-        let storage = self.storage.lock().unwrap();
-        let config = storage
-            .initialize_master_password(password)
-            .context("failed to initialize master password")?;
-        let key = crypto::derive_key(password, &config)?;
-        drop(storage);
-
-        let token = new_session_token()?;
-        self.sessions
-            .lock()
-            .unwrap()
-            .insert(token.clone(), Arc::new(key));
-        Ok(token)
+    /// Initializes the master password of `workspace` (creating the vault
+    /// file when needed) and opens a session.
+    pub fn initialize(&self, workspace: &str, password: &str) -> Result<String> {
+        storage::validate_workspace_name(workspace)?;
+        let vault = self.storage_for(workspace)?;
+        {
+            let guard = vault.lock().unwrap();
+            if guard.is_initialized()? {
+                anyhow::bail!("workspace '{workspace}' already has a master password");
+            }
+            guard.initialize_master_password(password)?;
+        }
+        self.create_session(workspace, password)
     }
 
-    pub fn session_key(&self, token: &str) -> Option<Arc<Zeroizing<Vec<u8>>>> {
+    pub fn session_record(&self, token: &str) -> Option<SessionRecord> {
         self.sessions.lock().unwrap().get(token).cloned()
     }
 
@@ -125,46 +182,91 @@ mod tests {
 
     fn test_state() -> (WebState, TempDir) {
         let dir = tempdir().unwrap();
-        let storage = Storage::open_at(dir.path().join("data.sqlite")).unwrap();
-        let state = WebState::from_storage(storage).unwrap();
+        let state = WebState::open_at(dir.path()).unwrap();
         (state, dir)
     }
 
     #[test]
     fn initialize_and_unlock_round_trip() {
         let (state, _dir) = test_state();
-        let token = state.initialize("hunter2").unwrap();
-        assert!(state.session_key(&token).is_some());
-        assert!(state.create_session("hunter2").is_ok());
+        let token = state.initialize("default", "hunter2").unwrap();
+        assert!(state.session_record(&token).is_some());
+        assert!(state.create_session("default", "hunter2").is_ok());
     }
 
     #[test]
     fn wrong_password_is_rejected() {
         let (state, _dir) = test_state();
-        state.initialize("correct horse").unwrap();
-        assert!(state.create_session("wrong").is_err());
+        state.initialize("default", "correct horse").unwrap();
+        assert!(state.create_session("default", "wrong").is_err());
     }
 
     #[test]
     fn sessions_are_unique_and_lockable() {
         let (state, _dir) = test_state();
-        state.initialize("pw").unwrap();
-        let a = state.create_session("pw").unwrap();
-        let b = state.create_session("pw").unwrap();
+        state.initialize("default", "pw").unwrap();
+        let a = state.create_session("default", "pw").unwrap();
+        let b = state.create_session("default", "pw").unwrap();
         assert_ne!(a, b);
-        assert!(state.session_key(&a).is_some());
+        assert_eq!(
+            state.session_record(&a).unwrap().workspace,
+            "default",
+            "session must be bound to its workspace"
+        );
         state.lock(&a);
-        assert!(state.session_key(&a).is_none());
-        assert!(state.session_key(&b).is_some());
+        assert!(state.session_record(&a).is_none());
+        assert!(state.session_record(&b).is_some());
     }
 
     #[test]
     fn wipe_sessions_clears_all_keys() {
         let (state, _dir) = test_state();
-        state.initialize("pw").unwrap();
-        let token = state.create_session("pw").unwrap();
-        assert!(state.session_key(&token).is_some());
+        state.initialize("default", "pw").unwrap();
+        let token = state.create_session("default", "pw").unwrap();
         state.wipe_sessions();
-        assert!(state.session_key(&token).is_none());
+        assert!(state.session_record(&token).is_none());
+    }
+
+    #[test]
+    fn workspaces_are_independent_vaults() {
+        let (state, _dir) = test_state();
+        state.initialize("old", "old-pass").unwrap();
+        state.initialize("new", "new-pass").unwrap();
+
+        assert!(state.create_session("old", "new-pass").is_err());
+        assert!(state.create_session("new", "new-pass").is_ok());
+
+        let workspaces = state.workspaces().unwrap();
+        let names: Vec<_> = workspaces.iter().map(|w| w.name.as_str()).collect();
+        assert_eq!(names, vec!["new", "old"]);
+        assert!(workspaces.iter().all(|w| w.initialized));
+    }
+
+    #[test]
+    fn delete_workspace_refuses_active_sessions() {
+        let (state, dir) = test_state();
+        let _keeper = state.initialize("keeper", "pw").unwrap();
+        let doomed_init = state.initialize("doomed", "pw").unwrap();
+        let doomed_session = state.create_session("doomed", "pw").unwrap();
+
+        assert!(state.delete_workspace("doomed").is_err());
+        state.lock(&doomed_init);
+        state.lock(&doomed_session);
+        assert!(state.delete_workspace("doomed").unwrap());
+
+        let workspaces = state.workspaces().unwrap();
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].name, "keeper");
+        drop(dir);
+    }
+
+    #[test]
+    fn uninitialized_workspace_is_reported_as_such() {
+        let (state, _dir) = test_state();
+        state.storage_for("fresh").unwrap();
+        let workspaces = state.workspaces().unwrap();
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].name, "fresh");
+        assert!(!workspaces[0].initialized);
     }
 }

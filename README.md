@@ -201,17 +201,21 @@ The master password is **never stored**.
 
 ### Forgot the master password?
 
-There is no recovery by design — the password only exists in your head. Run:
+There is no recovery by design — the password only exists in your head. Two options:
 
-```bash
-cais reset
-```
+- **Create another workspace** (web UI): on the unlock screen, click
+  "+ Novo workspace". Each workspace is an independent vault with its own
+  master password, instances and saved connections. The old workspace stays
+  on disk — if you remember its password later, just select it again.
+  Remove unused workspaces with the "Remover" button on the same screen.
+- **`cais reset`**: moves the vault database and the encrypted backups aside
+  under timestamped `.old-…` names, so the next launch starts a fresh
+  first-run setup. The moved files stay on disk but cannot be opened without
+  the old password.
 
-It moves the vault database and the encrypted backups aside under timestamped
-`.old-…` names, so the next launch starts a fresh first-run setup. The moved
-files stay on disk but cannot be opened without the old password. The actual
-PostgreSQL servers are untouched — re-add the instance with its base URL and
-use "Adicionar banco existente" to bring the databases back into the catalog.
+The actual PostgreSQL servers are untouched in both cases — re-add the
+instance with its base URL and use "Adicionar banco existente" to bring the
+databases back into the catalog.
 
 ## Testing
 
