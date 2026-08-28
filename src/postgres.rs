@@ -916,12 +916,17 @@ pub fn check_version_warning(source_cs: &str, backend: &PgToolBackend) -> Option
 /// Extension-owned schemas whose contents change between TimescaleDB
 /// releases; restoring a dump of them into a different TimescaleDB version
 /// fails (e.g. `_timescaledb_catalog.chunk` lost `schema_name`/`table_name`
-/// columns in newer releases).
-const TIMESCALE_DROP_SCHEMAS: [&str; 4] = [
+/// columns in newer releases). These are extension configuration tables:
+/// `pg_dump` emits only their `COPY` data, which lands in the target's own
+/// (new-layout) tables. `_timescaledb_cache` holds continuous-aggregate
+/// materializations — dropped too because its layout drifts across versions;
+/// materialized data can be rebuilt with `refresh_continuous_aggregate`.
+const TIMESCALE_DROP_SCHEMAS: [&str; 5] = [
     "_timescaledb_catalog",
     "_timescaledb_config",
     "timescaledb_information",
     "_timescaledb_functions",
+    "_timescaledb_cache",
 ];
 
 /// Filters a `pg_restore --list` table of contents, dropping TimescaleDB
@@ -940,14 +945,21 @@ fn filter_timescale_toc(toc: &str) -> Option<String> {
             let detail = line.split(';').nth(1).unwrap_or("").trim();
             let tokens: Vec<&str> = detail.split_whitespace().collect();
             let is_schema_creation = tokens.get(2).copied() == Some("SCHEMA");
+            // Extension-internal schemas already exist on any timescaledb
+            // target — any `_timescaledb*` prefix covers internal schemas
+            // this tool has not seen yet.
+            let is_extension_schema = tokens.iter().any(|token| {
+                token.starts_with("_timescaledb") || *token == "timescaledb_information"
+            });
             let touches_drop = tokens
                 .iter()
                 .any(|token| TIMESCALE_DROP_SCHEMAS.contains(token));
             let touches_internal = tokens.contains(&"_timescaledb_internal");
-            if touches_drop || touches_internal {
+            let dropped = touches_drop || (is_schema_creation && is_extension_schema);
+            if dropped || touches_internal {
                 has_timescale = true;
             }
-            !(touches_drop || (is_schema_creation && touches_internal))
+            !dropped
         };
         if keep {
             kept.push(line);
@@ -2518,8 +2530,12 @@ mod tests {
         let toc = "; header comment\n\
                    2110; 1259 16385 SCHEMA - _timescaledb_catalog postgres\n\
                    2111; 1259 16390 SCHEMA - _timescaledb_internal postgres\n\
+                   2112; 1259 16391 SCHEMA - _timescaledb_cache postgres\n\
+                   2113; 1259 16392 SCHEMA - _timescaledb_debug postgres\n\
                    2145; 1259 16456 TABLE _timescaledb_catalog chunk postgres\n\
                    2146; 0 16456 TABLE DATA _timescaledb_catalog chunk postgres\n\
+                   2147; 0 16456 TABLE DATA _timescaledb_cache _materialized_hypertable_2 postgres\n\
+                   2148; 1259 16458 FUNCTION _timescaledb_functions to_timestamp(pg_catalog.timestamp) postgres\n\
                    2150; 1259 16470 TABLE _timescaledb_internal _hyper_1_2_chunk postgres\n\
                    2151; 0 16470 TABLE DATA _timescaledb_internal _hyper_1_2_chunk postgres\n\
                    2152; 0 16470 CONSTRAINT _timescaledb_internal chunk_pkey postgres\n\
@@ -2530,6 +2546,18 @@ mod tests {
         assert!(
             !filtered.contains("_timescaledb_catalog"),
             "internal catalog must be fully dropped, got:\n{filtered}"
+        );
+        assert!(
+            !filtered.contains("_timescaledb_cache"),
+            "continuous-agg materialization must be dropped (layout drifts)"
+        );
+        assert!(
+            !filtered.contains("_timescaledb_functions"),
+            "extension functions must be dropped"
+        );
+        assert!(
+            !filtered.contains("SCHEMA - _timescaledb_debug"),
+            "any _timescaledb* schema creation must be dropped"
         );
         assert!(
             !filtered.contains("SCHEMA - _timescaledb_internal"),

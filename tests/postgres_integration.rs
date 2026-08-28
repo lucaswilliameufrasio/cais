@@ -1393,3 +1393,134 @@ fn rotate_base_url_password_round_trip() {
     assert!(Client::connect(&new_url, NoTls).is_err());
     Client::connect(&newest_url, NoTls).expect("newest URL works");
 }
+
+/// Covers the exact pair reported in production: timescaledb 2.26.4-pg17
+/// into timescaledb 2.29.2-pg18, with a continuous aggregate so the dump
+/// carries `_timescaledb_cache` materialization entries too. The filtered
+/// restore must skip all extension-internal schemas (their layouts differ
+/// between the two releases) and land the hypertable chunk data.
+#[test]
+fn migrate_modern_timescaledb_pair_with_continuous_aggregate() {
+    if std::env::var("RUN_DOCKER_TESTS").ok().as_deref() != Some("1") {
+        return;
+    }
+
+    const SOURCE_TAG: &str = "timescale/timescaledb:2.26.4-pg17";
+    const TARGET_TAG: &str = "timescale/timescaledb:2.29.2-pg18";
+
+    let source = DockerPostgres::start_with_tag(SOURCE_TAG);
+    let dest = DockerPostgres::start_with_tag(TARGET_TAG);
+
+    // Premise guard: both are modern layouts (chunk catalog has no
+    // schema_name). If a tag drifts, skip instead of failing blindly.
+    let has_schema_name = |url: &str| -> bool {
+        let mut client = Client::connect(url, NoTls).expect("connect");
+        client
+            .batch_execute("CREATE EXTENSION IF NOT EXISTS timescaledb;")
+            .expect("create extension");
+        let rows = client
+            .query(
+                "SELECT 1 FROM information_schema.columns \
+                 WHERE table_schema = '_timescaledb_catalog' AND table_name = 'chunk' \
+                 AND column_name = 'schema_name'",
+                &[],
+            )
+            .expect("chunk columns");
+        !rows.is_empty()
+    };
+    if has_schema_name(&source.url()) || has_schema_name(&dest.url()) {
+        eprintln!("SKIP: version pair no longer matches the modern catalog layout");
+        return;
+    }
+
+    {
+        let mut client = Client::connect(&source.url(), NoTls).expect("connect source");
+        client
+            .batch_execute("CREATE DATABASE api_gateway;")
+            .expect("create source db");
+    }
+    {
+        let source_db = source.db_url("api_gateway");
+        let mut client = Client::connect(&source_db, NoTls).expect("connect source db");
+        client
+            .batch_execute(
+                "CREATE EXTENSION IF NOT EXISTS timescaledb; \
+                 CREATE TABLE conditions (\
+                     time TIMESTAMPTZ NOT NULL, \
+                     device TEXT, \
+                     temperature DOUBLE PRECISION\
+                 ); \
+                 SELECT create_hypertable('conditions', 'time'); \
+                 CREATE MATERIALIZED VIEW conditions_daily \
+                 WITH (timescaledb.continuous) AS \
+                 SELECT time_bucket('1 day', time) AS bucket, device, \
+                        avg(temperature) AS avg_temp \
+                 FROM conditions GROUP BY bucket, device WITH NO DATA;",
+            )
+            .expect("create hypertable and continuous aggregate");
+        for (device, temperature) in [("s1", 10.0), ("s2", 20.0), ("s3", 30.0)] {
+            client
+                .execute(
+                    "INSERT INTO conditions (time, device, temperature) VALUES (now(), $1, $2)",
+                    &[&device, &temperature],
+                )
+                .expect("insert row");
+        }
+    }
+
+    migrate_database_with_progress(
+        &source.db_url("api_gateway"),
+        &dest.url(),
+        "api_gateway",
+        &PgToolBackend::Docker {
+            image: SOURCE_TAG.to_owned(),
+        },
+        true,
+        &mut |_| {},
+    )
+    .expect("2.26.4 -> 2.29.2 migration must succeed");
+
+    let target_db = dest.db_url("api_gateway");
+    let mut client = Client::connect(&target_db, NoTls).expect("connect target db");
+
+    client
+        .query_one(
+            "SELECT 1 FROM information_schema.tables WHERE table_name = 'conditions'",
+            &[],
+        )
+        .expect("parent table exists");
+
+    let chunks: Vec<String> = client
+        .query(
+            "SELECT table_name FROM information_schema.tables \
+             WHERE table_schema = '_timescaledb_internal' AND table_name LIKE '\\_hyper%'",
+            &[],
+        )
+        .expect("list chunks")
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect();
+    assert!(!chunks.is_empty(), "chunk tables must exist on the target");
+
+    let mut restored_rows = 0i64;
+    for chunk in &chunks {
+        restored_rows += client
+            .query_one(&format!("SELECT count(*) FROM \"{chunk}\""), &[])
+            .expect("count chunk rows")
+            .get::<_, i64>(0);
+    }
+    assert_eq!(restored_rows, 3, "all hypertable rows must be restored");
+
+    // Continuous-aggregate materialization tables are intentionally not
+    // restored (their layout drifts between releases).
+    let materialized: i64 = client
+        .query_one(
+            "SELECT count(*) FROM information_schema.tables \
+             WHERE table_schema = '_timescaledb_cache' \
+             AND table_name LIKE '\\_materialized%'",
+            &[],
+        )
+        .expect("count cache tables")
+        .get(0);
+    assert_eq!(materialized, 0, "cagg materialization must not be restored");
+}
