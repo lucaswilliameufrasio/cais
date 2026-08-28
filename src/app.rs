@@ -1303,6 +1303,7 @@ impl App {
                     &output_dir,
                     &backend,
                     Some(&metadata),
+                    &[],
                     &mut |step| {
                         let _ = tx.send(WorkerEvent::Log(step.to_owned()));
                     },

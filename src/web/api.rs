@@ -289,6 +289,8 @@ struct BackupRequest {
     source: SourceRef,
     #[serde(default)]
     databases: Vec<String>,
+    #[serde(default)]
+    tables: Option<Vec<String>>,
     #[serde(default = "default_true")]
     include_globals: bool,
     #[serde(default)]
@@ -1448,6 +1450,21 @@ async fn post_backup(
             .collect();
     }
 
+    // Table selection only applies to single-database backups.
+    let selected_tables = match &req.tables {
+        Some(tables) if !source.is_instance => {
+            for table in tables {
+                if table.split_once('.').is_none() {
+                    return Err(ApiError::bad_request(format!(
+                        "invalid table selection '{table}' (expected schema.table)"
+                    )));
+                }
+            }
+            tables.clone()
+        }
+        _ => Vec::new(),
+    };
+
     let config = BackupConfig {
         include_globals: req.include_globals,
         include_role_passwords: req.include_role_passwords,
@@ -1515,6 +1532,7 @@ async fn post_backup(
                     &output_dir,
                     &backend,
                     Some(&metadata),
+                    &selected_tables,
                     &mut |step| log(step),
                 )
             }

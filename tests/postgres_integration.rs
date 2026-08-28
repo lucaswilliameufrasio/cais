@@ -5,10 +5,11 @@ use cais::models::{
     ProvisionRequest,
 };
 use cais::postgres::{
-    InstanceBackupContext, backup_instance_with_progress, check_pg_tools, list_database_tables,
-    migrate_database_with_progress, provision_database_with_progress,
-    provision_extra_user_with_progress, provision_full_with_progress, resolve_docker_image,
-    restore_instance_with_progress, run_sql_query, run_table_page,
+    InstanceBackupContext, backup_database_with_progress, backup_instance_with_progress,
+    check_pg_tools, list_database_tables, migrate_database_with_progress,
+    provision_database_with_progress, provision_extra_user_with_progress,
+    provision_full_with_progress, resolve_docker_image, restore_instance_with_progress,
+    run_sql_query, run_table_page,
 };
 use postgres::{Client, NoTls};
 use testcontainers::{GenericImage, Image, ImageExt, core::WaitFor, runners::SyncRunner};
@@ -1523,4 +1524,114 @@ fn migrate_modern_timescaledb_pair_with_continuous_aggregate() {
         .expect("count cache tables")
         .get(0);
     assert_eq!(materialized, 0, "cagg materialization must not be restored");
+}
+
+#[test]
+fn backup_database_respects_table_selection() {
+    if std::env::var("RUN_DOCKER_TESTS").ok().as_deref() != Some("1") {
+        return;
+    }
+
+    let pg = DockerPostgres::start();
+    let cs = pg.url();
+    let mut client = Client::connect(&cs, NoTls).expect("connect");
+    client
+        .batch_execute(
+            "CREATE TABLE keep_me (id int); INSERT INTO keep_me VALUES (1); \
+             CREATE TABLE drop_me (id int); INSERT INTO drop_me VALUES (1);",
+        )
+        .expect("seed tables");
+    drop(client);
+
+    let output_dir = tempfile::tempdir().expect("output dir");
+    let outcome = backup_database_with_progress(
+        &cs,
+        b"01234567890123456789012345678901",
+        output_dir.path(),
+        &PgToolBackend::Docker {
+            image: "postgres:17-alpine".to_owned(),
+        },
+        None,
+        &["public.keep_me".to_owned()],
+        &mut |_| {},
+    )
+    .expect("backup with table selection");
+
+    let (_, dump) = cais::postgres::read_encrypted_dump(
+        std::path::Path::new(&outcome.file_path),
+        b"01234567890123456789012345678901",
+    )
+    .expect("decrypt dump");
+    let dump_path = output_dir.path().join("inspect.pgdump");
+    std::fs::write(&dump_path, &dump).expect("write dump for inspection");
+
+    let toc = std::process::Command::new("pg_restore")
+        .arg("--list")
+        .arg(&dump_path)
+        .output()
+        .expect("pg_restore --list");
+    assert!(toc.status.success(), "pg_restore --list must succeed");
+    let toc = String::from_utf8_lossy(&toc.stdout).to_string();
+    assert!(
+        toc.contains("keep_me"),
+        "selected table must be in the dump"
+    );
+    assert!(
+        !toc.contains("drop_me"),
+        "unselected table must not be in the dump"
+    );
+}
+
+#[test]
+fn backup_always_excludes_timescale_metadata_schemas() {
+    if std::env::var("RUN_DOCKER_TESTS").ok().as_deref() != Some("1") {
+        return;
+    }
+
+    let pg = DockerPostgres::start();
+    let cs = pg.url();
+    let mut client = Client::connect(&cs, NoTls).expect("connect");
+    client
+        .batch_execute(
+            "CREATE SCHEMA _timescaledb_catalog; \
+             CREATE TABLE _timescaledb_catalog.chunk (id int); \
+             CREATE TABLE real_data (id int); INSERT INTO real_data VALUES (1);",
+        )
+        .expect("seed tables");
+    drop(client);
+
+    let output_dir = tempfile::tempdir().expect("output dir");
+    let outcome = backup_database_with_progress(
+        &cs,
+        b"01234567890123456789012345678901",
+        output_dir.path(),
+        &PgToolBackend::Docker {
+            image: "postgres:17-alpine".to_owned(),
+        },
+        None,
+        &[],
+        &mut |_| {},
+    )
+    .expect("full backup");
+
+    let (_, dump) = cais::postgres::read_encrypted_dump(
+        std::path::Path::new(&outcome.file_path),
+        b"01234567890123456789012345678901",
+    )
+    .expect("decrypt dump");
+    let dump_path = output_dir.path().join("inspect.pgdump");
+    std::fs::write(&dump_path, &dump).expect("write dump for inspection");
+
+    let toc = std::process::Command::new("pg_restore")
+        .arg("--list")
+        .arg(&dump_path)
+        .output()
+        .expect("pg_restore --list");
+    assert!(toc.status.success());
+    let toc = String::from_utf8_lossy(&toc.stdout).to_string();
+    assert!(
+        !toc.contains("_timescaledb_catalog"),
+        "timescale metadata schemas must never be backed up"
+    );
+    assert!(toc.contains("real_data"), "user tables must be backed up");
 }

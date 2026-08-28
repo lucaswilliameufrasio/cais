@@ -1686,12 +1686,60 @@ pub fn read_encrypted_dump(
     }
 }
 
+/// pg_dump flags for TimescaleDB hygiene: extension metadata schemas are
+/// recreated by `CREATE EXTENSION` on any target, so backing them up only
+/// bloats the archive and breaks cross-version restores (their COPY data
+/// lands in the target's own, new-layout tables). Excluding a schema that
+/// does not exist is a no-op, so the flags are always added. Chunk data in
+/// `_timescaledb_internal` and cagg materializations in `_timescaledb_cache`
+/// are NOT excluded — that is actual data.
+const TIMESCALE_METADATA_EXCLUDE_SCHEMAS: [&str; 4] = [
+    "_timescaledb_catalog",
+    "_timescaledb_config",
+    "timescaledb_information",
+    "_timescaledb_functions",
+];
+
+/// Appends pg_dump table-selection flags: `-t schema."table"` for every
+/// explicitly chosen table and `-N` exclusions for TimescaleDB metadata
+/// schemas (always, they are harmless no-ops without the extension).
+fn push_pg_dump_selection_args<F>(
+    args: &mut Vec<String>,
+    tables: &[String],
+    emit: &mut F,
+) -> Result<()>
+where
+    F: FnMut(String),
+{
+    for schema in TIMESCALE_METADATA_EXCLUDE_SCHEMAS {
+        args.push("-N".to_owned());
+        args.push(schema.to_owned());
+    }
+    if tables.is_empty() {
+        return Ok(());
+    }
+    push_step(
+        &mut Vec::new(),
+        emit,
+        format!("Including {} explicitly selected table(s)", tables.len()),
+    );
+    for table in tables {
+        let (schema, name) = table.split_once('.').with_context(|| {
+            format!("invalid table selection '{table}' (expected schema.table)")
+        })?;
+        args.push("-t".to_owned());
+        args.push(format!("\"{schema}\".\"{}\"", name.replace('"', "\"\"")));
+    }
+    Ok(())
+}
+
 pub fn backup_database_with_progress<F>(
     source_cs: &str,
     encrypt_key: &[u8],
     output_dir: &std::path::Path,
     backend: &PgToolBackend,
     metadata: Option<&BackupMetadata>,
+    tables: &[String],
     emit: &mut F,
 ) -> Result<BackupOutcome>
 where
@@ -1705,31 +1753,31 @@ where
     let dump_dir = tempfile::tempdir().context("failed to create temp directory")?;
     let dump_path = dump_dir.path().join(format!("{}.pgdump", parsed.database));
 
+    let mut pg_dump_args: Vec<String> =
+        vec!["-Fc".to_owned(), "-d".to_owned(), source_cs.to_owned()];
+    push_pg_dump_selection_args(&mut pg_dump_args, tables, emit)?;
+
     push_step(&mut Vec::new(), emit, "Starting pg_dump...".to_owned());
     let dump_output = match backend {
         PgToolBackend::Native { .. } => std::process::Command::new("pg_dump")
-            .args(["-Fc", "-f"])
+            .args(&pg_dump_args)
+            .arg("-f")
             .arg(&dump_path)
-            .args(["-d", source_cs])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .output()
             .context("failed to execute pg_dump")?,
         PgToolBackend::Docker { image } => {
             docker_pull_silent(image)?;
+            let mut args: Vec<String> = ["run", "--rm", "-i", "--network", "host"]
+                .iter()
+                .map(|value| value.to_string())
+                .collect();
+            args.push(image.to_string());
+            args.push("pg_dump".to_owned());
+            args.extend(pg_dump_args.iter().cloned());
             let output = std::process::Command::new("docker")
-                .args([
-                    "run",
-                    "--rm",
-                    "-i",
-                    "--network",
-                    "host",
-                    image.as_str(),
-                    "pg_dump",
-                    "-Fc",
-                    "-d",
-                    source_cs,
-                ])
+                .args(&args)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .output()
@@ -1890,6 +1938,7 @@ where
             staging.path(),
             backend,
             Some(&metadata),
+            &[],
             emit,
         )?;
         let (_, dump) = read_encrypted_dump(std::path::Path::new(&outcome.file_path), encrypt_key)?;

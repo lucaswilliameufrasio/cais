@@ -1230,10 +1230,19 @@ function openBackupModal(preselectInstance = null) {
       <p class="hint">2. Fonte</p>
       <div id="bk-sources"></div>
       <div id="bk-db-wrap">
-        <p class="hint">3. Bancos da instância</p>
+        <p class="hint">Bancos da instância</p>
         <div id="bk-dbs" class="checkboxes"></div>
       </div>
-      <p class="hint">4. Opções</p>
+      <div id="bk-tables-wrap" class="hidden">
+        <p class="hint">Tabelas</p>
+        <div class="checkboxes" id="bk-table-mode">
+          <label><input type="radio" name="bk-table-mode" value="all" checked> Todas as tabelas</label>
+          <label><input type="radio" name="bk-table-mode" value="select"> Selecionar tabelas</label>
+        </div>
+        <p class="hint">Bancos com hypertables: o dado vive nos chunks internos — prefira "Todas as tabelas".</p>
+        <div id="bk-tables" class="checkboxes hidden"></div>
+      </div>
+      <p class="hint">Opções</p>
       <div id="bk-config" class="checkboxes">
         <label><input id="bk-globals" type="checkbox" checked> Incluir roles e membros do cluster</label>
         <label><input id="bk-passwords" type="checkbox"> Incluir hashes de senha de roles</label>
@@ -1260,6 +1269,7 @@ function openBackupModal(preselectInstance = null) {
         item.classList.add('selected');
         selectedSource = source.value;
         updateBackupDbs(selectedSource);
+        updateBackupTables(selectedSource);
       });
       box.appendChild(item);
     }
@@ -1267,6 +1277,58 @@ function openBackupModal(preselectInstance = null) {
 
   renderSources($('#bk-src-inst').value);
   $('#bk-src-inst').addEventListener('change', (e) => renderSources(e.target.value));
+
+  function updateBackupTables(source) {
+    const wrap = $('#bk-tables-wrap');
+    const modeBox = $('#bk-table-mode');
+    const list = $('#bk-tables');
+    if (!source || source.kind === 'instance') {
+      wrap.classList.add('hidden');
+      list.innerHTML = '';
+      return;
+    }
+    wrap.classList.remove('hidden');
+    const radios = modeBox.querySelectorAll('input[type=radio]');
+    radios.forEach((radio) => {
+      radio.checked = radio.value === 'all';
+    });
+    list.classList.add('hidden');
+    list.innerHTML = '';
+
+    modeBox.addEventListener('change', () => {
+      const selectMode = $('#bk-table-mode input[value=select]').checked;
+      list.classList.toggle('hidden', !selectMode);
+      if (selectMode && !list.dataset.loaded) {
+        loadBackupTables(source, list);
+      }
+    });
+  }
+
+  async function loadBackupTables(source, list) {
+    list.innerHTML = '<p class="hint">Carregando tabelas...</p>';
+    try {
+      const tables = await apiPost('/api/query/tables', { source });
+      list.innerHTML = '';
+      const visible = tables.filter(
+        (t) => !t.schema.startsWith('_timescaledb') && !t.schema.startsWith('timescaledb_'),
+      );
+      if (!visible.length) {
+        list.appendChild(el('p', { class: 'hint', text: 'Nenhuma tabela de usuário.' }));
+        list.dataset.loaded = '1';
+        return;
+      }
+      for (const t of visible) {
+        list.appendChild(el('label', {}, [
+          el('input', { type: 'checkbox', value: `${t.schema}.${t.name}`, checked: true }),
+          el('span', { text: `${t.schema}.${t.name} (${formatBytes(t.size_bytes)})` }),
+        ]));
+      }
+      list.dataset.loaded = '1';
+    } catch (e) {
+      list.innerHTML = '';
+      list.appendChild(el('p', { class: 'error', text: e.message }));
+    }
+  }
 
   async function updateBackupDbs(source) {
     const wrap = $('#bk-db-wrap');
@@ -1300,10 +1362,21 @@ function openBackupModal(preselectInstance = null) {
     if (selectedSource.kind === 'instance' && !databases.length) {
       return setStatus('Selecione ao menos um banco.');
     }
+    let tables = null;
+    const tablesWrap = $('#bk-tables-wrap');
+    const selectMode = !tablesWrap.classList.contains('hidden')
+      && $('#bk-table-mode input[value=select]').checked;
+    if (selectMode) {
+      tables = Array.from($('#bk-tables input[type=checkbox]:checked')).map((i) => i.value);
+      if (!tables.length) {
+        return setStatus('Selecione ao menos uma tabela.');
+      }
+    }
     try {
       const data = await apiPost('/api/backup', {
         source: selectedSource,
         databases,
+        tables,
         include_globals: $('#bk-globals').checked,
         include_role_passwords: $('#bk-passwords').checked,
         flatten_tablespaces: $('#bk-flatten').checked,
