@@ -909,6 +909,174 @@ pub fn check_version_warning(source_cs: &str, backend: &PgToolBackend) -> Option
     None
 }
 
+// ---------------------------------------------------------------------------
+// TimescaleDB restore compatibility
+// ---------------------------------------------------------------------------
+
+/// Extension-owned schemas whose contents change between TimescaleDB
+/// releases; restoring a dump of them into a different TimescaleDB version
+/// fails (e.g. `_timescaledb_catalog.chunk` lost `schema_name`/`table_name`
+/// columns in newer releases).
+const TIMESCALE_DROP_SCHEMAS: [&str; 4] = [
+    "_timescaledb_catalog",
+    "_timescaledb_config",
+    "timescaledb_information",
+    "_timescaledb_functions",
+];
+
+/// Filters a `pg_restore --list` table of contents, dropping TimescaleDB
+/// internal catalog entries so restores work across TimescaleDB versions.
+/// Chunk data in `_timescaledb_internal` is kept (it becomes plain tables);
+/// only that schema's own creation line is dropped since the extension
+/// already creates it on the target. Returns `None` when the TOC has no
+/// TimescaleDB internals — nothing to filter, restore unfiltered.
+fn filter_timescale_toc(toc: &str) -> Option<String> {
+    let mut has_timescale = false;
+    let mut kept: Vec<&str> = Vec::new();
+    for line in toc.lines() {
+        let keep = if line.starts_with(';') {
+            true
+        } else {
+            let detail = line.split(';').nth(1).unwrap_or("").trim();
+            let tokens: Vec<&str> = detail.split_whitespace().collect();
+            let is_schema_creation = tokens.get(2).copied() == Some("SCHEMA");
+            let touches_drop = tokens
+                .iter()
+                .any(|token| TIMESCALE_DROP_SCHEMAS.contains(token));
+            let touches_internal = tokens.contains(&"_timescaledb_internal");
+            if touches_drop || touches_internal {
+                has_timescale = true;
+            }
+            !(touches_drop || (is_schema_creation && touches_internal))
+        };
+        if keep {
+            kept.push(line);
+        }
+    }
+    if !has_timescale {
+        return None;
+    }
+    let mut out = kept.join("\n");
+    out.push('\n');
+    Some(out)
+}
+
+/// Reads the archive's table of contents and, when it contains TimescaleDB
+/// internals, writes a filtered restore list into `work_dir`. Returns the
+/// path for `pg_restore --use-list`, or `None` when no filtering is needed.
+fn build_filtered_restore_list<F>(
+    dump_path: &std::path::Path,
+    work_dir: &std::path::Path,
+    backend: &PgToolBackend,
+    emit: &mut F,
+) -> Result<Option<std::path::PathBuf>>
+where
+    F: FnMut(String),
+{
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+
+    let toc = match backend {
+        PgToolBackend::Native { .. } => {
+            let output = std::process::Command::new("pg_restore")
+                .arg("--list")
+                .arg(dump_path)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output()
+                .context("failed to execute pg_restore --list")?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "pg_restore --list failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        }
+        PgToolBackend::Docker { image } => {
+            docker_pull_silent(image)?;
+            let mut dump = Vec::new();
+            std::fs::File::open(dump_path)
+                .and_then(|mut file| file.read_to_end(&mut dump))
+                .with_context(|| format!("failed to read {}", dump_path.display()))?;
+            let mut child = std::process::Command::new("docker")
+                .args(["run", "--rm", "-i", image.as_str(), "pg_restore", "--list"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .context("failed to execute docker pg_restore --list")?;
+            child
+                .stdin
+                .as_mut()
+                .expect("spawned with piped stdin")
+                .write_all(&dump)
+                .context("failed to feed dump to pg_restore --list")?;
+            let output = child
+                .wait_with_output()
+                .context("failed to wait for pg_restore --list")?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "pg_restore --list failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        }
+        PgToolBackend::NotFound => unreachable!(),
+    };
+
+    let Some(filtered) = filter_timescale_toc(&toc) else {
+        return Ok(None);
+    };
+    push_step(
+        &mut Vec::new(),
+        emit,
+        "TimescaleDB internals detected in the dump: dropping internal catalog \
+         entries (_timescaledb_catalog/config, information) for cross-version \
+         compatibility. Chunk data in _timescaledb_internal is kept as plain \
+         tables; hypertables may need to be recreated manually."
+            .to_owned(),
+    );
+    let list_path = work_dir.join("restore-use-list.txt");
+    std::fs::write(&list_path, &filtered)
+        .with_context(|| format!("failed to write {}", list_path.display()))?;
+    Ok(Some(list_path))
+}
+
+/// Builds the `docker run` argument vector for a pg_restore invocation.
+fn docker_restore_args(
+    image: &str,
+    dest_url: &str,
+    tablespace_flatten: bool,
+    use_list: Option<&std::path::Path>,
+) -> Vec<String> {
+    let mut args: Vec<String> = ["run", "--rm", "-i", "--network", "host"]
+        .iter()
+        .map(|value| value.to_string())
+        .collect();
+    let list_in_container = use_list.map(|path| {
+        args.push("-v".to_owned());
+        args.push(format!("{}:/restore-use-list.txt:ro", path.display()));
+        "/restore-use-list.txt".to_owned()
+    });
+    args.push(image.to_owned());
+    args.push("pg_restore".to_owned());
+    args.push("--dbname".to_owned());
+    args.push(dest_url.to_owned());
+    args.push("--no-owner".to_owned());
+    args.push("--no-privileges".to_owned());
+    args.push("--exit-on-error".to_owned());
+    if tablespace_flatten {
+        args.push("--no-tablespaces".to_owned());
+    }
+    if let Some(path) = list_in_container {
+        args.push("--use-list".to_owned());
+        args.push(path);
+    }
+    args
+}
+
 /// Pull a Docker image silently, so pull progress doesn't contaminate
 /// stderr of subsequent Docker commands.
 fn docker_pull_silent(image: &str) -> Result<()> {
@@ -1178,39 +1346,35 @@ where
         ),
     );
 
+    let restore_use_list = build_filtered_restore_list(&dump_path, dump_dir.path(), backend, emit)?;
+
     let restore_result = match backend {
-        PgToolBackend::Native { .. } => std::process::Command::new("pg_restore")
-            .args([
+        PgToolBackend::Native { .. } => {
+            let mut command = std::process::Command::new("pg_restore");
+            command.args([
                 "--dbname",
                 &dest_url,
                 "--no-owner",
                 "--no-privileges",
                 "--exit-on-error",
-            ])
-            .arg(&dump_path)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .context("failed to execute pg_restore"),
+            ]);
+            if let Some(list) = &restore_use_list {
+                command.arg(format!("--use-list={}", list.display()));
+            }
+            command
+                .arg(&dump_path)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output()
+                .context("failed to execute pg_restore")
+        }
         PgToolBackend::Docker { image } => (|| -> Result<std::process::Output> {
             docker_pull_silent(image)?;
             let file = std::fs::File::open(&dump_path)
                 .context("failed to open dump file for pg_restore")?;
+            let args = docker_restore_args(image, &dest_url, false, restore_use_list.as_deref());
             std::process::Command::new("docker")
-                .args([
-                    "run",
-                    "--rm",
-                    "-i",
-                    "--network",
-                    "host",
-                    image.as_str(),
-                    "pg_restore",
-                    "--dbname",
-                    &dest_url,
-                    "--no-owner",
-                    "--no-privileges",
-                    "--exit-on-error",
-                ])
+                .args(&args)
                 .stdin(file)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
@@ -1895,6 +2059,8 @@ where
         ),
     );
 
+    let restore_use_list = build_filtered_restore_list(&dump_path, dump_dir.path(), backend, emit)?;
+
     let restore_result = match backend {
         PgToolBackend::Native { .. } => {
             let mut command = std::process::Command::new("pg_restore");
@@ -1905,6 +2071,9 @@ where
                 "--no-privileges",
                 "--exit-on-error",
             ]);
+            if let Some(list) = &restore_use_list {
+                command.arg(format!("--use-list={}", list.display()));
+            }
             if tablespace_flatten {
                 command.arg("--no-tablespaces");
             }
@@ -1919,23 +2088,12 @@ where
             docker_pull_silent(image)?;
             let file = std::fs::File::open(&dump_path)
                 .context("failed to open dump file for pg_restore")?;
-            let mut args = vec![
-                "run",
-                "--rm",
-                "-i",
-                "--network",
-                "host",
-                image.as_str(),
-                "pg_restore",
-                "--dbname",
+            let args = docker_restore_args(
+                image,
                 &dest_url,
-                "--no-owner",
-                "--no-privileges",
-                "--exit-on-error",
-            ];
-            if tablespace_flatten {
-                args.push("--no-tablespaces");
-            }
+                tablespace_flatten,
+                restore_use_list.as_deref(),
+            );
             std::process::Command::new("docker")
                 .args(&args)
                 .stdin(file)
@@ -2210,8 +2368,8 @@ mod tests {
     use super::{
         INSTANCE_BACKUP_MAGIC, PgToolBackend, create_encrypted_dump, database_connection_string,
         detect_timescale_installed, docker_pull_silent, error_string_database_exists,
-        extract_pg_major_version, is_connect_timeout, mask_connection_string, parse_database_url,
-        read_instance_backup, resolve_docker_image, safe_filename_component,
+        extract_pg_major_version, filter_timescale_toc, is_connect_timeout, mask_connection_string,
+        parse_database_url, read_instance_backup, resolve_docker_image, safe_filename_component,
     };
 
     #[test]
@@ -2345,6 +2503,58 @@ mod tests {
     #[test]
     fn detect_timescale_installed_invalid_connection_returns_false() {
         assert!(!detect_timescale_installed("postgres://invalid:0/postgres"));
+    }
+
+    #[test]
+    fn toc_without_timescale_is_not_filtered() {
+        let toc = "; Archive created at 2026-01-01\n;\
+                   2160; 1259 16480 TABLE public items postgres\n\
+                   2161; 0 16480 TABLE DATA public items postgres\n";
+        assert!(filter_timescale_toc(toc).is_none());
+    }
+
+    #[test]
+    fn toc_with_timescale_catalog_is_filtered_but_chunk_data_is_kept() {
+        let toc = "; header comment\n\
+                   2110; 1259 16385 SCHEMA - _timescaledb_catalog postgres\n\
+                   2111; 1259 16390 SCHEMA - _timescaledb_internal postgres\n\
+                   2145; 1259 16456 TABLE _timescaledb_catalog chunk postgres\n\
+                   2146; 0 16456 TABLE DATA _timescaledb_catalog chunk postgres\n\
+                   2150; 1259 16470 TABLE _timescaledb_internal _hyper_1_2_chunk postgres\n\
+                   2151; 0 16470 TABLE DATA _timescaledb_internal _hyper_1_2_chunk postgres\n\
+                   2152; 0 16470 CONSTRAINT _timescaledb_internal chunk_pkey postgres\n\
+                   2160; 1259 16480 TABLE public items postgres\n\
+                   2161; 0 16480 TABLE DATA public items postgres\n";
+        let filtered = filter_timescale_toc(toc).expect("timescale toc must be filtered");
+
+        assert!(
+            !filtered.contains("_timescaledb_catalog"),
+            "internal catalog must be fully dropped, got:\n{filtered}"
+        );
+        assert!(
+            !filtered.contains("SCHEMA - _timescaledb_internal"),
+            "internal schema creation must be dropped (extension creates it)"
+        );
+        assert!(
+            filtered.contains("TABLE _timescaledb_internal _hyper_1_2_chunk"),
+            "chunk tables must be kept"
+        );
+        assert!(
+            filtered.contains("TABLE DATA _timescaledb_internal _hyper_1_2_chunk"),
+            "chunk data must be kept"
+        );
+        assert!(filtered.contains("TABLE public items"));
+        assert!(filtered.contains("TABLE DATA public items"));
+        assert!(filtered.starts_with("; header comment"), "comments kept");
+    }
+
+    #[test]
+    fn toc_filter_uses_whole_token_match_not_substring() {
+        let toc = "2160; 1259 16480 TABLE public _timescaledb_catalog_backup postgres\n";
+        assert!(
+            filter_timescale_toc(toc).is_none(),
+            "user table whose name merely contains a schema name must be kept"
+        );
     }
 
     #[test]
