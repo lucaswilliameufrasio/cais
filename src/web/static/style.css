@@ -87,9 +87,36 @@ button.link:hover { text-decoration: underline; }
   border-color: var(--accent);
 }
 .auth-box button { margin-top: 4px; }
-.workspace-row { display: flex; gap: 8px; align-items: center; }
-.workspace-row select, .workspace-row input { flex: 1; min-width: 0; }
-.auth-box .workspace-row button { margin-top: 0; white-space: nowrap; }
+.workspace-picker { display: flex; flex-direction: column; gap: 8px; }
+.workspace-list {
+  max-height: 200px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 4px;
+  background: var(--bg);
+}
+.workspace-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: none;
+}
+.workspace-item:hover { background: var(--panel-2); }
+.workspace-item.selected {
+  border-color: var(--accent);
+  background: rgba(79, 140, 255, 0.12);
+}
+.workspace-name { font-weight: 600; font-size: 14px; }
+.workspace-actions { display: flex; gap: 8px; justify-content: space-between; }
+.auth-box .workspace-actions button { margin-top: 0; }
 
 /* Cards */
 .cards { display: flex; flex-direction: column; gap: 16px; }

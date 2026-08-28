@@ -238,6 +238,7 @@ function confirmModalCountdown(title, message, confirmLabel = 'Confirmar', secon
 
 const WORKSPACE_KEY = 'cais_workspace';
 let workspacesCache = [];
+let selectedWorkspace = null;
 let newWorkspaceMode = false;
 
 async function boot() {
@@ -277,27 +278,51 @@ async function showUnlock() {
 
 async function refreshWorkspaces() {
   workspacesCache = await apiGet('/api/workspaces');
-  const select = $('#field-workspace');
-  select.innerHTML = '';
-  for (const ws of workspacesCache) {
-    const suffix = ws.initialized ? '' : ' (sem senha)';
-    select.appendChild(el('option', { value: ws.name, text: ws.name + suffix }));
-  }
   const stored = localStorage.getItem(WORKSPACE_KEY);
   const names = workspacesCache.map((ws) => ws.name);
-  const target = names.includes(stored) ? stored : names[0];
-  if (target !== undefined) {
-    select.value = target;
+  if (!names.includes(selectedWorkspace)) {
+    selectedWorkspace = names.includes(stored) ? stored : names[0] || null;
   }
+  renderWorkspaceList();
   if (!names.length) {
     enterNewWorkspaceMode();
   }
   syncUnlockMode();
 }
 
+function renderWorkspaceList() {
+  const list = $('#workspace-list');
+  list.innerHTML = '';
+  const query = ($('#field-workspace-filter').value || '').trim().toLowerCase();
+  let shown = 0;
+  for (const ws of workspacesCache) {
+    if (query && !ws.name.toLowerCase().includes(query)) {
+      continue;
+    }
+    shown += 1;
+    list.appendChild(el('button', {
+      type: 'button',
+      class: 'workspace-item' + (ws.name === selectedWorkspace ? ' selected' : ''),
+      onclick: () => selectWorkspace(ws.name),
+    }, [
+      el('span', { class: 'workspace-name', text: ws.name }),
+      ws.initialized ? null : el('span', { class: 'tag', text: 'sem senha' }),
+    ]));
+  }
+  if (!shown) {
+    list.appendChild(el('p', { class: 'hint', text: 'Nenhum workspace.' }));
+  }
+}
+
+function selectWorkspace(name) {
+  selectedWorkspace = name;
+  renderWorkspaceList();
+  syncUnlockMode();
+  $('#field-password').focus();
+}
+
 function selectedWorkspaceInfo() {
-  const name = $('#field-workspace').value;
-  return workspacesCache.find((ws) => ws.name === name) || null;
+  return workspacesCache.find((ws) => ws.name === selectedWorkspace) || null;
 }
 
 function syncUnlockMode() {
@@ -331,10 +356,10 @@ function exitNewWorkspaceMode() {
 
 $('#btn-new-workspace').addEventListener('click', () => enterNewWorkspaceMode());
 $('#btn-cancel-new-workspace').addEventListener('click', () => exitNewWorkspaceMode());
-$('#field-workspace').addEventListener('change', syncUnlockMode);
+$('#field-workspace-filter').addEventListener('input', renderWorkspaceList);
 
 $('#btn-remove-workspace').addEventListener('click', async () => {
-  const name = $('#field-workspace').value;
+  const name = selectedWorkspace;
   if (!name) {
     return;
   }
@@ -363,7 +388,7 @@ $('#unlock-form').addEventListener('submit', async (e) => {
   const password = $('#field-password').value;
   const workspace = newWorkspaceMode
     ? $('#field-new-workspace').value.trim()
-    : $('#field-workspace').value;
+    : selectedWorkspace;
   const info = workspacesCache.find((ws) => ws.name === workspace);
   const needsInit = newWorkspaceMode || !info || !info.initialized;
   const errEl = $('#unlock-error');

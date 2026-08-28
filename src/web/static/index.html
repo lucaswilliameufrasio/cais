@@ -17,12 +17,15 @@
       <div id="workspace-select-wrap">
         <label>
           Workspace
-          <div class="workspace-row">
-            <select id="field-workspace"></select>
-            <button type="button" id="btn-remove-workspace" class="danger small">Remover</button>
+          <div class="workspace-picker">
+            <input id="field-workspace-filter" type="search" placeholder="Buscar workspace..." autocomplete="off">
+            <div id="workspace-list" class="workspace-list"></div>
           </div>
         </label>
-        <button type="button" id="btn-new-workspace" class="ghost small">+ Novo workspace</button>
+        <div class="workspace-actions">
+          <button type="button" id="btn-new-workspace" class="ghost small">+ Novo workspace</button>
+          <button type="button" id="btn-remove-workspace" class="danger small">Remover selecionado</button>
+        </div>
       </div>
       <label id="field-new-workspace-wrap" class="hidden">
         Nome do novo workspace

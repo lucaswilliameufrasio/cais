@@ -901,10 +901,21 @@ pub fn migrate_legacy_vault_at(data_dir: &std::path::Path) -> Result<()> {
     let workspaces = data_dir.join("workspaces");
     fs::create_dir_all(&workspaces)
         .with_context(|| format!("failed to create {}", workspaces.display()))?;
-    let target = workspaces.join("default.sqlite");
+
+    // Lands on default.sqlite, falling back to default-2, default-3, ... when
+    // the name is taken — the legacy vault always comes over, never dropped.
+    let mut target = workspaces.join("default.sqlite");
     if target.exists() {
-        return Ok(());
+        let mut index = 2;
+        loop {
+            target = workspaces.join(format!("default-{index}.sqlite"));
+            if !target.exists() {
+                break;
+            }
+            index += 1;
+        }
     }
+
     fs::rename(&legacy, &target).with_context(|| {
         format!(
             "failed to move {} into the workspaces layout",
@@ -914,7 +925,11 @@ pub fn migrate_legacy_vault_at(data_dir: &std::path::Path) -> Result<()> {
     for side in ["-wal", "-shm"] {
         let side_file = data_dir.join(format!("data.sqlite{side}"));
         if side_file.exists() {
-            let _ = fs::rename(&side_file, workspaces.join(format!("default.sqlite{side}")));
+            let stem = target
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("default");
+            let _ = fs::rename(&side_file, workspaces.join(format!("{stem}.sqlite{side}")));
         }
     }
     Ok(())
@@ -1592,7 +1607,7 @@ mod tests {
     }
 
     #[test]
-    fn migrate_legacy_vault_keeps_existing_default_workspace() {
+    fn migrate_legacy_vault_falls_back_when_default_is_taken() {
         let dir = tempdir().expect("dir");
         let data_dir = dir.path().join("data");
         let workspaces = data_dir.join("workspaces");
@@ -1602,13 +1617,20 @@ mod tests {
             .initialize_master_password("new-pass")
             .expect("init");
         drop(default);
-        std::fs::write(data_dir.join("data.sqlite"), b"legacy").expect("legacy file");
+
+        let legacy = Storage::open_at(data_dir.join("data.sqlite")).expect("legacy vault");
+        legacy.initialize_master_password("old-pass").expect("init");
+        drop(legacy);
 
         migrate_legacy_vault_at(&data_dir).expect("migrate");
 
-        // Legacy file stays untouched because default.sqlite already exists.
-        assert!(data_dir.join("data.sqlite").exists());
-        let reopened = Storage::open_at(workspaces.join("default.sqlite")).expect("default");
-        assert!(reopened.is_initialized().expect("check"));
+        // Legacy file moves to default-2 instead of being left behind.
+        assert!(!data_dir.join("data.sqlite").exists());
+        let names = list_workspaces_at(&workspaces).expect("list");
+        assert_eq!(names, vec!["default".to_owned(), "default-2".to_owned()]);
+
+        let migrated =
+            Storage::open_at(workspaces.join("default-2.sqlite")).expect("migrated vault");
+        assert!(migrated.is_initialized().expect("check"));
     }
 }

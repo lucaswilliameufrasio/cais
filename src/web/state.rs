@@ -60,7 +60,11 @@ pub struct WebState {
 
 impl WebState {
     pub fn new() -> Result<Self> {
-        Self::open_at(&storage::app_data_dir()?)
+        let data_dir = storage::app_data_dir()?;
+        // The web server may be the first entry point after an upgrade, so it
+        // must run the legacy vault migration just like the TUI does.
+        storage::migrate_legacy_vault_at(&data_dir)?;
+        Self::open_at(&data_dir)
     }
 
     /// Builds state rooted at `data_dir/workspaces`. Used by tests to point at
