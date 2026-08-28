@@ -1252,7 +1252,7 @@ fn migrate_between_timescaledb_versions_skips_internal_catalog() {
         return;
     }
 
-    const SOURCE_TAG: &str = "timescale/timescaledb:2.11.2-pg16";
+    const SOURCE_TAG: &str = "timescale/timescaledb:2.13.1-pg16";
     const TARGET_TAG: &str = "timescale/timescaledb:2.17.2-pg16";
 
     let source = DockerPostgres::start_with_tag(SOURCE_TAG);
