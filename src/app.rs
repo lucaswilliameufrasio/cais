@@ -717,6 +717,21 @@ impl App {
         }
         validate_database_name(&dest_db_name)?;
 
+        let (source_instance_name, source_database_name) = match source_record {
+            SavedConnectionRecord::Database(r) => {
+                (r.instance_name.clone(), r.database_name.clone())
+            }
+            SavedConnectionRecord::ExtraUser(r) => {
+                (r.instance_name.clone(), r.database_name.clone())
+            }
+            SavedConnectionRecord::Instance { name, .. } => (name.clone(), name.clone()),
+        };
+        if source_instance_name == *dest_instance && source_database_name == dest_db_name {
+            anyhow::bail!(
+                "refusing to migrate '{source_database_name}' onto itself in                  instance '{source_instance_name}': replace would drop the source                  database and force-disconnect everything using it"
+            );
+        }
+
         self.migrate_phase = MigratePhase::Running;
         let instance_name = dest_instance.clone();
         let start_msg = format!("Starting migration to '{dest_db_name}' in {instance_name}");

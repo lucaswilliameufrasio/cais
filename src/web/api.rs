@@ -1352,9 +1352,9 @@ async fn post_migrate(
     State(state): State<Arc<WebState>>,
     Json(req): Json<MigrateRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let source_cs = {
+    let source = {
         let storage = state.storage_for(&workspace)?;
-        resolve_source_cs(&storage, key.as_ref().as_slice(), &req.source)?
+        resolve_source(&storage, key.as_ref().as_slice(), &req.source)?
     };
     let dest_instance = req.dest_instance.trim().to_owned();
     let dest_db_name = req.dest_db_name.trim().to_owned();
@@ -1369,6 +1369,13 @@ async fn post_migrate(
         ));
     }
     validate_database_name(&dest_db_name).map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    if source.instance_name == dest_instance && source.database_name == dest_db_name {
+        return Err(ApiError::bad_request(format!(
+            "refusing to migrate '{}' onto itself in instance '{}': replace would              drop the source database and force-disconnect everything using it",
+            source.database_name, dest_instance
+        )));
+    }
+    let source_cs = source.cs;
 
     let dest_base_url = {
         let storage = state.storage_for(&workspace)?;
@@ -2071,6 +2078,48 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn migrate_refuses_to_migrate_onto_itself() {
+        let dir = tempdir().unwrap();
+        let (state, vault) = test_state_with_workspace(&dir);
+        let key = b"01234567890123456789012345678901";
+        let inst_enc = crypto::encrypt(key, b"postgresql://u:p@h:5432/postgres").unwrap();
+        vault
+            .lock()
+            .unwrap()
+            .save_instance_secret("prod", &inst_enc)
+            .unwrap();
+        let db_enc = crypto::encrypt(key, b"postgresql://u:p@h:5432/orders").unwrap();
+        vault
+            .lock()
+            .unwrap()
+            .save_provisioned_database(
+                "prod",
+                &ProvisionOutcome {
+                    database_name: "orders".into(),
+                    application_name: "orders".into(),
+                    role_name: "orders_owner".into(),
+                    connection_string: "cs".into(),
+                    database_created: true,
+                    role_created: true,
+                },
+                &db_enc,
+            )
+            .unwrap();
+
+        let request = MigrateRequest {
+            source: SourceRef::Db { id: 1 },
+            dest_instance: "prod".to_owned(),
+            dest_db_name: "orders".to_owned(),
+            replace_existing: true,
+        };
+        let result = post_migrate(test_session(key, "dev"), State(state), Json(request)).await;
+        assert!(
+            result.is_err(),
+            "migrating a database onto itself must be refused"
+        );
     }
 
     #[tokio::test]

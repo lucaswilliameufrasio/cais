@@ -973,15 +973,35 @@ fn filter_timescale_toc(toc: &str) -> Option<String> {
     Some(out)
 }
 
+/// Counts user table entries in a `pg_restore --list` TOC, excluding
+/// TimescaleDB internals (which are filtered out or restored as plain chunk
+/// tables). Used to verify a restore actually produced data instead of
+/// silently completing empty.
+fn count_restore_user_tables(toc: &str) -> usize {
+    toc.lines()
+        .filter(|line| !line.starts_with(';'))
+        .filter(|line| {
+            let detail = line.split(';').nth(1).unwrap_or("").trim();
+            let tokens: Vec<&str> = detail.split_whitespace().collect();
+            tokens.get(2).copied() == Some("TABLE")
+                && !tokens
+                    .iter()
+                    .any(|token| TIMESCALE_DROP_SCHEMAS.contains(token))
+                && !tokens.contains(&"_timescaledb_internal")
+        })
+        .count()
+}
+
 /// Reads the archive's table of contents and, when it contains TimescaleDB
 /// internals, writes a filtered restore list into `work_dir`. Returns the
-/// path for `pg_restore --use-list`, or `None` when no filtering is needed.
+/// expected number of user tables (for post-restore verification) plus the
+/// optional `--use-list` path.
 fn build_filtered_restore_list<F>(
     dump_path: &std::path::Path,
     work_dir: &std::path::Path,
     backend: &PgToolBackend,
     emit: &mut F,
-) -> Result<Option<std::path::PathBuf>>
+) -> Result<(usize, Option<std::path::PathBuf>)>
 where
     F: FnMut(String),
 {
@@ -1038,22 +1058,67 @@ where
         PgToolBackend::NotFound => unreachable!(),
     };
 
+    let expected_user_tables = count_restore_user_tables(&toc);
     let Some(filtered) = filter_timescale_toc(&toc) else {
-        return Ok(None);
+        return Ok((expected_user_tables, None));
     };
     push_step(
         &mut Vec::new(),
         emit,
         "TimescaleDB internals detected in the dump: dropping internal catalog \
-         entries (_timescaledb_catalog/config, information) for cross-version \
-         compatibility. Chunk data in _timescaledb_internal is kept as plain \
-         tables; hypertables may need to be recreated manually."
+         entries (_timescaledb_catalog/config, information, cache) for cross-\
+         version compatibility. Chunk data in _timescaledb_internal is kept as \
+         plain tables; hypertables may need to be recreated manually."
             .to_owned(),
     );
     let list_path = work_dir.join("restore-use-list.txt");
     std::fs::write(&list_path, &filtered)
         .with_context(|| format!("failed to write {}", list_path.display()))?;
-    Ok(Some(list_path))
+    Ok((expected_user_tables, Some(list_path)))
+}
+
+/// Verifies a restore actually produced the expected user tables on the
+/// target. `pg_restore` can complete successfully while restoring nothing
+/// (bad use-list, mount or tool quirk), which used to be reported as a
+/// successful migration and registered in the catalog — lying to the user.
+/// This refuses to.
+fn verify_restore_produced_tables<F>(
+    dest_base_url: &str,
+    dest_db_name: &str,
+    expected_user_tables: usize,
+    emit: &mut F,
+) -> Result<usize>
+where
+    F: FnMut(String),
+{
+    let verify_url = with_connect_timeout_param(&target_url(dest_base_url, dest_db_name)?)?;
+    let mut client = connect_client(&verify_url)
+        .context("failed to connect to restored database for verification")?;
+    let restored: i64 = client
+        .query_one(
+            "SELECT count(*) FROM information_schema.tables \
+             WHERE table_type = 'BASE TABLE' \
+             AND table_schema NOT IN ('pg_catalog', 'information_schema') \
+             AND table_schema NOT LIKE '%timescaledb%'",
+            &[],
+        )
+        .context("failed to count restored tables")?
+        .get(0);
+    let restored = restored.max(0) as usize;
+    if restored == 0 && expected_user_tables > 0 {
+        anyhow::bail!(
+            "pg_restore reported success but restored 0 of {expected_user_tables} \
+             expected tables — refusing to register this migration"
+        );
+    }
+    push_step(
+        &mut Vec::new(),
+        emit,
+        format!(
+            "Verified restore: {restored} user table(s) present on target (expected ~{expected_user_tables})."
+        ),
+    );
+    Ok(restored)
 }
 
 /// Builds the `docker run` argument vector for a pg_restore invocation.
@@ -1246,6 +1311,19 @@ where
     }
 
     let parsed = parse_database_url(dest_base_url)?;
+    let source_parsed = parse_database_url(source_cs)?;
+    if replace_existing
+        && source_parsed.host == parsed.host
+        && source_parsed.port == parsed.port
+        && source_parsed.database == dest_db_name
+    {
+        anyhow::bail!(
+            "destination matches the source database '{}:{} / {}' — replace would drop the source database",
+            parsed.host,
+            parsed.port,
+            dest_db_name
+        );
+    }
     let dump_dir = tempfile::tempdir().context("failed to create temp directory")?;
     let dump_path = dump_dir.path().join(format!("{}.pgdump", dest_db_name));
 
@@ -1358,7 +1436,8 @@ where
         ),
     );
 
-    let restore_use_list = build_filtered_restore_list(&dump_path, dump_dir.path(), backend, emit)?;
+    let (expected_user_tables, restore_use_list) =
+        build_filtered_restore_list(&dump_path, dump_dir.path(), backend, emit)?;
 
     let restore_result = match backend {
         PgToolBackend::Native { .. } => {
@@ -1424,6 +1503,13 @@ where
         &mut Vec::new(),
         emit,
         format!("Migration to '{dest_db_name}' completed successfully."),
+    );
+    let restored_tables =
+        verify_restore_produced_tables(dest_base_url, dest_db_name, expected_user_tables, emit)?;
+    push_step(
+        &mut Vec::new(),
+        emit,
+        format!("Verified: {restored_tables} user table(s) restored on target."),
     );
 
     let outcome = ProvisionFullOutcome {
@@ -2071,7 +2157,8 @@ where
         ),
     );
 
-    let restore_use_list = build_filtered_restore_list(&dump_path, dump_dir.path(), backend, emit)?;
+    let (expected_user_tables, restore_use_list) =
+        build_filtered_restore_list(&dump_path, dump_dir.path(), backend, emit)?;
 
     let restore_result = match backend {
         PgToolBackend::Native { .. } => {
@@ -2144,6 +2231,13 @@ where
         &mut Vec::new(),
         emit,
         format!("Restore to '{dest_db_name}' completed successfully."),
+    );
+    let restored_tables =
+        verify_restore_produced_tables(dest_base_url, dest_db_name, expected_user_tables, emit)?;
+    push_step(
+        &mut Vec::new(),
+        emit,
+        format!("Verified: {restored_tables} user table(s) restored on target."),
     );
 
     Ok(ProvisionFullOutcome {
@@ -2582,6 +2676,28 @@ mod tests {
         assert!(
             filter_timescale_toc(toc).is_none(),
             "user table whose name merely contains a schema name must be kept"
+        );
+    }
+
+    #[test]
+    fn migrate_refuses_to_replace_onto_itself() {
+        let err = super::migrate_database_with_progress(
+            "postgres://user:pass@db.example.com:5432/api_gateway",
+            "postgres://user:pass@db.example.com:5432/postgres",
+            "api_gateway",
+            &PgToolBackend::Native {
+                dump_ver: "pg_dump (PostgreSQL) 16.0".to_owned(),
+                restore_ver: "pg_restore (PostgreSQL) 16.0".to_owned(),
+            },
+            true,
+            &mut |_| {},
+        )
+        .expect_err("self-replace must be refused");
+
+        assert!(
+            err.to_string()
+                .contains("destination matches the source database"),
+            "got: {err}"
         );
     }
 
