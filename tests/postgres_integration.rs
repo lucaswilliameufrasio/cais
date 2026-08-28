@@ -1526,6 +1526,33 @@ fn migrate_modern_timescaledb_pair_with_continuous_aggregate() {
     assert_eq!(materialized, 0, "cagg materialization must not be restored");
 }
 
+/// Inspects a dump's TOC through the Docker backend (CI runners have no
+/// native pg_restore) by piping the archive into `pg_restore --list`.
+fn list_dump_entries(image: &str, dump: &[u8]) -> String {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = std::process::Command::new("docker")
+        .args(["run", "--rm", "-i", image, "pg_restore", "--list"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn pg_restore --list");
+    child
+        .stdin
+        .as_mut()
+        .expect("piped stdin")
+        .write_all(dump)
+        .expect("feed dump to pg_restore --list");
+    let output = child.wait_with_output().expect("wait pg_restore --list");
+    assert!(
+        output.status.success(),
+        "pg_restore --list failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
 #[test]
 fn backup_database_respects_table_selection() {
     if std::env::var("RUN_DOCKER_TESTS").ok().as_deref() != Some("1") {
@@ -1562,16 +1589,7 @@ fn backup_database_respects_table_selection() {
         b"01234567890123456789012345678901",
     )
     .expect("decrypt dump");
-    let dump_path = output_dir.path().join("inspect.pgdump");
-    std::fs::write(&dump_path, &dump).expect("write dump for inspection");
-
-    let toc = std::process::Command::new("pg_restore")
-        .arg("--list")
-        .arg(&dump_path)
-        .output()
-        .expect("pg_restore --list");
-    assert!(toc.status.success(), "pg_restore --list must succeed");
-    let toc = String::from_utf8_lossy(&toc.stdout).to_string();
+    let toc = list_dump_entries("postgres:17-alpine", &dump);
     assert!(
         toc.contains("keep_me"),
         "selected table must be in the dump"
@@ -1619,16 +1637,7 @@ fn backup_always_excludes_timescale_metadata_schemas() {
         b"01234567890123456789012345678901",
     )
     .expect("decrypt dump");
-    let dump_path = output_dir.path().join("inspect.pgdump");
-    std::fs::write(&dump_path, &dump).expect("write dump for inspection");
-
-    let toc = std::process::Command::new("pg_restore")
-        .arg("--list")
-        .arg(&dump_path)
-        .output()
-        .expect("pg_restore --list");
-    assert!(toc.status.success());
-    let toc = String::from_utf8_lossy(&toc.stdout).to_string();
+    let toc = list_dump_entries("postgres:17-alpine", &dump);
     assert!(
         !toc.contains("_timescaledb_catalog"),
         "timescale metadata schemas must never be backed up"
