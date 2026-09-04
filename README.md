@@ -82,6 +82,7 @@ What you can do in the browser:
 ### Security model
 
 - The server binds to `127.0.0.1` by default. Binding to another interface (e.g. `--host 0.0.0.0`) prints a warning.
+- Binding the web interface to a non-localhost address is an unsafe deployment mode: the server has no TLS support, so traffic and bearer tokens are not protected in transit. Use it only behind a trusted network or a TLS-terminating reverse proxy, and do not expose it directly to the internet.
 - On first use the browser asks for the master password; it is verified against the stored blob and is **never stored or transmitted again**.
 - After unlocking, the server issues a random bearer token that maps to the in-memory decryption key. All data endpoints require `Authorization: Bearer <token>`.
 - Connection strings are decrypted only when you explicitly view/copy them.
