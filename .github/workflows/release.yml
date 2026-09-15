@@ -77,7 +77,7 @@ jobs:
         run: ${{ matrix.install_dist.run }}
 
       - name: Fetch local artifacts
-        uses: actions/download-artifact@cc203385981b70ca67e1cc392b4751b7d214b751 # v4.1.9
+        uses: actions/download-artifact@v4.1.9 # v4.1.9
         with:
           pattern: artifacts-*
           path: target/distrib/
@@ -120,14 +120,14 @@ jobs:
           persist-credentials: false
           submodules: recursive
 
-      - uses: actions/download-artifact@cc203385981b70ca67e1cc392b4751b7d214b751 # v4.1.9
+      - uses: actions/download-artifact@v4.1.9 # v4.1.9
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/
 
       - run: chmod +x ~/.cargo/bin/dist
 
-      - uses: actions/download-artifact@cc203385981b70ca67e1cc392b4751b7d214b751 # v4.1.9
+      - uses: actions/download-artifact@v4.1.9 # v4.1.9
         with:
           pattern: artifacts-*
           path: target/distrib/
@@ -166,14 +166,14 @@ jobs:
           persist-credentials: false
           submodules: recursive
 
-      - uses: actions/download-artifact@cc203385981b70ca67e1cc392b4751b7d214b751 # v4.1.9
+      - uses: actions/download-artifact@v4.1.9 # v4.1.9
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/
 
       - run: chmod +x ~/.cargo/bin/dist
 
-      - uses: actions/download-artifact@cc203385981b70ca67e1cc392b4751b7d214b751 # v4.1.9
+      - uses: actions/download-artifact@v4.1.9 # v4.1.9
         with:
           pattern: artifacts-*
           path: target/distrib/
@@ -190,7 +190,7 @@ jobs:
           name: artifacts-dist-manifest
           path: dist-manifest.json
 
-      - uses: actions/download-artifact@cc203385981b70ca67e1cc392b4751b7d214b751 # v4.1.9
+      - uses: actions/download-artifact@v4.1.9 # v4.1.9
         with:
           pattern: artifacts-*
           path: artifacts
