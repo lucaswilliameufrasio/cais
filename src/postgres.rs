@@ -1159,15 +1159,28 @@ fn docker_restore_args(
 fn docker_pull_silent(image: &str) -> Result<()> {
     let pull = std::process::Command::new("docker")
         .args(["pull", image])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .output()
         .with_context(|| format!("failed to execute docker pull for image '{}'", image))?;
     if !pull.status.success() {
         let stderr = String::from_utf8_lossy(&pull.stderr);
-        anyhow::bail!("failed to pull Docker image '{}': {}", image, stderr.trim());
+        let stdout = String::from_utf8_lossy(&pull.stdout);
+        anyhow::bail!("{}", docker_pull_error_message(image, &stderr, &stdout));
     }
     Ok(())
+}
+
+fn docker_pull_error_message(image: &str, stderr: &str, stdout: &str) -> String {
+    let detail = [stderr.trim(), stdout.trim()]
+        .into_iter()
+        .find(|output| !output.is_empty())
+        .unwrap_or("Docker returned no diagnostic output.");
+
+    format!(
+        "failed to pull Docker image '{}': {}. Check that Docker is running, the image tag exists, and the registry is reachable or authenticated.",
+        image, detail
+    )
 }
 
 fn dump_globals(
@@ -2597,9 +2610,10 @@ pub fn rotate_base_url_password(base_url: &str) -> Result<String> {
 mod tests {
     use super::{
         INSTANCE_BACKUP_MAGIC, PgToolBackend, create_encrypted_dump, database_connection_string,
-        detect_timescale_installed, docker_pull_silent, error_string_database_exists,
-        extract_pg_major_version, filter_timescale_toc, is_connect_timeout, mask_connection_string,
-        parse_database_url, read_instance_backup, resolve_docker_image, safe_filename_component,
+        detect_timescale_installed, docker_pull_error_message, docker_pull_silent,
+        error_string_database_exists, extract_pg_major_version, filter_timescale_toc,
+        is_connect_timeout, mask_connection_string, parse_database_url, read_instance_backup,
+        resolve_docker_image, safe_filename_component,
     };
 
     #[test]
@@ -2918,6 +2932,15 @@ mod tests {
                 // that's fine — the test shouldn't fail
             }
         }
+    }
+
+    #[test]
+    fn docker_pull_error_message_explains_empty_diagnostics() {
+        let message = docker_pull_error_message("postgres:17-alpine", "", "");
+
+        assert!(message.contains("postgres:17-alpine"));
+        assert!(message.contains("Docker returned no diagnostic output"));
+        assert!(message.contains("image tag exists"));
     }
 
     #[test]
