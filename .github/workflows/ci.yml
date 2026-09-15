@@ -91,7 +91,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install AWS CLI for S3 E2E tests
-        uses: aws-actions/install@v2
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip
+          curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip
+          unzip -q /tmp/awscliv2.zip -d /tmp
+          sudo /tmp/aws/install --update
 
       - name: Run PostgreSQL and S3 integration tests
         run: RUN_DOCKER_TESTS=1 cargo test --locked --test postgres_integration --test headless_integration -- --test-threads=1
