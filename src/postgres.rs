@@ -2314,20 +2314,95 @@ pub fn restore_instance_with_progress<F>(
 where
     F: FnMut(String),
 {
+    restore_instance_selected_with_progress(
+        input_path,
+        decrypt_key,
+        dest_base_url,
+        backend,
+        on_conflict,
+        &[],
+        &[],
+        emit,
+    )
+}
+
+/// Restores selected databases from a DBP2 bundle. Each mapping is a
+/// `(source_name, destination_name)` pair; unmapped selected databases keep
+/// their source name.
+#[allow(clippy::too_many_arguments)]
+pub fn restore_instance_selected_with_progress<F>(
+    input_path: &std::path::Path,
+    decrypt_key: &[u8],
+    dest_base_url: &str,
+    backend: &PgToolBackend,
+    on_conflict: ConflictPolicy,
+    selected_database_names: &[String],
+    mappings: &[(String, String)],
+    emit: &mut F,
+) -> Result<Vec<ProvisionFullOutcome>>
+where
+    F: FnMut(String),
+{
     let contents = read_instance_backup(input_path, decrypt_key)?;
     let dumps = contents.dumps;
     let globals = contents.globals;
+    let bundle_names: std::collections::HashSet<&str> =
+        dumps.iter().map(|(name, _)| name.as_str()).collect();
+    for name in selected_database_names {
+        if !bundle_names.contains(name.as_str()) {
+            anyhow::bail!("database '{name}' is not present in the backup bundle")
+        }
+    }
+    let mut mapped_sources = std::collections::HashSet::new();
+    for (source, destination) in mappings {
+        if !bundle_names.contains(source.as_str()) {
+            anyhow::bail!("database '{source}' is not present in the backup bundle")
+        }
+        validate_database_name(destination)?;
+        if !mapped_sources.insert(source) {
+            anyhow::bail!("database '{source}' has more than one destination mapping")
+        }
+    }
+    let selected = |source_name: &str| {
+        selected_database_names.is_empty()
+            || selected_database_names
+                .iter()
+                .any(|name| name == source_name)
+    };
+    let destination_name = |source_name: &str| {
+        mappings
+            .iter()
+            .find(|(source, _)| source == source_name)
+            .map_or_else(
+                || source_name.to_owned(),
+                |(_, destination)| destination.clone(),
+            )
+    };
+    let mut destination_names = std::collections::HashSet::new();
+    for (source_name, _) in &dumps {
+        if selected(source_name) {
+            let destination = destination_name(source_name);
+            if !destination_names.insert(destination.clone()) {
+                anyhow::bail!(
+                    "destination database '{destination}' would be restored more than once"
+                )
+            }
+        }
+    }
     emit("Restoring cluster roles and memberships...".to_owned());
     restore_globals(dest_base_url, &globals, backend)?;
     let total = dumps.len();
     let staging = tempfile::tempdir().context("failed to create restore staging directory")?;
     let mut outcomes = Vec::with_capacity(total);
-    for (index, (database_name, dump)) in dumps.into_iter().enumerate() {
+    for (index, (source_name, dump)) in dumps.into_iter().enumerate() {
+        if !selected(&source_name) {
+            continue;
+        }
+        let database_name = destination_name(&source_name);
         emit(format!(
-            "Restoring database {}/{}: {}",
+            "Restoring database {}/{}: {source_name} -> {database_name}",
             index + 1,
-            total,
-            database_name
+            total
         ));
         let result = (|| -> Result<ProvisionFullOutcome> {
             let encrypted_path = staging.path().join(format!("{index}.pgdump.enc"));

@@ -79,6 +79,54 @@ What you can do in the browser:
 - **Restore** from an encrypted backup, with a preview of instance bundles (`DBP2`)
 - Manage instances (add, rotate base credential, remove with its catalog entries) and saved connections (view/copy/rename/delete)
 
+## Headless Backup and Restore
+
+The CLI operates directly on PostgreSQL URIs and does not read the local vault:
+
+```bash
+export CAIS_BACKUP_ENCRYPTION_KEY="$(openssl rand -base64 32)"
+cais backup --database-uri "$DATABASE_URL" --name production \
+  --output ./backups --database orders
+cais restore --source ./backups/host_production_1_*.cluster.pgdump.enc \
+  --database-uri "$TARGET_DATABASE_URL" --database orders \
+  --map orders=orders_restored --conflict skip --yes
+```
+
+`CAIS_BACKUP_ENCRYPTION_KEY` is standard base64 for exactly 32 bytes. It is never accepted
+as a command-line argument or printed. Use `--encryption-key-env NAME` to read a
+different environment variable. Backup `--name` identifies the source instance;
+`--database` may be repeated to select a subset of the bundle. Restore accepts
+`--database-uri-env NAME` as an alternative to `--database-uri`, with
+`--target-uri*` and `--backup` aliases for workflow-oriented command lines.
+For a single-database backup, use `--database-name` to choose a new destination
+name. For a DBP2 bundle, repeat `--map SOURCE=DESTINATION`; without mappings,
+source names are preserved.
+
+The current TUI and Web restore flows preserve the original names of databases
+inside a multi-database bundle. Use the headless command when a bundle needs
+selection or source-to-destination renaming.
+
+The default restore conflict policy is `skip`, which leaves existing databases
+untouched. `fail` is stricter; `replace` drops conflicting databases with
+`DROP DATABASE ... WITH (FORCE)`. Every restore requires explicit `--yes`.
+
+S3-compatible locations are supported through the system AWS CLI, without adding
+an SDK dependency:
+
+```bash
+export CAIS_S3_ENDPOINT_URL="https://s3.example.test"
+cais backup --database-uri-env DATABASE_URL --name production \
+  --output s3://bucket/cais-backups/
+cais restore --source s3://bucket/cais-backups/backup.cluster.pgdump.enc \
+  --database-uri-env TARGET_DATABASE_URL --yes
+```
+
+Configure credentials using the AWS CLI's standard environment/configuration
+mechanism. The local staging file is encrypted before upload and removed after
+the command exits. The executor still needs network access to the PostgreSQL
+source or target; headless execution does not remove VPN, firewall, or runner
+network requirements.
+
 ### Security model
 
 - The server binds to `127.0.0.1` by default. Binding to another interface (e.g. `--host 0.0.0.0`) prints a warning.
