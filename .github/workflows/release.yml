@@ -87,6 +87,10 @@ jobs:
         run: |
           ${{ matrix.packages_install }}
 
+      - name: Install NASM on Windows
+        if: runner.os == 'Windows'
+        run: choco install nasm --no-progress -y
+
       - name: Build artifacts
         run: |
           dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
