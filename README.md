@@ -127,7 +127,7 @@ the command exits. The executor still needs network access to the PostgreSQL
 source or target; headless execution does not remove VPN, firewall, or runner
 network requirements.
 
-The headless E2E test uses the pinned `floci/floci:2.1.0` Docker image as a real
+The headless E2E test uses the pinned `floci/floci:2.0.1` Docker image digest as a real
 S3-compatible service and requires the AWS CLI. Run it with:
 
 ```bash

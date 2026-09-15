@@ -366,7 +366,9 @@ fn s3_copy(source: impl AsRef<Path>, destination: impl AsRef<Path>) -> Result<()
         .arg(source.as_ref())
         .arg(destination.as_ref())
         .arg("--only-show-errors");
-    if let Ok(endpoint) = std::env::var("CAIS_S3_ENDPOINT_URL") {
+    if let Ok(endpoint) = std::env::var("CAIS_S3_ENDPOINT_URL")
+        && !endpoint.trim().is_empty()
+    {
         command.args(["--endpoint-url", &endpoint]);
     }
     let output = command

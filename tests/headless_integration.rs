@@ -62,10 +62,13 @@ struct Floci {
 
 impl Floci {
     fn start() -> Self {
-        let container = GenericImage::new("floci/floci", "2.1.0")
-            .with_exposed_port(ContainerPort::Tcp(4566))
-            .start()
-            .expect("start Floci container");
+        let container = GenericImage::new(
+            "floci/floci",
+            "2.0.1@sha256:4e451c39c7bb88e3cd4f87e8fc0c25d5b47695a51185d521e2241fa00486e8eb",
+        )
+        .with_exposed_port(ContainerPort::Tcp(4566))
+        .start()
+        .expect("start Floci container");
         let port = container
             .get_host_port_ipv4(4566)
             .expect("mapped Floci port");
