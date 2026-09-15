@@ -127,6 +127,14 @@ the command exits. The executor still needs network access to the PostgreSQL
 source or target; headless execution does not remove VPN, firewall, or runner
 network requirements.
 
+The headless E2E test uses the pinned `floci/floci:2.1.0` Docker image as a real
+S3-compatible service and requires the AWS CLI. Run it with:
+
+```bash
+DOCKER_HOST=unix:///run/user/$(id -u)/docker.sock \
+RUN_DOCKER_TESTS=1 cargo test --locked --test headless_integration -- --test-threads=1
+```
+
 ### Security model
 
 - The server binds to `127.0.0.1` by default. Binding to another interface (e.g. `--host 0.0.0.0`) prints a warning.
