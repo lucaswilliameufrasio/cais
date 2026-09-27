@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-09-27
+
+### Bug Fixes
+
+- Report Docker image pull failures
+- Verify backups match discovered servers
+
+### Features
+
+- Add generic PostgreSQL discovery
 ## [0.2.0] - 2026-09-15
 
 ### Bug Fixes
@@ -20,6 +30,7 @@ All notable changes to this project will be documented in this file.
 - Also filter _timescaledb_cache and any _timescaledb* schema creation
 - Verify restored tables and refuse self-replacing migration
 - Inspect dump TOC through Docker backend
+- Cover all remote PostgreSQL postgres targets
 
 ### CI / Build
 
@@ -27,10 +38,19 @@ All notable changes to this project will be documented in this file.
 - Improve workflow and add release pipeline
 - Fix workflow SHAs and add comprehensive Makefile
 - Run web API tests in build job
+- Add guarded remote PostgreSQL backup workflow
+- Install AWS CLI on Ubuntu runners
+- Use official AWS CLI installer
+- Match PostgreSQL client to integration server
+- Fix release artifact action reference
+- Install NASM for Windows release builds
+- Expose NASM to Windows release builds
+- Export release manifest from host job
 
 ### Chores
 
 - Ignore backups and document insecure web binding
+- Prepare for v0.2.0
 
 ### Documentation
 
