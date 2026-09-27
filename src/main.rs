@@ -27,6 +27,9 @@ fn main() -> Result<()> {
     if args.first().is_some_and(|arg| arg == "backup") {
         return backup_from_args(&args[1..]);
     }
+    if args.first().is_some_and(|arg| arg == "discover") {
+        return discover_from_args(&args[1..]);
+    }
     if args.first().is_some_and(|arg| arg == "restore") {
         return restore_from_args(&args[1..]);
     }
@@ -131,6 +134,8 @@ fn backup_from_args(args: &[String]) -> Result<()> {
     let mut database_uri_env = None;
     let mut name = None;
     let mut output = None;
+    let mut inventory = None;
+    let mut server_id = None;
     let mut key_env = "CAIS_BACKUP_ENCRYPTION_KEY".to_owned();
     let mut databases = Vec::new();
     let mut config = cais::models::BackupConfig::default();
@@ -141,6 +146,8 @@ fn backup_from_args(args: &[String]) -> Result<()> {
             "--database-uri-env" => database_uri_env = Some(required_value(&mut iter, arg)?),
             "--name" => name = Some(required_value(&mut iter, arg)?),
             "--output" => output = Some(PathBuf::from(required_value(&mut iter, arg)?)),
+            "--inventory" => inventory = Some(PathBuf::from(required_value(&mut iter, arg)?)),
+            "--server" => server_id = Some(required_value(&mut iter, arg)?),
             "--encryption-key-env" => key_env = required_value(&mut iter, arg)?,
             "--database" => databases.push(required_value(&mut iter, arg)?),
             "--no-globals" => config.include_globals = false,
@@ -151,6 +158,20 @@ fn backup_from_args(args: &[String]) -> Result<()> {
     let source = resolve_database_uri(database_uri, database_uri_env)?;
     let name = name.context("backup requires --name")?;
     let output = output.context("backup requires --output")?;
+    let inventory_databases = match (inventory, server_id) {
+        (Some(path), Some(id)) => Some(cais::discovery::load_server_databases(&path, &id)?),
+        (None, None) => None,
+        _ => anyhow::bail!("--inventory and --server must be provided together"),
+    };
+    if let Some(discovered) = &inventory_databases {
+        for database in &databases {
+            if !discovered.contains(database) {
+                anyhow::bail!(
+                    "database '{database}' is not listed for the selected discovery server"
+                )
+            }
+        }
+    }
     let key = encryption_key(&key_env)?;
     let backend = cais::postgres::check_pg_tools();
     let staging = if is_s3_uri(&output) {
@@ -172,10 +193,14 @@ fn backup_from_args(args: &[String]) -> Result<()> {
             hostname: &identity.1,
         },
         &if databases.is_empty() {
-            cais::postgres::discover_databases(&source)?
-                .into_iter()
-                .map(|db| db.name)
-                .collect()
+            if let Some(discovered) = inventory_databases {
+                discovered
+            } else {
+                cais::postgres::discover_databases(&source)?
+                    .into_iter()
+                    .map(|db| db.name)
+                    .collect()
+            }
         } else {
             databases
         },
@@ -190,6 +215,106 @@ fn backup_from_args(args: &[String]) -> Result<()> {
         println!("Backup written to {}", outcome.file_path);
     }
     Ok(())
+}
+
+fn discover_from_args(args: &[String]) -> Result<()> {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print_discovery_help();
+        return Ok(());
+    }
+
+    let mut sources = Vec::new();
+    let mut hosts = Vec::new();
+    let mut format = "text".to_owned();
+    let mut output = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--source" => {
+                let value = required_value(&mut iter, arg)?;
+                for source in value.split(',') {
+                    let source = cais::discovery::DiscoverySource::parse(source.trim())?;
+                    if !sources.contains(&source) {
+                        sources.push(source);
+                    }
+                }
+            }
+            "--host" => hosts.push(required_value(&mut iter, arg)?),
+            "--format" => format = required_value(&mut iter, arg)?,
+            "--output" => output = Some(PathBuf::from(required_value(&mut iter, arg)?)),
+            other => anyhow::bail!("unknown discover argument '{other}'"),
+        }
+    }
+    if sources.is_empty() {
+        sources.extend([
+            cais::discovery::DiscoverySource::Local,
+            cais::discovery::DiscoverySource::Docker,
+        ]);
+    }
+    if hosts.is_empty() && sources.contains(&cais::discovery::DiscoverySource::Ssh) {
+        anyhow::bail!("SSH discovery requires --host <OPENSSH_HOST>")
+    }
+    if !hosts.is_empty() && !sources.contains(&cais::discovery::DiscoverySource::Ssh) {
+        anyhow::bail!("--host is only valid with --source ssh")
+    }
+    if !matches!(format.as_str(), "text" | "json") {
+        anyhow::bail!("discovery format must be text or json")
+    }
+
+    let report = cais::discovery::discover(&sources, &hosts);
+    let rendered = match format.as_str() {
+        "text" => format_discovery_text(&report),
+        "json" => serde_json::to_string_pretty(&report)
+            .context("failed to serialize discovery inventory")?,
+        _ => unreachable!("format was validated before discovery"),
+    };
+    if let Some(path) = output {
+        std::fs::write(&path, format!("{rendered}\n")).with_context(|| {
+            format!("failed to write discovery inventory to {}", path.display())
+        })?;
+    } else {
+        println!("{rendered}");
+    }
+    Ok(())
+}
+
+fn format_discovery_text(report: &cais::discovery::DiscoveryReport) -> String {
+    let mut lines = Vec::new();
+    for source in &report.sources {
+        lines.push(format!("{}: {}", source.source, source.status));
+        if let Some(message) = &source.message {
+            lines.push(format!("  {message}"));
+        }
+    }
+    for server in &report.servers {
+        lines.push(format!(
+            "{} [{}] — {}",
+            server.name, server.source, server.status
+        ));
+        if let Some(image) = &server.image {
+            lines.push(format!("  image: {image}"));
+        }
+        for endpoint in &server.endpoints {
+            let context = endpoint
+                .context
+                .as_deref()
+                .map(|context| format!("; {context}"))
+                .unwrap_or_default();
+            lines.push(format!(
+                "  endpoint: {}:{} ({}){context}",
+                endpoint.host, endpoint.port, endpoint.route
+            ));
+        }
+        if server.databases.is_empty() {
+            lines.push("  databases: not enumerated".to_owned());
+        } else {
+            lines.push(format!("  databases: {}", server.databases.join(", ")));
+        }
+        if let Some(message) = &server.message {
+            lines.push(format!("  {message}"));
+        }
+    }
+    lines.join("\n")
 }
 
 fn restore_from_args(args: &[String]) -> Result<()> {
@@ -391,9 +516,25 @@ fn print_backup_help() {
          (standard base64, exactly 32 decoded bytes), or --encryption-key-env <VAR>.\n\
          \n\
          --database <NAME>             Select a database (repeatable; default: all)\n\
+         --inventory <JSON>            Use a saved `cais discover --format json` inventory\n\
+         --server <ID>                 Select a server from --inventory (URI must reach it)\n\
          --no-globals                  Exclude cluster roles and memberships\n\
          --include-role-passwords     Include role passwords in globals\n\
          S3 requires the aws CLI; set CAIS_S3_ENDPOINT_URL for S3-compatible providers."
+    );
+}
+
+fn print_discovery_help() {
+    eprintln!(
+        "cais discover [OPTIONS]\n\
+         \n\
+         Discover PostgreSQL instances on the local host, Docker, or an SSH host.\n\
+         Results do not contain passwords. SSH discovery does not create tunnels.\n\
+         \n\
+         --source <local,docker,ssh>  Select sources (repeatable; default: local,docker)\n\
+         --host <OPENSSH_HOST>        SSH host or alias (repeatable; requires ssh source)\n\
+         --format <text|json>         Output format (default: text)\n\
+         --output <PATH>              Write the inventory to a file instead of stdout"
     );
 }
 
@@ -422,6 +563,7 @@ fn print_help() {
          \x20 cais                 Run the TUI\n\
          \x20 cais serve [OPTIONS]  Run the local web interface\n\
          \x20 cais backup [OPTIONS] Run an encrypted headless DBP2 backup\n\
+         \x20 cais discover [OPTIONS] Discover local, Docker, or SSH PostgreSQL servers\n\
          \x20 cais restore [OPTIONS] Restore an encrypted headless DBP2 backup\n\
          \x20 cais reset [--yes]    Move the vault and encrypted backups aside (fresh start)\n\
          \n\
@@ -432,7 +574,7 @@ fn print_help() {
          \n\
          reset OPTIONS:\n\
          \x20 --yes               Skip interactive confirmation\n\
-         Use 'cais backup --help' or 'cais restore --help' for headless options."
+         Use 'cais discover --help', 'cais backup --help', or 'cais restore --help' for options."
     );
 }
 

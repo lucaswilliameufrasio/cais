@@ -106,6 +106,56 @@ The current TUI and Web restore flows preserve the original names of databases
 inside a multi-database bundle. Use the headless command when a bundle needs
 selection or source-to-destination renaming.
 
+## PostgreSQL Discovery
+
+`cais discover` inventories PostgreSQL available through the current user's
+local PostgreSQL client settings and Docker. It can also inspect a remote host
+through SSH:
+
+```bash
+cais discover
+cais discover --source local,docker --format json --output discovery.json
+cais discover --source ssh --host database-host --format json
+```
+
+The command is read-only. It uses the current user's PostgreSQL client settings
+for local access, the selected Docker daemon for container discovery, and the
+user's OpenSSH configuration/agent for SSH. Docker and remote query results can
+show container addresses that are only reachable inside their Docker network.
+SSH discovery does not create a tunnel or expose a database port. Use the
+reported route information to decide where a tunnel is needed.
+
+For a remote endpoint that is only reachable from the SSH host, create the
+tunnel yourself in a separate terminal, substituting the endpoint and port
+reported by discovery:
+
+```bash
+ssh -N -L 127.0.0.1:15432:<remote-endpoint>:<remote-port> <ssh-host>
+```
+
+Passwords are not collected from container or host configuration and are never
+included in the inventory. Database names are included only when the current
+user or the container's default local PostgreSQL authentication can query
+them. If discovery reports a server as `detected`, it found the server but
+could not enumerate its databases with available access.
+
+An inventory can select the database list for a headless backup. Supply a
+separate URI through an environment variable; it must connect to the selected
+server from the machine running Cais. For SSH-only routes, establish the tunnel
+yourself first and use its local endpoint in the URI:
+
+```bash
+export DATABASE_URL='postgresql://backup_user:<password>@127.0.0.1:15432/postgres'
+export CAIS_BACKUP_ENCRYPTION_KEY="$(openssl rand -base64 32)"
+cais backup --database-uri-env DATABASE_URL --name remote-production \
+  --output ./backups --inventory discovery.json --server 'ssh:database-host:postgresql'
+```
+
+Use `--database <NAME>` to select a subset of the databases listed for that
+server. Cais rejects names that are not in the selected inventory entry. The
+URI is still required for authentication and actual network access; discovery
+does not recover credentials or make a private endpoint reachable.
+
 The default restore conflict policy is `skip`, which leaves existing databases
 untouched. `fail` is stricter; `replace` drops conflicting databases with
 `DROP DATABASE ... WITH (FORCE)`. Every restore requires explicit `--yes`.
