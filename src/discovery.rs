@@ -101,7 +101,7 @@ pub fn discover(sources: &[DiscoverySource], ssh_hosts: &[String]) -> DiscoveryR
     report
 }
 
-pub fn load_server_databases(path: &std::path::Path, server_id: &str) -> Result<Vec<String>> {
+pub fn load_server(path: &std::path::Path, server_id: &str) -> Result<DiscoveredServer> {
     let contents = std::fs::read(path)
         .with_context(|| format!("failed to read discovery inventory {}", path.display()))?;
     let report: DiscoveryReport = serde_json::from_slice(&contents)
@@ -125,7 +125,47 @@ pub fn load_server_databases(path: &std::path::Path, server_id: &str) -> Result<
     if server.databases.is_empty() {
         anyhow::bail!("server '{server_id}' has no enumerated databases in the inventory")
     }
-    Ok(server.databases.clone())
+    Ok(server.clone())
+}
+
+pub fn load_server_databases(path: &std::path::Path, server_id: &str) -> Result<Vec<String>> {
+    Ok(load_server(path, server_id)?.databases)
+}
+
+pub fn inventory_matches_connection(
+    server: &DiscoveredServer,
+    uri_host: &str,
+    uri_port: u16,
+    connected_host: Option<&str>,
+    connected_port: u16,
+) -> bool {
+    server.endpoints.iter().any(|endpoint| {
+        (endpoint.port == uri_port && hosts_match(&endpoint.host, uri_host))
+            || (endpoint.port == connected_port
+                && connected_host.is_some_and(|host| hosts_match(&endpoint.host, host)))
+            || (endpoint.port == connected_port
+                && connected_host.is_none()
+                && endpoint.route.contains("socket"))
+    })
+}
+
+fn hosts_match(left: &str, right: &str) -> bool {
+    let left = normalize_host(left);
+    let right = normalize_host(right);
+    if left.eq_ignore_ascii_case(right) {
+        return true;
+    }
+    let is_loopback = |host: &str| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    };
+    is_loopback(left) && is_loopback(right)
+}
+
+fn normalize_host(host: &str) -> &str {
+    host.trim().trim_start_matches('[').trim_end_matches(']')
 }
 
 fn discover_local(report: &mut DiscoveryReport) {
@@ -143,7 +183,67 @@ fn discover_local(report: &mut DiscoveryReport) {
         return;
     }
 
-    match psql_databases(None, None) {
+    if let Some(clusters) = local_postgres_clusters()
+        && clusters.iter().any(|cluster| cluster.online)
+    {
+        let mut enumerated = 0usize;
+        for cluster in clusters.iter().filter(|cluster| cluster.online) {
+            let endpoint =
+                local_endpoint(std::env::var("PGHOST").unwrap_or_default(), cluster.port);
+            match psql_databases_local(Some(cluster.port)) {
+                Ok(databases) => {
+                    enumerated += 1;
+                    report.servers.push(DiscoveredServer {
+                        id: format!("local:{}:{}", cluster.name, cluster.port),
+                        name: cluster.name.clone(),
+                        source: "local".to_owned(),
+                        image: None,
+                        status: "authenticated".to_owned(),
+                        databases,
+                        endpoints: vec![endpoint],
+                        message: None,
+                    });
+                }
+                Err(_) => {
+                    let reachable = local_server_ready(Some(cluster.port));
+                    report.servers.push(DiscoveredServer {
+                        id: format!("local:{}:{}", cluster.name, cluster.port),
+                        name: cluster.name.clone(),
+                        source: "local".to_owned(),
+                        image: None,
+                        status: if reachable {
+                            "reachable".to_owned()
+                        } else {
+                            "detected".to_owned()
+                        },
+                        databases: Vec::new(),
+                        endpoints: vec![endpoint],
+                        message: Some(if reachable {
+                            "PostgreSQL is accepting connections, but database enumeration requires valid local credentials".to_owned()
+                        } else {
+                            "The local cluster manager reports this cluster online, but the current user could not verify connectivity".to_owned()
+                        }),
+                    });
+                }
+            }
+        }
+        let online = clusters.iter().filter(|cluster| cluster.online).count();
+        report.sources.push(SourceStatus {
+            source: "local".to_owned(),
+            status: if enumerated == online {
+                "complete"
+            } else {
+                "partial"
+            }
+            .to_owned(),
+            message: Some(format!(
+                "Enumerated databases for {enumerated} of {online} online local PostgreSQL cluster(s)"
+            )),
+        });
+        return;
+    }
+
+    match psql_databases_local(None) {
         Ok(databases) => {
             let host = std::env::var("PGHOST").unwrap_or_default();
             let port = std::env::var("PGPORT")
@@ -186,7 +286,7 @@ fn discover_local(report: &mut DiscoveryReport) {
             });
         }
         Err(message) => {
-            if local_server_ready() {
+            if local_server_ready(None) {
                 let host = std::env::var("PGHOST").unwrap_or_default();
                 let port = std::env::var("PGPORT")
                     .ok()
@@ -222,11 +322,68 @@ fn discover_local(report: &mut DiscoveryReport) {
     }
 }
 
-fn local_server_ready() -> bool {
-    Command::new("pg_isready")
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalPgCluster {
+    name: String,
+    port: u16,
+    online: bool,
+}
+
+fn local_postgres_clusters() -> Option<Vec<LocalPgCluster>> {
+    let output = Command::new("pg_lsclusters")
+        .arg("--no-header")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(parse_pg_lsclusters(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+fn parse_pg_lsclusters(output: &str) -> Vec<LocalPgCluster> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            if fields.len() < 4 {
+                return None;
+            }
+            let port = fields[2].parse::<u16>().ok()?;
+            Some(LocalPgCluster {
+                name: format!("PostgreSQL cluster {}/{}", fields[0], fields[1]),
+                port,
+                online: fields[3] == "online",
+            })
+        })
+        .collect()
+}
+
+fn local_server_ready(port: Option<u16>) -> bool {
+    let mut command = Command::new("pg_isready");
+    if let Some(port) = port {
+        command.args(["-p", &port.to_string()]);
+    }
+    command
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)
+}
+
+fn psql_databases_local(port: Option<u16>) -> Result<Vec<String>> {
+    let mut command = Command::new("psql");
+    if let Some(port) = port {
+        command.env("PGPORT", port.to_string());
+    }
+    let output = command
+        .args(["-X", "-A", "-t", "-d", "postgres", "-c", DATABASE_QUERY])
+        .output()
+        .context("PostgreSQL client psql is not installed")?;
+    if !output.status.success() {
+        anyhow::bail!("could not query PostgreSQL using the current user's configured access")
+    }
+    Ok(parse_lines(&output.stdout))
 }
 
 fn local_endpoint(host: String, port: u16) -> DiscoveredEndpoint {
@@ -711,8 +868,9 @@ fn docker_endpoints(settings: &Value) -> Vec<DiscoveredEndpoint> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DiscoverySource, docker_endpoints, docker_networks, is_postgres_image,
-        is_safe_container_id, load_server_databases, parse_remote_listener,
+        DiscoveredEndpoint, DiscoveredServer, DiscoverySource, docker_endpoints, docker_networks,
+        inventory_matches_connection, is_postgres_image, is_safe_container_id,
+        load_server_databases, parse_pg_lsclusters, parse_remote_listener,
     };
     use serde_json::json;
     use std::io::Write;
@@ -732,6 +890,19 @@ mod tests {
     }
 
     #[test]
+    fn parses_online_and_stopped_local_postgresql_clusters() {
+        let clusters = parse_pg_lsclusters(
+            "16 main 5432 online postgres /var/lib/postgresql/16/main /var/log/postgresql/postgresql-16-main.log\n\
+             17 staging 5433 down postgres /var/lib/postgresql/17/staging /var/log/postgresql/postgresql-17-staging.log\n",
+        );
+        assert_eq!(clusters.len(), 2);
+        assert_eq!(clusters[0].name, "PostgreSQL cluster 16/main");
+        assert_eq!(clusters[0].port, 5432);
+        assert!(clusters[0].online);
+        assert!(!clusters[1].online);
+    }
+
+    #[test]
     fn classifies_remote_socket_and_tcp_listener_paths() {
         let socket = parse_remote_listener("5432|").expect("socket endpoint");
         assert_eq!(socket.route, "ssh-local-socket");
@@ -745,6 +916,57 @@ mod tests {
         let private_listener = parse_remote_listener("6432|10.0.0.8").expect("private endpoint");
         assert_eq!(private_listener.host, "10.0.0.8");
         assert_eq!(private_listener.port, 6432);
+    }
+
+    #[test]
+    fn inventory_selection_matches_direct_tunnel_and_socket_routes() {
+        let server = DiscoveredServer {
+            id: "ssh:db-host:docker:abc123".into(),
+            name: "postgres".into(),
+            source: "ssh-docker".into(),
+            image: Some("postgres:18".into()),
+            status: "authenticated".into(),
+            databases: vec!["app".into()],
+            endpoints: vec![DiscoveredEndpoint {
+                host: "172.20.0.2".into(),
+                port: 5432,
+                route: "ssh-tunnel".into(),
+                context: Some("db-host/private-net".into()),
+            }],
+            message: None,
+        };
+
+        assert!(inventory_matches_connection(
+            &server,
+            "127.0.0.1",
+            15432,
+            Some("172.20.0.2"),
+            5432
+        ));
+        assert!(!inventory_matches_connection(
+            &server,
+            "127.0.0.1",
+            15432,
+            Some("172.20.0.3"),
+            5432
+        ));
+
+        let socket_server = DiscoveredServer {
+            endpoints: vec![DiscoveredEndpoint {
+                host: "local-socket".into(),
+                port: 5432,
+                route: "local-socket".into(),
+                context: None,
+            }],
+            ..server
+        };
+        assert!(inventory_matches_connection(
+            &socket_server,
+            "localhost",
+            5432,
+            None,
+            5432
+        ));
     }
 
     #[test]

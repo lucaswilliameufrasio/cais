@@ -683,6 +683,21 @@ pub fn discover_databases(instance_cs: &str) -> Result<Vec<DiscoveredDatabase>> 
         .collect())
 }
 
+/// Returns the PostgreSQL server address seen by the current connection. A
+/// `None` address means the client connected over a Unix-domain socket.
+pub fn connected_server_endpoint(connection_string: &str) -> Result<(Option<String>, u16)> {
+    let mut client = connect_client(connection_string)
+        .context("failed to connect while verifying the selected discovery server")?;
+    let row = client.query_one(
+        "SELECT inet_server_addr(), current_setting('port')::integer",
+        &[],
+    )?;
+    let address: Option<std::net::IpAddr> = row.get(0);
+    let port: i32 = row.get(1);
+    let port = u16::try_from(port).context("PostgreSQL returned an invalid server port")?;
+    Ok((address.map(|address| address.to_string()), port))
+}
+
 // ---------------------------------------------------------------------------
 // Query console (web)
 // ---------------------------------------------------------------------------

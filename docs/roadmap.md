@@ -18,7 +18,9 @@ or infrastructure inventory belongs in Cais code, fixtures, or documentation.
 ## 2. Local Host Discovery
 
 - Detect PostgreSQL available on the local host using the current user's
-  PostgreSQL client configuration and operating-system defaults.
+  PostgreSQL client configuration and operating-system defaults. Enumerate
+  clusters reported by `pg_lsclusters` on Debian/Ubuntu; probe the default local
+  PostgreSQL client endpoint on other systems.
 - Query database names only when local authentication permits it.
 - Report whether the connection uses a local socket or TCP, and the effective
   endpoint where available.
@@ -68,8 +70,10 @@ or infrastructure inventory belongs in Cais code, fixtures, or documentation.
   `--database-uri-env ...` interfaces.
 - Allow a user to select a discovered server/inventory for backup, reusing
   explicitly supplied credentials rather than trying to recover passwords.
-- Verify that the endpoint/route is accessible from the process performing the
-  backup before starting database dumps.
+- Verify that the selected URI connects to the selected inventory server by
+  comparing the URI and server-reported endpoint against discovered routes.
+- Verify connectivity before starting database dumps and reject a URI that
+  reaches a different server.
 - Allow selecting databases from the discovery result; retain the existing
   behavior of discovering all connectable databases when no selection is given.
 - Preserve encryption-before-upload for local and S3-compatible destinations.

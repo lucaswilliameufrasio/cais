@@ -158,14 +158,27 @@ fn backup_from_args(args: &[String]) -> Result<()> {
     let source = resolve_database_uri(database_uri, database_uri_env)?;
     let name = name.context("backup requires --name")?;
     let output = output.context("backup requires --output")?;
-    let inventory_databases = match (inventory, server_id) {
-        (Some(path), Some(id)) => Some(cais::discovery::load_server_databases(&path, &id)?),
+    let selected_server = match (inventory, server_id) {
+        (Some(path), Some(id)) => Some(cais::discovery::load_server(&path, &id)?),
         (None, None) => None,
         _ => anyhow::bail!("--inventory and --server must be provided together"),
     };
-    if let Some(discovered) = &inventory_databases {
+    if let Some(server) = &selected_server {
+        let uri_endpoint = cais::postgres::parse_database_url(&source)?;
+        let (connected_host, connected_port) = cais::postgres::connected_server_endpoint(&source)?;
+        if !cais::discovery::inventory_matches_connection(
+            server,
+            &uri_endpoint.host,
+            uri_endpoint.port,
+            connected_host.as_deref(),
+            connected_port,
+        ) {
+            anyhow::bail!(
+                "DATABASE_URL does not connect to the server selected from the discovery inventory"
+            )
+        }
         for database in &databases {
-            if !discovered.contains(database) {
+            if !server.databases.contains(database) {
                 anyhow::bail!(
                     "database '{database}' is not listed for the selected discovery server"
                 )
@@ -193,8 +206,8 @@ fn backup_from_args(args: &[String]) -> Result<()> {
             hostname: &identity.1,
         },
         &if databases.is_empty() {
-            if let Some(discovered) = inventory_databases {
-                discovered
+            if let Some(server) = selected_server {
+                server.databases
             } else {
                 cais::postgres::discover_databases(&source)?
                     .into_iter()

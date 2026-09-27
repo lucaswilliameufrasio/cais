@@ -118,12 +118,16 @@ cais discover --source local,docker --format json --output discovery.json
 cais discover --source ssh --host database-host --format json
 ```
 
-The command is read-only. It uses the current user's PostgreSQL client settings
-for local access, the selected Docker daemon for container discovery, and the
-user's OpenSSH configuration/agent for SSH. Docker and remote query results can
-show container addresses that are only reachable inside their Docker network.
+The command is read-only. On Debian/Ubuntu it enumerates local clusters reported
+by `pg_lsclusters`; on other systems it probes the current user's default
+PostgreSQL client endpoint. It uses the selected Docker daemon for container
+discovery and the user's OpenSSH configuration/agent for SSH. Docker and remote
+query results can show container addresses that are only reachable inside their
+Docker network.
 SSH discovery does not create a tunnel or expose a database port. Use the
 reported route information to decide where a tunnel is needed.
+An endpoint reported as `ssh-local-socket` has no TCP listener to tunnel to;
+the backup process must run where that local socket is available.
 
 For a remote endpoint that is only reachable from the SSH host, create the
 tunnel yourself in a separate terminal, substituting the endpoint and port
@@ -142,7 +146,9 @@ could not enumerate its databases with available access.
 An inventory can select the database list for a headless backup. Supply a
 separate URI through an environment variable; it must connect to the selected
 server from the machine running Cais. For SSH-only routes, establish the tunnel
-yourself first and use its local endpoint in the URI:
+yourself first and use its local endpoint in the URI. Before dumping, Cais
+checks the connected PostgreSQL server address/port against the selected
+inventory entry and refuses a URI that reaches a different server:
 
 ```bash
 export DATABASE_URL='postgresql://backup_user:<password>@127.0.0.1:15432/postgres'

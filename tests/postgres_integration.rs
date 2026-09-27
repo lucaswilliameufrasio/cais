@@ -6,10 +6,10 @@ use cais::models::{
 };
 use cais::postgres::{
     InstanceBackupContext, backup_database_with_progress, backup_instance_with_progress,
-    check_pg_tools, list_database_tables, migrate_database_with_progress,
-    provision_database_with_progress, provision_extra_user_with_progress,
-    provision_full_with_progress, resolve_docker_image, restore_instance_with_progress,
-    run_sql_query, run_table_page,
+    check_pg_tools, connected_server_endpoint, list_database_tables,
+    migrate_database_with_progress, provision_database_with_progress,
+    provision_extra_user_with_progress, provision_full_with_progress, resolve_docker_image,
+    restore_instance_with_progress, run_sql_query, run_table_page,
 };
 use postgres::{Client, NoTls};
 use testcontainers::{GenericImage, Image, ImageExt, core::WaitFor, runners::SyncRunner};
@@ -80,6 +80,22 @@ impl DockerPostgres<GenericImage> {
             std::thread::sleep(Duration::from_millis(500));
         }
     }
+}
+
+#[test]
+fn connected_server_endpoint_reports_the_live_postgres_endpoint() {
+    if std::env::var("RUN_DOCKER_TESTS").ok().as_deref() != Some("1") {
+        return;
+    }
+    let postgres = DockerPostgres::start();
+
+    let (host, port) = connected_server_endpoint(&postgres.url()).expect("server endpoint");
+
+    assert!(
+        host.is_some(),
+        "TCP connection should report its server address"
+    );
+    assert_eq!(port, 5432);
 }
 
 /// Pick a PostgreSQL Docker tag compatible with the native pg_dump
