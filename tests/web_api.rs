@@ -262,3 +262,111 @@ async fn workspaces_keep_vaults_isolated() {
     assert_eq!(instances.len(), 1);
     assert_eq!(instances[0]["name"], "prod");
 }
+
+#[tokio::test]
+async fn existing_workspace_is_listed_before_any_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspaces = dir.path().join("workspaces");
+    std::fs::create_dir_all(&workspaces).unwrap();
+    let vault = cais::storage::Storage::open_at(workspaces.join("default.sqlite")).unwrap();
+    vault.initialize_master_password("secret").unwrap();
+    drop(vault);
+
+    let state = Arc::new(WebState::open_at(dir.path()).unwrap());
+    let app = cais::web::api::router(state);
+    let (status, body) = request(&app, "GET", "/api/workspaces", None, None).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let workspaces = body.as_array().unwrap();
+    assert_eq!(workspaces.len(), 1);
+    assert_eq!(workspaces[0]["name"], "default");
+    assert_eq!(workspaces[0]["initialized"], true);
+}
+
+#[tokio::test]
+async fn duplicate_instance_is_rejected_and_edit_keeps_catalog() {
+    let (app, _dir) = build_app();
+    let (status, body) = request(
+        &app,
+        "POST",
+        "/api/init",
+        Some(r#"{"workspace":"default","password":"secret","confirm":"secret"}"#),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let token = body["token"].as_str().unwrap().to_owned();
+
+    let (status, _) = request(
+        &app,
+        "POST",
+        "/api/instances",
+        Some(r#"{"name":"prod","url":"postgresql://admin:pw@db.example.com:5432/postgres"}"#),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = request(
+        &app,
+        "POST",
+        "/api/instances",
+        Some(r#"{"name":"prod","url":"postgresql://other:pw@other.example.com:5432/postgres"}"#),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    assert!(body["error"].as_str().unwrap().contains("already exists"));
+
+    let (status, body) = request(
+        &app,
+        "PUT",
+        "/api/instances/prod",
+        Some(
+            r#"{"name":"production","url":"postgresql://admin:new@db.example.com:5432/postgres"}"#,
+        ),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["name"], "production");
+    assert_eq!(body["host"], "db.example.com");
+
+    let (status, body) = request(&app, "GET", "/api/dashboard", None, Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let instances = body["instances"].as_array().unwrap();
+    assert_eq!(instances.len(), 1);
+    assert_eq!(instances[0]["name"], "production");
+    assert_eq!(instances[0]["host"], "db.example.com");
+
+    let (status, _) = request(
+        &app,
+        "POST",
+        "/api/instances",
+        Some(
+            r#"{"name":"staging","url":"postgresql://admin:pw@staging.example.com:5432/postgres"}"#,
+        ),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = request(
+        &app,
+        "PUT",
+        "/api/instances/production",
+        Some(r#"{"name":"staging","url":"postgresql://admin:new@db.example.com:5432/postgres"}"#),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+
+    let (status, body) = request(
+        &app,
+        "PUT",
+        "/api/instances/missing",
+        Some(r#"{"name":"ghost","url":"postgresql://admin:pw@db.example.com:5432/postgres"}"#),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
+}

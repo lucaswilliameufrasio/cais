@@ -687,7 +687,7 @@ fn draw_manage_instances(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
     let help = if app.confirming_delete_instance {
         "Delete this instance? Press y to confirm, any other key to cancel."
     } else {
-        "a: add  Enter: select  Delete: remove  m: monitor queries  r: health check  Esc: back"
+        "a: add  e: edit  Enter: select  Delete: remove  m: monitor queries  r: health check  Esc: back"
     };
     draw_footer(frame, layout[1], app, help);
     Ok(())
@@ -696,7 +696,12 @@ fn draw_manage_instances(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
 fn draw_add_instance(frame: &mut Frame<'_>, app: &App) {
     let area = centered_rect(frame.area(), 70, 35);
     frame.render_widget(Clear, area);
-    let block = Block::default().title("Add Instance").borders(Borders::ALL);
+    let title = if app.editing_instance.is_some() {
+        "Edit Instance"
+    } else {
+        "Add Instance"
+    };
+    let block = Block::default().title(title).borders(Borders::ALL);
     frame.render_widget(block, area);
     let chunks = Layout::default()
         .direction(Direction::Vertical)

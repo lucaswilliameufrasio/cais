@@ -308,34 +308,115 @@ impl Storage {
         Ok(output)
     }
 
+    /// Inserts a new instance. Refuses when `instance_name` is already taken so
+    /// a second "add" cannot replace the saved base URI.
     pub fn save_instance_secret(
         &self,
         instance_name: &str,
         encrypted: &EncryptedValue,
     ) -> Result<()> {
+        if self.load_instance_secret(instance_name)?.is_some() {
+            anyhow::bail!("instance '{instance_name}' already exists");
+        }
         let now = now_iso();
-        self.conn.execute(
+        self.conn
+            .execute(
+                r#"
+                INSERT INTO environments (
+                    name,
+                    base_database_url_ciphertext,
+                    base_database_url_nonce,
+                    created_at,
+                    updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5)
+                "#,
+                params![
+                    instance_name,
+                    encrypted.ciphertext,
+                    encrypted.nonce,
+                    now,
+                    now,
+                ],
+            )
+            .map_err(|error| {
+                let message = error.to_string();
+                if message.contains("UNIQUE") {
+                    anyhow::anyhow!("instance '{instance_name}' already exists")
+                } else {
+                    anyhow::Error::from(error)
+                }
+            })?;
+        Ok(())
+    }
+
+    /// Replaces the saved base URI of an instance that already exists.
+    pub fn update_instance_secret(
+        &self,
+        instance_name: &str,
+        encrypted: &EncryptedValue,
+    ) -> Result<()> {
+        let now = now_iso();
+        let updated = self.conn.execute(
             r#"
-            INSERT INTO environments (
-                name,
-                base_database_url_ciphertext,
-                base_database_url_nonce,
-                created_at,
-                updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5)
-            ON CONFLICT(name) DO UPDATE SET
-                base_database_url_ciphertext = excluded.base_database_url_ciphertext,
-                base_database_url_nonce = excluded.base_database_url_nonce,
-                updated_at = excluded.updated_at
+            UPDATE environments
+            SET base_database_url_ciphertext = ?1,
+                base_database_url_nonce = ?2,
+                updated_at = ?3
+            WHERE name = ?4
+            "#,
+            params![encrypted.ciphertext, encrypted.nonce, now, instance_name,],
+        )?;
+        if updated == 0 {
+            anyhow::bail!("instance '{instance_name}' not found");
+        }
+        Ok(())
+    }
+
+    /// Updates an existing instance's base URI and, when the name changes,
+    /// moves every catalog row that belongs to it. Refuses a rename onto a
+    /// name that another instance already uses.
+    pub fn replace_instance(
+        &mut self,
+        current_name: &str,
+        new_name: &str,
+        encrypted: &EncryptedValue,
+    ) -> Result<()> {
+        if current_name != new_name && self.load_instance_secret(new_name)?.is_some() {
+            anyhow::bail!("instance '{new_name}' already exists");
+        }
+        let now = now_iso();
+        let tx = self.conn.transaction()?;
+        let updated = tx.execute(
+            r#"
+            UPDATE environments
+            SET name = ?1,
+                base_database_url_ciphertext = ?2,
+                base_database_url_nonce = ?3,
+                updated_at = ?4
+            WHERE name = ?5
             "#,
             params![
-                instance_name,
+                new_name,
                 encrypted.ciphertext,
                 encrypted.nonce,
                 now,
-                now,
+                current_name,
             ],
         )?;
+        if updated == 0 {
+            anyhow::bail!("instance '{current_name}' not found");
+        }
+        if current_name != new_name {
+            tx.execute(
+                "UPDATE provisioned_databases SET environment_name = ?1 WHERE environment_name = ?2",
+                params![new_name, current_name],
+            )?;
+            tx.execute(
+                "UPDATE provisioned_extra_users SET environment_name = ?1 WHERE environment_name = ?2",
+                params![new_name, current_name],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -1108,6 +1189,98 @@ mod tests {
         assert!(
             records.iter().any(|r| r.database_name == "test-db"),
             "provisioned database should be listable with engine column"
+        );
+    }
+
+    #[test]
+    fn instance_insert_does_not_overwrite_and_replace_renames_catalog() {
+        let dir = tempdir().expect("dir");
+        let mut storage = Storage::open_at(dir.path().join("data.sqlite")).expect("storage");
+        let key = b"01234567890123456789012345678901";
+        let original = crypto::encrypt(key, b"postgresql://old").expect("encrypt original");
+        let replacement = crypto::encrypt(key, b"postgresql://new").expect("encrypt replacement");
+        storage
+            .save_instance_secret("prod", &original)
+            .expect("insert");
+        let err = storage
+            .save_instance_secret("prod", &replacement)
+            .expect_err("duplicate insert");
+        assert!(
+            err.to_string().contains("already exists"),
+            "unexpected error: {err:#}"
+        );
+        let loaded = storage
+            .load_instance_secret("prod")
+            .expect("load")
+            .expect("still present");
+        assert_eq!(loaded.encrypted.ciphertext, original.ciphertext);
+
+        let db_enc = crypto::encrypt(key, b"db").expect("encrypt db");
+        storage
+            .save_provisioned_database(
+                "prod",
+                &ProvisionOutcome {
+                    database_name: "orders".into(),
+                    application_name: "orders".into(),
+                    role_name: "orders_owner".into(),
+                    connection_string: "cs".into(),
+                    database_created: true,
+                    role_created: true,
+                },
+                &db_enc,
+            )
+            .expect("save database");
+        let user_enc = crypto::encrypt(key, b"user").expect("encrypt user");
+        storage
+            .save_provisioned_extra_user(
+                "prod",
+                &ExtraUserProvisionOutcome {
+                    database_name: "orders".into(),
+                    username: "orders_app".into(),
+                    application_name: "orders".into(),
+                    connection_string: "cs".into(),
+                    role_created: true,
+                    grants_applied: true,
+                },
+                &user_enc,
+            )
+            .expect("save extra user");
+
+        let other = crypto::encrypt(key, b"postgresql://other").expect("encrypt other");
+        storage
+            .save_instance_secret("other", &other)
+            .expect("insert other");
+        let err = storage
+            .replace_instance("prod", "other", &replacement)
+            .expect_err("rename collision");
+        assert!(err.to_string().contains("already exists"));
+        assert_eq!(
+            storage.list_provisioned_databases().expect("dbs")[0].instance_name,
+            "prod",
+            "a refused rename must leave catalog rows on the original instance"
+        );
+
+        storage
+            .replace_instance("prod", "production", &replacement)
+            .expect("rename");
+        assert!(
+            storage
+                .load_instance_secret("prod")
+                .expect("load old")
+                .is_none()
+        );
+        let renamed = storage
+            .load_instance_secret("production")
+            .expect("load new")
+            .expect("renamed instance");
+        assert_eq!(renamed.encrypted.ciphertext, replacement.ciphertext);
+        assert_eq!(
+            storage.list_provisioned_databases().expect("dbs")[0].instance_name,
+            "production"
+        );
+        assert_eq!(
+            storage.list_provisioned_extra_users().expect("users")[0].instance_name,
+            "production"
         );
     }
 

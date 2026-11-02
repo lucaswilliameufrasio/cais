@@ -260,6 +260,9 @@ pub struct App {
     pub selected_instance_idx: usize,
     pub selected_instance: Option<String>,
     pub confirming_delete_instance: bool,
+    /// Set while the add-instance screen is editing an existing instance.
+    /// `None` means the screen creates a new instance.
+    pub editing_instance: Option<String>,
     pub instance_name_field: TextField,
     pub instance_url_field: TextField,
     pub migrate_phase: MigratePhase,
@@ -391,6 +394,7 @@ impl App {
             selected_instance_idx: 0,
             selected_instance: None,
             confirming_delete_instance: false,
+            editing_instance: None,
             instance_name_field: TextField::new("Instance name", false),
             instance_url_field: TextField::new("Base DATABASE_URL", false),
             migrate_phase: MigratePhase::SelectSource,
@@ -1100,15 +1104,50 @@ impl App {
         let key = self.session_key()?;
         let parsed = parse_database_url(&raw_url)?;
         let encrypted = crypto::encrypt(key, raw_url.as_bytes())?;
-        self.storage.save_instance_secret(&name, &encrypted)?;
+        if let Some(current) = self.editing_instance.clone() {
+            self.storage.replace_instance(&current, &name, &encrypted)?;
+            if self.selected_instance.as_deref() == Some(current.as_str()) {
+                self.selected_instance = Some(name.clone());
+            }
+            self.editing_instance = None;
+            self.set_status(format!(
+                "Updated instance '{name}' ({}:{} / {})",
+                parsed.host, parsed.port, parsed.database
+            ));
+        } else {
+            self.storage.save_instance_secret(&name, &encrypted)?;
+            self.set_status(format!(
+                "Added instance '{name}' ({}:{} / {})",
+                parsed.host, parsed.port, parsed.database
+            ));
+        }
         self.instance_name_field.clear();
         self.instance_url_field.clear();
         self.load_instances()?;
         self.screen = Screen::ManageInstances;
-        self.set_status(format!(
-            "Added instance '{name}' ({}:{} / {})",
-            parsed.host, parsed.port, parsed.database
-        ));
+        Ok(())
+    }
+
+    pub fn begin_edit_instance(&mut self) -> Result<()> {
+        if self.instances.is_empty() {
+            return Ok(());
+        }
+        let name = self.selected_instance_in_mgmt();
+        let key = self.session_key()?.to_vec();
+        let secret = self
+            .storage
+            .load_instance_secret(&name)?
+            .context(format!("instance '{name}' not found"))?;
+        let plaintext = crypto::decrypt(&key, &secret.encrypted)?;
+        let url =
+            String::from_utf8(plaintext.to_vec()).context("stored base URI is not valid UTF-8")?;
+        self.instance_name_field.value = name.clone();
+        self.instance_name_field.cursor_pos = name.chars().count();
+        self.instance_url_field.value = url.clone();
+        self.instance_url_field.cursor_pos = url.chars().count();
+        self.editing_instance = Some(name);
+        self.screen = Screen::AddInstance;
+        self.focused_input = InputTarget::InstanceName;
         Ok(())
     }
 
@@ -1797,6 +1836,109 @@ mod tests {
         assert_eq!(
             String::from_utf8(plaintext.to_vec()).expect("utf8"),
             "postgresql://admin:pw@db.example.com:5432/postgres"
+        );
+    }
+
+    #[test]
+    fn add_instance_refuses_to_overwrite_an_existing_name() {
+        let (mut app, _dir) = initialized_app();
+        app.instance_name_field.value = "prod".to_owned();
+        app.instance_url_field.value =
+            "postgresql://admin:pw@db.example.com:5432/postgres".to_owned();
+        app.add_instance().expect("add");
+
+        app.screen = Screen::AddInstance;
+        app.instance_name_field.value = "prod".to_owned();
+        app.instance_url_field.value =
+            "postgresql://other:pw@other.example.com:5432/postgres".to_owned();
+        let err = app.add_instance().expect_err("duplicate name");
+        assert!(
+            err.to_string().contains("already exists"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(
+            app.screen,
+            Screen::AddInstance,
+            "a refused add stays on the form"
+        );
+
+        let secret = app
+            .storage
+            .load_instance_secret("prod")
+            .expect("load")
+            .expect("secret exists");
+        let plaintext =
+            crypto::decrypt(app.session_key().expect("key"), &secret.encrypted).expect("decrypt");
+        assert_eq!(
+            String::from_utf8(plaintext.to_vec()).expect("utf8"),
+            "postgresql://admin:pw@db.example.com:5432/postgres",
+            "the original base URI must stay in place"
+        );
+    }
+
+    #[test]
+    fn edit_instance_updates_url_and_refuses_a_taken_name() {
+        let (mut app, _dir) = initialized_app();
+        app.instance_name_field.value = "prod".to_owned();
+        app.instance_url_field.value =
+            "postgresql://admin:pw@db.example.com:5432/postgres".to_owned();
+        app.add_instance().expect("add prod");
+        app.instance_name_field.value = "staging".to_owned();
+        app.instance_url_field.value =
+            "postgresql://admin:pw@staging.example.com:5432/postgres".to_owned();
+        app.add_instance().expect("add staging");
+
+        app.selected_instance_idx = app
+            .instances
+            .iter()
+            .position(|name| name == "prod")
+            .expect("prod index");
+        app.begin_edit_instance().expect("begin edit");
+        assert_eq!(app.editing_instance.as_deref(), Some("prod"));
+        assert_eq!(
+            app.instance_url_field.value,
+            "postgresql://admin:pw@db.example.com:5432/postgres"
+        );
+        app.instance_name_field.value = "production".to_owned();
+        app.instance_url_field.value =
+            "postgresql://admin:new@db.example.com:5432/postgres".to_owned();
+        app.add_instance().expect("save edit");
+        assert!(app.editing_instance.is_none());
+        assert!(app.instances.contains(&"production".to_owned()));
+        assert!(!app.instances.contains(&"prod".to_owned()));
+
+        let secret = app
+            .storage
+            .load_instance_secret("production")
+            .expect("load")
+            .expect("renamed");
+        let plaintext =
+            crypto::decrypt(app.session_key().expect("key"), &secret.encrypted).expect("decrypt");
+        assert_eq!(
+            String::from_utf8(plaintext.to_vec()).expect("utf8"),
+            "postgresql://admin:new@db.example.com:5432/postgres"
+        );
+
+        app.selected_instance_idx = app
+            .instances
+            .iter()
+            .position(|name| name == "production")
+            .expect("production index");
+        app.begin_edit_instance().expect("begin edit again");
+        app.instance_name_field.value = "staging".to_owned();
+        let err = app.add_instance().expect_err("rename collision");
+        assert!(err.to_string().contains("already exists"));
+        assert!(
+            app.storage
+                .load_instance_secret("production")
+                .expect("load production")
+                .is_some()
+        );
+        assert!(
+            app.storage
+                .load_instance_secret("staging")
+                .expect("load staging")
+                .is_some()
         );
     }
 

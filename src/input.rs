@@ -621,10 +621,14 @@ fn handle_manage_instances(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Down => move_selection_if_nonempty(&mut app.selected_instance_idx, len, 1),
         KeyCode::Up => move_selection_if_nonempty(&mut app.selected_instance_idx, len, -1),
         KeyCode::Char('a') => {
+            app.editing_instance = None;
             app.instance_name_field.clear();
             app.instance_url_field.clear();
             app.screen = Screen::AddInstance;
             app.focused_input = InputTarget::InstanceName;
+        }
+        KeyCode::Char('e') if len > 0 => {
+            app.begin_edit_instance()?;
         }
         KeyCode::Enter => {
             if len > 0 {
@@ -673,6 +677,7 @@ fn handle_add_instance(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Esc => {
             app.instance_name_field.clear();
             app.instance_url_field.clear();
+            app.editing_instance = None;
             app.screen = Screen::ManageInstances;
         }
         KeyCode::Tab | KeyCode::Down | KeyCode::Up => {
