@@ -6,7 +6,8 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{FromRequestParts, Path, State},
-    http::{StatusCode, header},
+    http::{Request, StatusCode, header},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{delete, get, post, put},
 };
@@ -59,6 +60,24 @@ impl ApiError {
             status: StatusCode::NOT_FOUND,
             message: message.into(),
         }
+    }
+
+    fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: message.into(),
+        }
+    }
+}
+
+fn map_instance_write(error: anyhow::Error) -> ApiError {
+    let message = format!("{error:#}");
+    if message.contains("already exists") {
+        ApiError::conflict(message)
+    } else if message.contains("not found") {
+        ApiError::not_found(message)
+    } else {
+        ApiError::bad_request(message)
     }
 }
 
@@ -864,7 +883,8 @@ async fn post_rotate_instance(
     storage
         .lock()
         .unwrap()
-        .save_instance_secret(&name, &encrypted)?;
+        .update_instance_secret(&name, &encrypted)
+        .map_err(map_instance_write)?;
     Ok(Json(json!({
         "name": name,
         "connection_string": new_url,
@@ -951,12 +971,53 @@ async fn post_instances(
     let parsed = postgres::parse_database_url(&raw_url)?;
     let encrypted = crypto::encrypt(key.as_ref().as_slice(), raw_url.as_bytes())?;
     let storage = state.storage_for(&workspace)?;
-    storage
-        .lock()
-        .unwrap()
-        .save_instance_secret(&name, &encrypted)?;
+    let guard = storage.lock().unwrap();
+    if guard.load_instance_secret(&name)?.is_some() {
+        return Err(ApiError::conflict(format!(
+            "instance '{name}' already exists"
+        )));
+    }
+    guard
+        .save_instance_secret(&name, &encrypted)
+        .map_err(map_instance_write)?;
     Ok(Json(InstanceInfo {
         name,
+        host: parsed.host,
+        port: parsed.port,
+        database: parsed.database,
+    }))
+}
+
+async fn put_instance(
+    Session { key, workspace, .. }: Session,
+    State(state): State<Arc<WebState>>,
+    Path(current_name): Path<String>,
+    Json(req): Json<InstanceRequest>,
+) -> Result<Json<InstanceInfo>, ApiError> {
+    let new_name = req.name.trim().to_owned();
+    let raw_url = req.url.trim().to_owned();
+    if new_name.is_empty() {
+        return Err(ApiError::bad_request("instance name cannot be empty"));
+    }
+    if raw_url.is_empty() {
+        return Err(ApiError::bad_request("base DATABASE_URL cannot be empty"));
+    }
+    let parsed = postgres::parse_database_url(&raw_url)?;
+    let encrypted = crypto::encrypt(key.as_ref().as_slice(), raw_url.as_bytes())?;
+    {
+        let storage = state.storage_for(&workspace)?;
+        let mut storage = storage.lock().unwrap();
+        storage
+            .replace_instance(&current_name, &new_name, &encrypted)
+            .map_err(map_instance_write)?;
+    }
+    state
+        .health
+        .lock()
+        .unwrap()
+        .remove(&format!("instance:{current_name}"));
+    Ok(Json(InstanceInfo {
+        name: new_name,
         host: parsed.host,
         port: parsed.port,
         database: parsed.database,
@@ -1823,7 +1884,10 @@ pub fn router(state: Arc<WebState>) -> Router {
             get(get_instance_connection),
         )
         .route("/api/instances", post(post_instances))
-        .route("/api/instances/{name}", delete(delete_instance))
+        .route(
+            "/api/instances/{name}",
+            put(put_instance).delete(delete_instance),
+        )
         .route("/api/instances/{name}/health", post(post_instance_health))
         .route("/api/instances/{name}/rotate", post(post_rotate_instance))
         .route("/api/adopt", post(post_adopt))
@@ -1841,7 +1905,20 @@ pub fn router(state: Arc<WebState>) -> Router {
             "/api/operations/{id}",
             get(get_operation).delete(delete_operation),
         )
+        .layer(middleware::from_fn(no_store))
         .with_state(state)
+}
+
+/// The unlock screen and the workspace list must reflect the vault on disk.
+/// A cached empty response from the first request would hide workspaces that
+/// exist on the next load.
+async fn no_store(request: Request<Body>, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    response
 }
 
 #[cfg(test)]

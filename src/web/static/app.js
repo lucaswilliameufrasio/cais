@@ -246,16 +246,16 @@ async function boot() {
     await apiGet('/api/status');
   } catch (e) {
     setStatus('Falha ao consultar o servidor: ' + e.message);
+    await showUnlock();
     return;
   }
 
   if (token) {
-    try {
-      await loadDashboard();
+    const loaded = await loadDashboard();
+    if (loaded) {
       return;
-    } catch {
-      // Token inválido ou servidor reiniciado — cai no unlock abaixo.
     }
+    return;
   }
   await showUnlock();
 }
@@ -270,9 +270,11 @@ async function showUnlock() {
   exitNewWorkspaceMode();
   try {
     await refreshWorkspaces();
-  } catch {
+  } catch (e) {
     workspacesCache = [];
+    renderWorkspaceList();
     syncUnlockMode();
+    setStatus('Falha ao listar workspaces: ' + e.message);
   }
 }
 
@@ -329,7 +331,6 @@ function syncUnlockMode() {
   const info = selectedWorkspaceInfo();
   const needsInit = newWorkspaceMode || !info || !info.initialized;
   $('#field-confirm-wrap').classList.toggle('hidden', !needsInit);
-  $('#workspace-select-wrap').classList.toggle('hidden', newWorkspaceMode);
   $('#btn-new-workspace').classList.toggle('hidden', newWorkspaceMode);
   $('#btn-cancel-new-workspace').classList.toggle('hidden', !newWorkspaceMode);
   const submitLabel = needsInit ? 'Criar workspace' : 'Desbloquear';
@@ -448,13 +449,14 @@ async function loadDashboard(showOverlay = true) {
     dashboard = await apiGet('/api/dashboard');
   } catch (e) {
     hideLoading();
-    showView('view-unlock');
-    return;
+    await showUnlock();
+    return false;
   }
   hideLoading();
   showView('view-dashboard');
   renderDashboard();
   renderTotals();
+  return true;
 }
 
 function renderTotals() {
@@ -566,6 +568,7 @@ function instanceCard(inst) {
     el('div', { class: 'inst-actions' }, [
       el('button', { class: 'small ghost', type: 'button', onclick: stop(() => testInstance(inst.name)), text: 'Testar' }),
       el('button', { class: 'small ghost', type: 'button', onclick: stop(() => revealInstanceUrl(inst.name)), text: 'URL base' }),
+      el('button', { class: 'small ghost', type: 'button', onclick: stop(() => editInstance(inst)), text: 'Editar' }),
       el('button', { class: 'small ghost', type: 'button', onclick: stop(() => rotateInstance(inst.name)), text: 'Rotacionar' }),
       el('button', { class: 'small danger', type: 'button', onclick: stop(() => removeInstance(inst.name)), text: 'Remover' }),
     ]),
@@ -854,6 +857,60 @@ function showRotatedCredential(connectionString, title) {
   `);
   $('#rot-copy').addEventListener('click', () => copyText(connectionString));
   $('#rot-close').addEventListener('click', closeModal);
+}
+
+async function editInstance(inst) {
+  let currentUrl = '';
+  try {
+    const data = await apiGet('/api/connections/instance/' + encodeURIComponent(inst.name));
+    currentUrl = data.connection_string;
+  } catch (e) {
+    setStatus(e.message);
+    return;
+  }
+  openModal(`
+    <h2>Editar instância</h2>
+    <div class="form-grid">
+      <label>
+        Nome da instância
+        <input id="ei-name" type="text">
+      </label>
+      <label>
+        Base DATABASE_URL
+        <input id="ei-url" type="text">
+      </label>
+      <p class="hint">Alterar o nome mantém os bancos e usuários salvos nesta instância. Um nome já usado por outra instância é recusado.</p>
+      <div class="form-actions">
+        <button id="ei-cancel" class="ghost">Cancelar</button>
+        <button id="ei-save" class="primary">Salvar</button>
+      </div>
+    </div>
+  `);
+  $('#ei-name').value = inst.name;
+  $('#ei-url').value = currentUrl;
+  $('#ei-save').addEventListener('click', async () => {
+    const name = $('#ei-name').value.trim();
+    const url = $('#ei-url').value.trim();
+    if (!name || !url) {
+      setStatus('Preencha nome e URL.');
+      return;
+    }
+    try {
+      const info = await apiPut('/api/instances/' + encodeURIComponent(inst.name), { name, url });
+      if (expandedInstance === inst.name) {
+        expandedInstance = info.name;
+      }
+      closeModal();
+      const loaded = await loadDashboard();
+      if (loaded) {
+        setStatus(`Instância '${info.name}' atualizada (${info.host}:${info.port} / ${info.database}).`);
+      }
+    } catch (e) {
+      setStatus(e.message);
+    }
+  });
+  $('#ei-cancel').addEventListener('click', closeModal);
+  $('#ei-name').focus();
 }
 
 async function revealInstanceUrl(name) {

@@ -26,27 +26,31 @@ pub fn serve(host: &str, port: u16, open_browser: bool) -> Result<()> {
         .with_context(|| format!("invalid bind address '{host}:{port}'"))?;
     let url = format!("http://{addr}");
 
-    println!("cais web UI listening on {url}");
-    if host == "0.0.0.0" {
-        println!(
-            "WARNING: binding to all interfaces. Anyone who can reach this port and knows the \
-             master password can unlock the vault."
-        );
-    } else {
-        println!("Bound to localhost only. Secrets are decrypted in memory while the server runs.");
-    }
-
-    if open_browser {
-        open_in_browser(&url);
-    }
-
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("failed to build tokio runtime")?;
 
     runtime.block_on(async {
-        let listener = tokio::net::TcpListener::bind(addr).await?;
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("failed to bind {url}"))?;
+        // Bind before opening the browser. Opening first makes the initial
+        // page load fail, and that load is the one that should list workspaces.
+        println!("cais web UI listening on {url}");
+        if host == "0.0.0.0" {
+            println!(
+                "WARNING: binding to all interfaces. Anyone who can reach this port and knows the \
+                 master password can unlock the vault."
+            );
+        } else {
+            println!(
+                "Bound to localhost only. Secrets are decrypted in memory while the server runs."
+            );
+        }
+        if open_browser {
+            open_in_browser(&url);
+        }
         axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_signal(state.clone()))
             .await?;

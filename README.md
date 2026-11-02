@@ -77,7 +77,7 @@ What you can do in the browser:
 - **Migrate** a database between instances
 - **Backup** a database or an entire instance (select databases, include globals/passwords)
 - **Restore** from an encrypted backup, with a preview of instance bundles (`DBP2`)
-- Manage instances (add, rotate base credential, remove with its catalog entries) and saved connections (view/copy/rename/delete)
+- Manage instances (add, edit name and base URL, rotate base credential, remove with its catalog entries) and saved connections (view/copy/rename/delete). Adding an instance refuses a name that is already registered.
 
 ## Headless Backup and Restore
 
@@ -285,6 +285,7 @@ Backups are saved to `backups/{db_name}_{timestamp}.pgdump.enc`.
 |-----|--------|
 | `Enter` | Select/deselect current instance |
 | `a` | Add a new instance |
+| `e` | Edit the selected instance name and base URL |
 | `Delete` | Delete instance (confirm with `y`) |
 
 ### Settings / Change Password
