@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.1] - 2026-11-03
+
+### Chores
+
+- Pin Rust 1.99.1 and upgrade dependencies
 ## [0.4.0] - 2026-11-03
 
 ### Bug Fixes
@@ -21,17 +26,21 @@ All notable changes to this project will be documented in this file.
 - Bump rusqlite from 0.40.2 to 0.41.0
 - Bump argon2 from 0.5.3 to 0.6.0
 - Bump base64 from 0.22.1 to 0.23.1
+- Prepare for v0.4.0
 
 ### Features
 
 - Reshape the tui and web around daily use
-
 ## [0.3.0] - 2026-09-27
 
 ### Bug Fixes
 
 - Report Docker image pull failures
 - Verify backups match discovered servers
+
+### Chores
+
+- Prepare for v0.3.0
 
 ### Features
 
