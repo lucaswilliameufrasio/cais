@@ -6,11 +6,9 @@ NEXTEST_THREADS := 4
 all: format lint build test
 
 setup:
-	@echo "==> Verifying Rust toolchain..."
-	@command -v rustup >/dev/null 2>&1 || { echo "error: rustup not found. Install from https://rustup.rs/"; exit 1; }
-	@rustup toolchain list | grep -q stable || rustup toolchain install stable
-	@echo "==> Installing rustfmt and clippy..."
-	rustup component add rustfmt clippy 2>/dev/null; true
+	@echo "==> Installing the Rust toolchain pinned in mise.toml..."
+	@command -v mise >/dev/null 2>&1 || { echo "error: mise not found. Install from https://mise.jdx.dev/"; exit 1; }
+	mise install
 	@echo "==> Installing cargo-nextest..."
 	@command -v cargo-nextest >/dev/null 2>&1 || cargo install cargo-nextest --locked
 	@echo "==> Installing cargo-llvm-cov..."

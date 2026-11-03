@@ -21,6 +21,12 @@ Secrets are encrypted with AES-256-GCM (Argon2id key derivation) and stored in a
 
 ## Prerequisites
 
+Rust 1.99.1 is pinned in `mise.toml`. From the repository root:
+
+```bash
+mise install
+```
+
 ### PostgreSQL client tools (optional)
 
 One of:
