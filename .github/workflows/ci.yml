@@ -53,6 +53,10 @@ jobs:
           - macos-latest
           - windows-latest
     steps:
+      - uses: actions/checkout@v7
+
+      - uses: jdx/mise-action@6be3c7ed4c21d4f76b208d351d95aac273ebb76d # v5.2.4
+
       - name: Set temp directory on Windows
         if: ${{ runner.os == 'Windows' }}
         run: |
@@ -60,10 +64,6 @@ jobs:
           echo "TEMP=D:\a\_temp" >> $GITHUB_ENV
           echo "TMP=D:\a\_temp" >> $GITHUB_ENV
         shell: bash
-
-      - uses: actions/checkout@v7
-
-      - uses: jdx/mise-action@6be3c7ed4c21d4f76b208d351d95aac273ebb76d # v5.2.4
 
       - uses: Swatinem/rust-cache@v2
 
