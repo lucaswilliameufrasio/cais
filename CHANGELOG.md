@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] - 2026-11-03
+
+### Bug Fixes
+
+- Edit instances and list workspaces on first serve
+
+### CI / Build
+
+- Correct download-artifact version comment
+
+### Chores
+
+- Refresh compatible Rust dependencies
+- Bump actions/checkout from 4 to 7
+- Bump actions/upload-artifact from 4 to 7
+- Bump actions/download-artifact from 4.1.9 to 8.0.2
+- Bump rusqlite from 0.40.2 to 0.41.0
+- Bump argon2 from 0.5.3 to 0.6.0
+- Bump base64 from 0.22.1 to 0.23.1
+
+### Features
+
+- Reshape the tui and web around daily use
+
 ## [0.3.0] - 2026-09-27
 
 ### Bug Fixes
