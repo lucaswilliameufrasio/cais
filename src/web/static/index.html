@@ -3,136 +3,150 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#141816">
 <title>cais — gestão de bancos</title>
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
+<a class="skip" href="#main">Ir para o conteúdo</a>
 <div id="app">
 
-  <section id="view-unlock" class="view hidden">
+  <section id="view-unlock" class="view gate">
     <form id="unlock-form" class="auth-box">
-      <h1>cais</h1>
-      <p id="unlock-subtitle">Digite a senha mestra para desbloquear o cofre.</p>
+      <p class="mark">cais</p>
+      <h1>Abrir o cofre</h1>
+      <p id="unlock-subtitle">A senha mestra abre este workspace. As conexões continuam criptografadas no disco.</p>
       <div id="workspace-select-wrap">
-        <label>
-          Workspace
-          <div class="workspace-picker">
-            <input id="field-workspace-filter" type="search" placeholder="Buscar workspace..." autocomplete="off">
-            <div id="workspace-list" class="workspace-list"></div>
-          </div>
-        </label>
+        <label for="field-workspace-filter">Workspace</label>
+        <div class="workspace-picker">
+          <input id="field-workspace-filter" name="workspace-filter" type="search" placeholder="Buscar workspace…" autocomplete="off" spellcheck="false">
+          <div id="workspace-list" class="workspace-list" role="listbox" aria-label="Workspaces"></div>
+        </div>
         <div class="workspace-actions">
-          <button type="button" id="btn-new-workspace" class="ghost small">+ Novo workspace</button>
+          <button type="button" id="btn-new-workspace" class="ghost small">Novo workspace</button>
           <button type="button" id="btn-remove-workspace" class="danger small">Remover selecionado</button>
         </div>
       </div>
-      <label id="field-new-workspace-wrap" class="hidden">
-        Nome do novo workspace
+      <div id="field-new-workspace-wrap" class="hidden">
+        <label for="field-new-workspace">Nome do novo workspace</label>
         <div class="workspace-row">
-          <input id="field-new-workspace" type="text" placeholder="ex.: pessoal" autocomplete="off">
+          <input id="field-new-workspace" name="new-workspace" type="text" placeholder="ex.: pessoal" autocomplete="off" spellcheck="false">
           <button type="button" id="btn-cancel-new-workspace" class="ghost small hidden">Cancelar</button>
         </div>
-      </label>
-      <label>
-        Senha mestra
-        <input id="field-password" type="password" autocomplete="current-password">
-      </label>
-      <label id="field-confirm-wrap" class="hidden">
-        Confirmar senha
-        <input id="field-confirm" type="password" autocomplete="new-password">
-      </label>
-      <button type="submit" id="unlock-submit">Desbloquear</button>
-      <p id="unlock-error" class="error hidden"></p>
+      </div>
+      <label for="field-password">Senha mestra</label>
+      <input id="field-password" name="password" type="password" autocomplete="current-password">
+      <div id="field-confirm-wrap" class="hidden">
+        <label for="field-confirm">Confirmar senha</label>
+        <input id="field-confirm" name="confirm-password" type="password" autocomplete="new-password">
+      </div>
+      <button type="submit" id="unlock-submit" class="primary">Desbloquear</button>
+      <p id="unlock-error" class="error hidden" role="alert"></p>
     </form>
   </section>
 
-  <section id="view-dashboard" class="view hidden">
-    <header class="topbar">
-      <h1>cais</h1>
-      <div class="topbar-actions">
-        <button id="btn-migrate" class="ghost">Migrar</button>
-        <button id="btn-backup" class="ghost">Backup</button>
-        <button id="btn-restore" class="ghost">Restaurar</button>
-        <button id="btn-backups" class="ghost">Backups</button>
-        <button id="btn-add-instance" class="primary">+ Instância</button>
-        <button id="btn-lock" class="danger">Bloquear</button>
+  <div id="shell" class="shell hidden">
+    <aside class="rail">
+      <div class="brand">
+        <p class="mark">cais</p>
+        <p id="rail-workspace" class="rail-workspace" translate="no"></p>
       </div>
-    </header>
-    <p id="status-bar" class="status"></p>
-    <p id="totals" class="totals"></p>
-    <div class="inst-toolbar">
-      <input id="instance-filter" type="search" placeholder="Filtrar por nome da instância ou host..." autocomplete="off">
-      <div id="inst-pagination" class="pagination"></div>
-    </div>
-    <div id="instance-cards" class="cards"></div>
-  </section>
+      <nav aria-label="Seções">
+        <button type="button" id="nav-instances" class="nav current" aria-current="page">Instâncias</button>
+        <button type="button" id="nav-query" class="nav">Consultar</button>
+        <button type="button" id="btn-backups" class="nav">Backups</button>
+      </nav>
+      <button type="button" id="btn-lock" class="nav danger">Bloquear cofre</button>
+    </aside>
 
-  <section id="view-backups" class="view hidden">
-    <header class="topbar">
-      <button id="back-to-dashboard" class="ghost">&larr; Dashboard</button>
-      <h1>Backups</h1>
-      <div class="topbar-actions">
-        <button id="btn-refresh-backups" class="ghost">Atualizar</button>
-      </div>
-    </header>
-    <p id="status-bar" class="status"></p>
-    <table class="table">
-      <thead>
-        <tr><th>Arquivo</th><th>Tamanho</th><th>Modificado</th><th></th></tr>
-      </thead>
-      <tbody id="backups-tbody"></tbody>
-    </table>
-    <p id="backups-empty" class="empty hidden">Nenhum backup encontrado.</p>
-  </section>
+    <div class="stage">
+      <header class="stage-bar">
+        <h1 id="stage-title">Instâncias</h1>
+      </header>
+      <main id="main">
+        <section id="view-dashboard" class="view hidden">
+          <div class="stage-actions">
+            <button type="button" id="btn-add-instance" class="primary">Nova instância</button>
+            <button type="button" id="btn-migrate" class="ghost">Migrar</button>
+            <button type="button" id="btn-backup" class="ghost">Backup</button>
+            <button type="button" id="btn-restore" class="ghost">Restaurar</button>
+          </div>
+          <p id="totals" class="totals"></p>
+          <div class="inst-toolbar">
+            <label class="sr" for="instance-filter">Filtrar instâncias</label>
+            <input id="instance-filter" name="instance-filter" type="search" placeholder="Filtrar por nome ou host…" autocomplete="off" spellcheck="false">
+            <div id="inst-pagination" class="pagination"></div>
+          </div>
+          <div id="instance-cards" class="cards"></div>
+        </section>
 
-  <section id="view-query" class="view hidden">
-    <header class="topbar">
-      <button id="query-back" class="ghost">&larr; Dashboard</button>
-      <h1>Consultar</h1>
-      <div class="topbar-actions">
-        <select id="query-instance" title="Instância"></select>
-        <select id="query-source" title="Conexão"></select>
-      </div>
-    </header>
-    <p id="status-bar" class="status"></p>
-    <div class="query-layout">
-      <aside class="query-sidebar">
-        <input id="query-table-filter" type="search" placeholder="Filtrar tabelas..." autocomplete="off">
-        <div id="query-tables" class="query-tables"></div>
-      </aside>
-      <div class="query-main">
-        <div class="query-tabs">
-          <button id="tab-data" class="ghost active" type="button">Data</button>
-          <button id="tab-sql" class="ghost" type="button">SQL</button>
-        </div>
-        <div id="query-data-pane" class="query-pane">
-          <p id="query-data-title" class="hint">Selecione uma tabela na lateral.</p>
-          <div id="query-data-wrap" class="query-grid-wrap">
-            <table class="table" id="query-data-table"></table>
+        <section id="view-backups" class="view hidden">
+          <div class="page-tools">
+            <button id="back-to-dashboard" class="ghost" type="button">Instâncias</button>
+            <button id="btn-refresh-backups" class="ghost" type="button">Atualizar</button>
           </div>
-        </div>
-        <div id="query-sql-pane" class="query-pane hidden">
-          <textarea id="query-sql-input" class="mono" rows="6" placeholder="SELECT ..."></textarea>
-          <div class="query-sql-actions">
-            <label class="check-row">
-              <input id="query-read-only" type="checkbox" checked>
-              <span>Somente leitura</span>
-            </label>
-            <button id="query-run" class="primary" type="button">Executar (Ctrl+Enter)</button>
+          <table class="table">
+            <thead>
+              <tr><th>Arquivo</th><th>Tamanho</th><th>Modificado</th><th>Ações</th></tr>
+            </thead>
+            <tbody id="backups-tbody"></tbody>
+          </table>
+          <p id="backups-empty" class="empty hidden">Nenhum backup neste workspace. Faça um backup de uma instância para criar o primeiro arquivo.</p>
+        </section>
+
+        <section id="view-query" class="view hidden">
+          <div class="page-tools">
+            <button id="query-back" class="ghost" type="button">Instâncias</button>
+            <label class="field-label" for="query-instance">Instância</label>
+            <select id="query-instance" name="query-instance"></select>
+            <label class="field-label" for="query-source">Conexão</label>
+            <select id="query-source" name="query-source"></select>
           </div>
-          <p id="query-sql-status" class="query-status"></p>
-          <div id="query-result-wrap" class="query-grid-wrap">
-            <table class="table" id="query-result-table"></table>
+          <div class="query-layout">
+            <aside class="query-sidebar">
+              <label class="sr" for="query-table-filter">Filtrar tabelas</label>
+              <input id="query-table-filter" name="query-table-filter" type="search" placeholder="Filtrar tabelas…" autocomplete="off" spellcheck="false">
+              <div id="query-tables" class="query-tables"></div>
+            </aside>
+            <div class="query-main">
+              <div class="query-tabs" role="tablist">
+                <button id="tab-data" class="ghost active" type="button" role="tab" aria-selected="true">Dados</button>
+                <button id="tab-sql" class="ghost" type="button" role="tab" aria-selected="false">SQL</button>
+              </div>
+              <div id="query-data-pane" class="query-pane">
+                <p id="query-data-title" class="hint">Escolha uma tabela na lista.</p>
+                <div id="query-data-wrap" class="query-grid-wrap">
+                  <table class="table" id="query-data-table"></table>
+                </div>
+              </div>
+              <div id="query-sql-pane" class="query-pane hidden">
+                <label class="sr" for="query-sql-input">SQL</label>
+                <textarea id="query-sql-input" class="mono" name="sql" rows="6" placeholder="SELECT …" spellcheck="false" autocomplete="off"></textarea>
+                <div class="query-sql-actions">
+                  <label class="check-row">
+                    <input id="query-read-only" name="read-only" type="checkbox" checked>
+                    <span>Somente leitura</span>
+                  </label>
+                  <button id="query-run" class="primary" type="button">Executar</button>
+                </div>
+                <p id="query-sql-status" class="query-status" role="status"></p>
+                <div id="query-result-wrap" class="query-grid-wrap">
+                  <table class="table" id="query-result-table"></table>
+                </div>
+              </div>
+            </div>
           </div>
-        </div>
-      </div>
+        </section>
+      </main>
     </div>
-  </section>
+  </div>
+
+  <p id="status-bar" class="status-dock" role="status" aria-live="polite"></p>
 
   <div id="modal-overlay" class="overlay hidden">
-    <div id="modal" class="modal">
-      <button id="modal-close" class="close" aria-label="Fechar">&times;</button>
+    <div id="modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <button id="modal-close" class="close" type="button">Fechar</button>
       <div id="modal-body"></div>
     </div>
   </div>
@@ -140,7 +154,7 @@
   <div id="loading-overlay" class="overlay hidden" aria-live="polite">
     <div class="loading-box">
       <span class="spinner" aria-hidden="true"></span>
-      <span id="loading-text">Carregando...</span>
+      <span id="loading-text">Carregando…</span>
     </div>
   </div>
 

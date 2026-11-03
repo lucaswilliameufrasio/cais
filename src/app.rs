@@ -60,32 +60,74 @@ pub enum HomeItem {
 
 impl HomeItem {
     pub const ALL: [HomeItem; 11] = [
+        HomeItem::Instances,
+        HomeItem::ViewSavedConnections,
+        HomeItem::ConnectionWizard,
         HomeItem::ProvisionFull,
         HomeItem::MigrateDatabase,
         HomeItem::BackupDatabase,
         HomeItem::RestoreDatabase,
         HomeItem::ManageBackups,
-        HomeItem::Instances,
-        HomeItem::ConnectionWizard,
         HomeItem::About,
-        HomeItem::ViewSavedConnections,
         HomeItem::Settings,
         HomeItem::Quit,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
-            HomeItem::ProvisionFull => "Provision full (database + extra user)",
+            HomeItem::ProvisionFull => "Provision database",
             HomeItem::MigrateDatabase => "Migrate database",
             HomeItem::BackupDatabase => "Backup database",
             HomeItem::RestoreDatabase => "Restore database",
-            HomeItem::ManageBackups => "Manage backups",
-            HomeItem::Instances => "Manage instances",
-            HomeItem::ConnectionWizard => "Connection wizard (URL builder)",
+            HomeItem::ManageBackups => "Backup files",
+            HomeItem::Instances => "Instances",
+            HomeItem::ConnectionWizard => "Connection wizard",
             HomeItem::About => "About",
-            HomeItem::ViewSavedConnections => "View saved connections",
+            HomeItem::ViewSavedConnections => "Saved connections",
             HomeItem::Settings => "Settings",
             HomeItem::Quit => "Quit",
+        }
+    }
+
+    pub fn section(self) -> &'static str {
+        match self {
+            HomeItem::ProvisionFull | HomeItem::MigrateDatabase => "Operate",
+            HomeItem::BackupDatabase | HomeItem::RestoreDatabase | HomeItem::ManageBackups => {
+                "Protect"
+            }
+            HomeItem::Instances | HomeItem::ConnectionWizard | HomeItem::ViewSavedConnections => {
+                "Catalog"
+            }
+            HomeItem::About | HomeItem::Settings => "Account",
+            HomeItem::Quit => "Leave",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            HomeItem::ProvisionFull => {
+                "Creates the database, its owner role, and an optional application user on the selected instance."
+            }
+            HomeItem::MigrateDatabase => {
+                "Copies a saved database onto another instance and stores the new connection."
+            }
+            HomeItem::BackupDatabase => "Writes an encrypted dump of the databases you choose.",
+            HomeItem::RestoreDatabase => {
+                "Restores an encrypted dump onto an instance. Databases that already exist can be skipped."
+            }
+            HomeItem::ManageBackups => "Lists dump files on disk. Restore or delete one from here.",
+            HomeItem::Instances => {
+                "Registers a PostgreSQL instance by name and base URL. Edit, rotate, or remove it here."
+            }
+            HomeItem::ConnectionWizard => {
+                "Builds a base URL from host, port, user, and database, then saves the instance."
+            }
+            HomeItem::About => "Version, storage path, and which pg_dump this app will call.",
+            HomeItem::ViewSavedConnections => {
+                "Every connection in the vault. Search, reveal, rename, or check health."
+            }
+            HomeItem::Settings => "Changes the master password and re-encrypts the vault.",
+            HomeItem::Quit => "Leaves cais. The vault stays encrypted on disk.",
         }
     }
 }
@@ -586,7 +628,7 @@ impl App {
 
     pub fn load_full_base_uri(&mut self) -> Result<()> {
         let Some(instance_name) = &self.selected_instance else {
-            self.set_status("No instance selected. Choose one from Manage instances first.");
+            self.set_status("No instance selected. Open Instances and press Enter.");
             return Ok(());
         };
         let Some(secret) = self.storage.load_instance_secret(instance_name)? else {
@@ -1762,6 +1804,18 @@ mod tests {
         app.first_run_confirm.value = "master-pass".to_owned();
         app.start_first_run().expect("first run");
         (app, dir)
+    }
+
+    #[test]
+    fn home_menu_starts_at_instances_and_ends_at_quit() {
+        let (app, _dir) = temp_app();
+        assert_eq!(app.selected_home_item(), HomeItem::Instances);
+        assert_eq!(
+            HomeItem::ALL[HomeItem::ALL.len() - 1],
+            HomeItem::Quit,
+            "quit stays last so it is not adjacent to routine work"
+        );
+        assert_eq!(HomeItem::Instances.label(), "Instances");
     }
 
     #[test]

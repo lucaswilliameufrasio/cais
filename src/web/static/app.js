@@ -111,6 +111,39 @@ function showView(id) {
   if (view) {
     view.classList.remove('hidden');
   }
+  const shell = document.getElementById('shell');
+  if (shell) {
+    shell.classList.toggle('hidden', id === 'view-unlock');
+  }
+  const titles = {
+    'view-dashboard': 'Instâncias',
+    'view-backups': 'Backups',
+    'view-query': 'Consultar',
+  };
+  const title = document.getElementById('stage-title');
+  if (title && titles[id]) {
+    title.textContent = titles[id];
+  }
+  document.querySelectorAll('.nav').forEach((button) => {
+    button.classList.remove('current');
+    button.removeAttribute('aria-current');
+  });
+  const currentId = {
+    'view-dashboard': 'nav-instances',
+    'view-backups': 'btn-backups',
+    'view-query': 'nav-query',
+  }[id];
+  if (currentId) {
+    const current = document.getElementById(currentId);
+    if (current) {
+      current.classList.add('current');
+      current.setAttribute('aria-current', 'page');
+    }
+  }
+  const workspace = document.getElementById('rail-workspace');
+  if (workspace) {
+    workspace.textContent = localStorage.getItem('cais_workspace') || '';
+  }
 }
 
 function setStatus(msg) {
@@ -118,7 +151,7 @@ function setStatus(msg) {
   bars.forEach((b) => { b.textContent = msg || ''; });
 }
 
-function showLoading(msg = 'Carregando...') {
+function showLoading(msg = 'Carregando…') {
   $('#loading-text').textContent = msg;
   $('#loading-overlay').classList.remove('hidden');
 }
@@ -147,13 +180,35 @@ const opPollTimers = new Set();
 // AbortController of the health check currently shown in the modal. Closing
 // the modal (X, overlay, Esc or the Cancel button) aborts it.
 let activeHealthCheck = null;
+let modalReturnFocus = null;
+
+function modalFocusables() {
+  const nodes = $('#modal').querySelectorAll('button, input, select, textarea');
+  const usable = [];
+  for (const node of nodes) {
+    if (node.disabled || node.closest('.hidden')) {
+      continue;
+    }
+    usable.push(node);
+  }
+  return usable;
+}
 
 function openModal(html) {
+  if ($('#modal-overlay').classList.contains('hidden')) {
+    modalReturnFocus = document.activeElement;
+  }
   $('#modal-body').innerHTML = html;
+  const heading = $('#modal-body').querySelector('h2');
+  if (heading) {
+    heading.id = 'modal-title';
+  }
   $('#modal-overlay').classList.remove('hidden');
-  const firstInput = $('#modal-body input, #modal-body select');
-  if (firstInput) {
-    firstInput.focus();
+  const firstField = $('#modal-body').querySelector('input, select, textarea');
+  if (firstField) {
+    firstField.focus();
+  } else {
+    $('#modal-close').focus();
   }
 }
 
@@ -166,6 +221,11 @@ function closeModal() {
   }
   $('#modal-overlay').classList.add('hidden');
   $('#modal-body').innerHTML = '';
+  const back = modalReturnFocus;
+  modalReturnFocus = null;
+  if (back && document.contains(back) && typeof back.focus === 'function') {
+    back.focus();
+  }
 }
 
 function confirmModal(title, message, confirmLabel = 'Confirmar') {
@@ -180,6 +240,7 @@ function confirmModal(title, message, confirmLabel = 'Confirmar') {
     `);
     $('#cm-ok').addEventListener('click', () => { closeModal(); resolve(true); });
     $('#cm-cancel').addEventListener('click', () => { closeModal(); resolve(false); });
+    $('#cm-cancel').focus();
   });
 }
 
@@ -267,7 +328,8 @@ async function showUnlock() {
   $('#field-confirm').value = '';
   $('#field-new-workspace').value = '';
   $('#unlock-error').classList.add('hidden');
-  exitNewWorkspaceMode();
+  newWorkspaceMode = false;
+  $('#field-new-workspace-wrap').classList.add('hidden');
   try {
     await refreshWorkspaces();
   } catch (e) {
@@ -335,6 +397,7 @@ function syncUnlockMode() {
   $('#btn-cancel-new-workspace').classList.toggle('hidden', !newWorkspaceMode);
   const submitLabel = needsInit ? 'Criar workspace' : 'Desbloquear';
   $('#unlock-submit').textContent = submitLabel;
+  $('#btn-remove-workspace').disabled = newWorkspaceMode || !selectedWorkspace;
   $('#unlock-subtitle').textContent = newWorkspaceMode
     ? 'Novo workspace: escolha um nome e crie a senha mestra dele.'
     : needsInit
@@ -397,7 +460,7 @@ $('#unlock-form').addEventListener('submit', async (e) => {
   errEl.classList.add('hidden');
   submitBtn.disabled = true;
   const originalLabel = submitBtn.textContent;
-  submitBtn.textContent = needsInit ? 'Criando workspace...' : 'Desbloqueando...';
+  submitBtn.textContent = needsInit ? 'Criando workspace…' : 'Desbloqueando…';
   try {
     let tokenResp;
     if (needsInit) {
@@ -443,7 +506,7 @@ function lockLocal() {
 
 async function loadDashboard(showOverlay = true) {
   if (showOverlay) {
-    showLoading('Carregando painel...');
+    showLoading('Carregando painel…');
   }
   try {
     dashboard = await apiGet('/api/dashboard');
@@ -459,10 +522,14 @@ async function loadDashboard(showOverlay = true) {
   return true;
 }
 
+function countPhrase(count, one, many) {
+  return `${count} ${count === 1 ? one : many}`;
+}
+
 function renderTotals() {
   const t = dashboard.totals;
   $('#totals').textContent =
-    `${t.databases} banco(s) e ${t.extra_users} usuário(s) extra(s) em ${dashboard.instances.length} instância(s).`;
+    `${countPhrase(t.databases, 'banco', 'bancos')} e ${countPhrase(t.extra_users, 'usuário extra', 'usuários extras')} em ${countPhrase(dashboard.instances.length, 'instância', 'instâncias')}.`;
 }
 
 function healthBadge(health) {
@@ -470,7 +537,7 @@ function healthBadge(health) {
   const label = {
     ok: health && health.latency_ms != null ? `OK ${health.latency_ms}ms` : 'OK',
     error: 'ERRO',
-    checking: 'Verificando...',
+    checking: 'Verificando…',
     unknown: 'Desconhecido',
   }[status] || 'Desconhecido';
   return el('span', { class: 'health ' + status, text: label });
@@ -499,7 +566,7 @@ function renderInstanceList() {
   const container = $('#instance-cards');
   container.innerHTML = '';
   if (!dashboard.instances.length) {
-    container.appendChild(el('p', { class: 'empty', text: 'Nenhuma instância. Clique em "+ Instância" para começar.' }));
+    container.appendChild(el('p', { class: 'empty', text: 'Nenhuma instância neste workspace. Use Nova instância para registrar a URL base de um PostgreSQL.' }));
     return;
   }
   const instances = filteredInstances();
@@ -533,15 +600,17 @@ function renderPagination() {
   box.appendChild(el('button', {
     class: 'small ghost',
     type: 'button',
-    text: '←',
+    text: 'Anterior',
+    'aria-label': 'Página anterior',
     disabled: instancePage <= 1 ? 'disabled' : null,
     onclick: () => goto(instancePage - 1),
   }));
-  box.appendChild(el('span', { class: 'page-info', text: `Página ${instancePage} de ${pageCount} · ${total} instância(s)` }));
+  box.appendChild(el('span', { class: 'page-info', text: `Página ${instancePage} de ${pageCount} · ${total} instâncias` }));
   box.appendChild(el('button', {
     class: 'small ghost',
     type: 'button',
-    text: '→',
+    text: 'Próxima',
+    'aria-label': 'Próxima página',
     disabled: instancePage >= pageCount ? 'disabled' : null,
     onclick: () => goto(instancePage + 1),
   }));
@@ -556,62 +625,70 @@ function instanceCard(inst) {
   const expanded = expandedInstance === inst.name;
   const dbCount = inst.databases.filter((d) => d.kind === 'db').length;
   const userCount = inst.databases.filter((d) => d.kind === 'user').length;
-  const summary = `${dbCount} banco(s) · ${userCount} usuário(s) extra(s)`;
+  const summary = `${countPhrase(dbCount, 'banco', 'bancos')} · ${countPhrase(userCount, 'usuário extra', 'usuários extras')}`;
 
-  const stop = (fn) => (e) => { e.stopPropagation(); fn(); };
-  const head = el('div', { class: 'card-head clickable', onclick: () => toggleInstance(inst.name) }, [
-    el('span', { class: 'caret', text: expanded ? '▾' : '▸' }),
-    el('span', { class: 'inst-name', text: inst.name }),
-    healthBadge(inst.health),
-    el('span', { class: 'inst-summary', text: summary }),
-    el('span', { class: 'inst-host', text: hostLabel(inst) }),
-    el('div', { class: 'inst-actions' }, [
-      el('button', { class: 'small ghost', type: 'button', onclick: stop(() => testInstance(inst.name)), text: 'Testar' }),
-      el('button', { class: 'small ghost', type: 'button', onclick: stop(() => revealInstanceUrl(inst.name)), text: 'URL base' }),
-      el('button', { class: 'small ghost', type: 'button', onclick: stop(() => editInstance(inst)), text: 'Editar' }),
-      el('button', { class: 'small ghost', type: 'button', onclick: stop(() => rotateInstance(inst.name)), text: 'Rotacionar' }),
-      el('button', { class: 'small danger', type: 'button', onclick: stop(() => removeInstance(inst.name)), text: 'Remover' }),
+  const head = el('div', { class: 'card-head' }, [
+    el('button', {
+      class: 'inst-toggle',
+      type: 'button',
+      'aria-expanded': expanded ? 'true' : 'false',
+      onclick: () => toggleInstance(inst.name),
+    }, [
+      el('span', { class: 'inst-name', text: inst.name }),
+      healthBadge(inst.health),
+      el('span', { class: 'inst-summary', text: summary }),
+      el('span', { class: 'inst-host', text: hostLabel(inst) }),
     ]),
   ]);
 
   const children = [head];
   if (expanded) {
-    const tbody = el('tbody');
-    for (const db of inst.databases) {
-      tbody.appendChild(dbRow(inst.name, db));
-    }
-    const table = el('table', {}, [
-      el('thead', {}, [
-        el('tr', {}, [
-          el('th', { text: 'Banco' }), el('th', { text: 'Aplicação' }),
-          el('th', { text: 'Role' }), el('th', { text: '' }),
-        ]),
-      ]),
-      tbody,
-    ]);
-
-    // Filters the rows directly in the DOM so the input never loses focus.
-    const dbFilter = el('input', {
-      class: 'db-filter',
-      type: 'search',
-      placeholder: 'Filtrar bancos por nome, aplicação ou role...',
-      autocomplete: 'off',
-    });
-    dbFilter.addEventListener('input', () => {
-      const query = dbFilter.value.trim().toLowerCase();
-      for (const row of tbody.rows) {
-        const match = !query || row.textContent.toLowerCase().includes(query);
-        row.style.display = match ? '' : 'none';
+    if (!inst.databases.length) {
+      children.push(el('p', {
+        class: 'empty',
+        text: 'Nenhum banco catalogado. Provisione um banco novo ou adicione um que já existe nesta instância.',
+      }));
+    } else {
+      const tbody = el('tbody');
+      for (const db of inst.databases) {
+        tbody.appendChild(dbRow(inst.name, db));
       }
-    });
+      const table = el('table', {}, [
+        el('thead', {}, [
+          el('tr', {}, [
+            el('th', { text: 'Banco' }), el('th', { text: 'Aplicação' }),
+            el('th', { text: 'Role' }), el('th', { text: '' }),
+          ]),
+        ]),
+        tbody,
+      ]);
+      const dbFilter = el('input', {
+        class: 'db-filter',
+        type: 'search',
+        placeholder: 'Filtrar bancos por nome, aplicação ou role…',
+        autocomplete: 'off',
+        'aria-label': 'Filtrar bancos',
+      });
+      dbFilter.addEventListener('input', () => {
+        const query = dbFilter.value.trim().toLowerCase();
+        for (const row of tbody.rows) {
+          const match = !query || row.textContent.toLowerCase().includes(query);
+          row.style.display = match ? '' : 'none';
+        }
+      });
+      children.push(dbFilter, table);
+    }
 
-    const foot = el('div', { class: 'card-foot' }, [
+    children.push(el('div', { class: 'card-foot' }, [
+      el('button', { class: 'small ghost', type: 'button', onclick: () => testInstance(inst.name), text: 'Testar' }),
+      el('button', { class: 'small ghost', type: 'button', onclick: () => revealInstanceUrl(inst.name), text: 'URL base' }),
+      el('button', { class: 'small ghost', type: 'button', onclick: () => editInstance(inst), text: 'Editar' }),
+      el('button', { class: 'small ghost', type: 'button', onclick: () => rotateInstance(inst.name), text: 'Rotacionar senha' }),
       el('button', { class: 'ghost', type: 'button', onclick: () => openBackupModal(inst.name), text: 'Backup' }),
       el('button', { class: 'ghost', type: 'button', onclick: () => openAdoptModal(inst.name), text: 'Adicionar banco existente' }),
-      el('button', { class: 'primary', type: 'button', onclick: () => openProvisionModal(inst.name), text: '+ Provisionar banco nesta instância' }),
-    ]);
-
-    children.push(dbFilter, table, foot);
+      el('button', { class: 'primary', type: 'button', onclick: () => openProvisionModal(inst.name), text: 'Provisionar banco' }),
+      el('button', { class: 'small danger', type: 'button', onclick: () => removeInstance(inst.name), text: 'Remover' }),
+    ]));
   }
 
   return el('div', { class: 'card' + (expanded ? ' expanded' : '') }, children);
@@ -638,7 +715,7 @@ function dbRow(instanceName, db) {
     el('button', { class: 'link', type: 'button', onclick: () => testConnection(db), text: 'testar' }),
     el('button', { class: 'link', type: 'button', onclick: () => rotateConnection(db), text: 'rotacionar' }),
     el('button', { class: 'link', type: 'button', onclick: () => editName(db), text: 'renomear' }),
-    el('button', { class: 'link', type: 'button', onclick: () => deleteConnection(instanceName, db), text: 'excluir' }),
+    el('button', { class: 'link danger', type: 'button', onclick: () => deleteConnection(instanceName, db), text: 'excluir' }),
   ]);
   return el('tr', {}, [
     nameCell,
@@ -691,7 +768,7 @@ function openHealthCheckModal(title, controller, run) {
     <h2>Testar conexão — ${escapeHtml(title)}</h2>
     <div class="health-check" id="hc-status" data-state="checking">
       <span class="spinner" id="hc-spinner"></span>
-      <span id="hc-label">Verificando conexão...</span>
+      <span id="hc-label">Verificando conexão…</span>
     </div>
     <div id="hc-detail" class="hint"></div>
     <div class="form-actions">
@@ -1118,7 +1195,7 @@ async function openAdoptModal(instanceName) {
   `);
 
   const box = $('#ad-dbs');
-  box.innerHTML = '<p class="hint">Descobrindo bancos...</p>';
+  box.innerHTML = '<p class="hint">Descobrindo bancos…</p>';
   try {
     const instance = dashboard.instances.find((entry) => entry.name === instanceName);
     const known = new Set((instance ? instance.databases : []).map((db) => db.database_name));
@@ -1362,7 +1439,7 @@ function openBackupModal(preselectInstance = null) {
   }
 
   async function loadBackupTables(source, list) {
-    list.innerHTML = '<p class="hint">Carregando tabelas...</p>';
+    list.innerHTML = '<p class="hint">Carregando tabelas…</p>';
     try {
       const tables = await apiPost('/api/query/tables', { source });
       list.innerHTML = '';
@@ -1396,7 +1473,7 @@ function openBackupModal(preselectInstance = null) {
       return;
     }
     wrap.classList.remove('hidden');
-    box.innerHTML = '<p class="hint">Descobrindo bancos...</p>';
+    box.innerHTML = '<p class="hint">Descobrindo bancos…</p>';
     try {
       const dbs = await apiPost('/api/discover', { source });
       box.innerHTML = '';
@@ -1490,7 +1567,7 @@ $('#btn-restore').addEventListener('click', async () => {
   async function loadPreview() {
     const file = $('#rs-file').value;
     const detail = $('#rs-detail');
-    detail.innerHTML = '<p class="hint">Carregando preview...</p>';
+    detail.innerHTML = '<p class="hint">Carregando preview…</p>';
     try {
       const preview = await apiPost('/api/restore/preview', { file });
       if (preview.type === 'bundle') {
@@ -1557,6 +1634,8 @@ $('#btn-restore').addEventListener('click', async () => {
 // Backups view
 // ---------------------------------------------------------------------------
 
+$('#nav-instances').addEventListener('click', () => loadDashboard());
+$('#nav-query').addEventListener('click', () => openQueryView());
 $('#btn-backups').addEventListener('click', showBackups);
 $('#back-to-dashboard').addEventListener('click', () => loadDashboard());
 $('#btn-refresh-backups').addEventListener('click', showBackups);
@@ -1698,7 +1777,7 @@ async function loadQueryTables() {
   if (!queryState.source) {
     return;
   }
-  list.appendChild(el('p', { class: 'hint', text: 'Carregando tabelas...' }));
+  list.appendChild(el('p', { class: 'hint', text: 'Carregando tabelas…' }));
   try {
     const tables = await apiPost('/api/query/tables', { source: queryState.source });
     queryState.tables = tables;
@@ -1724,7 +1803,8 @@ function renderQueryTables() {
     const active = queryState.activeTable
       && queryState.activeTable.schema === t.schema
       && queryState.activeTable.name === t.name;
-    list.appendChild(el('div', {
+    list.appendChild(el('button', {
+      type: 'button',
       class: 'query-table-item' + (active ? ' active' : ''),
       onclick: () => selectQueryTable(t),
     }, [
@@ -1745,7 +1825,7 @@ function selectQueryTable(t) {
   switchQueryTab('data');
   renderQueryTables();
   $('#query-data-table').innerHTML = '';
-  $('#query-data-title').textContent = `${t.schema}.${t.name} — carregando...`;
+  $('#query-data-title').textContent = `${t.schema}.${t.name} — carregando…`;
   fetchTablePage(false);
 }
 
@@ -1804,6 +1884,8 @@ function switchQueryTab(tab) {
   $('#query-sql-pane').classList.toggle('hidden', isData);
   $('#tab-data').classList.toggle('active', isData);
   $('#tab-sql').classList.toggle('active', !isData);
+  $('#tab-data').setAttribute('aria-selected', isData ? 'true' : 'false');
+  $('#tab-sql').setAttribute('aria-selected', isData ? 'false' : 'true');
 }
 
 async function runQuerySql() {
@@ -1815,7 +1897,7 @@ async function runQuerySql() {
     return setStatus('Selecione uma conexão.');
   }
   const readOnly = $('#query-read-only').checked;
-  $('#query-sql-status').textContent = 'Executando...';
+  $('#query-sql-status').textContent = 'Executando…';
   try {
     const data = await apiPost('/api/query/run', {
       source: queryState.source,
@@ -1995,8 +2077,28 @@ $('#modal-overlay').addEventListener('click', (e) => {
 });
 
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && !$('#modal-overlay').classList.contains('hidden')) {
+  if ($('#modal-overlay').classList.contains('hidden')) {
+    return;
+  }
+  if (e.key === 'Escape') {
     closeModal();
+    return;
+  }
+  if (e.key !== 'Tab') {
+    return;
+  }
+  const nodes = modalFocusables();
+  if (!nodes.length) {
+    return;
+  }
+  const first = nodes[0];
+  const last = nodes[nodes.length - 1];
+  if (e.shiftKey && document.activeElement === first) {
+    e.preventDefault();
+    last.focus();
+  } else if (!e.shiftKey && document.activeElement === last) {
+    e.preventDefault();
+    first.focus();
   }
 });
 

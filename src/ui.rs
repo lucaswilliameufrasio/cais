@@ -2,10 +2,18 @@ use anyhow::Result;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
+
+const INK: Color = Color::Rgb(20, 24, 22);
+const PAPER: Color = Color::Rgb(231, 226, 214);
+const MUTED: Color = Color::Rgb(143, 153, 143);
+const BRASS: Color = Color::Rgb(196, 161, 90);
+const OXIDE: Color = Color::Rgb(212, 101, 79);
+const LINE: Color = Color::Rgb(44, 56, 50);
+const SURFACE: Color = Color::Rgb(28, 36, 32);
 
 use crate::app::{
     App, BackupPhase, HealthStatus, HomeItem, InputTarget, MigratePhase, RestorePhase, Screen,
@@ -13,7 +21,183 @@ use crate::app::{
 };
 use crate::models::{ConflictPolicy, PgToolBackend, SavedConnectionRecord};
 
+fn base_style() -> Style {
+    Style::default().fg(PAPER).bg(INK)
+}
+
+fn selected_style() -> Style {
+    Style::default()
+        .fg(INK)
+        .bg(BRASS)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn content_area(frame: &Frame<'_>) -> Rect {
+    chrome_rows(frame)[1]
+}
+
+fn chrome_rows(frame: &Frame<'_>) -> std::rc::Rc<[Rect]> {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(frame.area())
+}
+
+fn paint_chrome(frame: &mut Frame<'_>, app: &App) {
+    let rows = chrome_rows(frame);
+    let header = Line::from(vec![
+        Span::styled(
+            " cais",
+            Style::default()
+                .fg(BRASS)
+                .bg(SURFACE)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("   ", Style::default().bg(SURFACE)),
+        Span::styled(
+            screen_title(app.screen),
+            Style::default().fg(PAPER).bg(SURFACE),
+        ),
+    ]);
+    frame.render_widget(
+        Paragraph::new(header).style(Style::default().bg(SURFACE).fg(PAPER)),
+        rows[0],
+    );
+    frame.render_widget(
+        Paragraph::new(format!(" {}", screen_keys(app)))
+            .style(Style::default().fg(MUTED).bg(SURFACE)),
+        rows[2],
+    );
+    let status_style = if status_is_problem(&app.status) {
+        Style::default().fg(OXIDE).bg(INK)
+    } else {
+        Style::default().fg(PAPER).bg(INK)
+    };
+    let status = if app.status.is_empty() {
+        " Ready.".to_owned()
+    } else {
+        format!(" {}", app.status)
+    };
+    frame.render_widget(Paragraph::new(status).style(status_style), rows[3]);
+}
+
+fn status_is_problem(status: &str) -> bool {
+    let lower = status.to_lowercase();
+    lower.contains("fail")
+        || lower.contains("error")
+        || lower.contains("already")
+        || lower.contains("refused")
+        || lower.contains("invalid")
+        || lower.contains("not found")
+}
+
+fn screen_title(screen: Screen) -> &'static str {
+    match screen {
+        Screen::FirstRun => "First run",
+        Screen::Unlock => "Unlock",
+        Screen::Home => "Home",
+        Screen::ProvisionFull => "Provision",
+        Screen::MigrateDatabase => "Migrate",
+        Screen::BackupDatabase => "Backup",
+        Screen::RestoreDatabase => "Restore",
+        Screen::ViewSavedConnections => "Saved connections",
+        Screen::About => "About",
+        Screen::Settings => "Settings",
+        Screen::ChangePassword => "Master password",
+        Screen::ManageInstances => "Instances",
+        Screen::AddInstance => "Instance",
+        Screen::EditConnectionAppName => "Application name",
+        Screen::ManageBackups => "Backup files",
+        Screen::ActiveQueries => "Active queries",
+        Screen::ConnectionWizard => "Connection wizard",
+    }
+}
+
+fn screen_keys(app: &App) -> &'static str {
+    match app.screen {
+        Screen::FirstRun => "Enter saves the master password",
+        Screen::Unlock => "Enter unlocks this vault",
+        Screen::Home => "↑↓ move   Enter opens   q quits",
+        Screen::ProvisionFull => {
+            "Enter provisions   Tab changes field   F5 loads the saved URL   Esc back"
+        }
+        Screen::MigrateDatabase => match app.migrate_phase {
+            MigratePhase::SelectSource => "↑↓ move   Enter picks the source   Esc back",
+            MigratePhase::SelectDestInstance => "↑↓ move   Enter picks the destination   Esc back",
+            MigratePhase::EnterDestDbName => "Enter starts the migration   Esc back",
+            MigratePhase::Running => "Migration keeps running. You can leave this screen.",
+        },
+        Screen::BackupDatabase => match app.backup_phase {
+            BackupPhase::SelectSource => {
+                "↑↓ move   Enter continues with this connection   Esc back"
+            }
+            BackupPhase::SelectDatabases => {
+                "↑↓ move   Space toggles   a selects all   Enter continues   Esc back"
+            }
+            BackupPhase::ConfigureBackup => {
+                "g globals   p passwords   t tablespaces   Enter starts   Esc back"
+            }
+            BackupPhase::Running => "Backup keeps running. You can leave this screen.",
+        },
+        Screen::RestoreDatabase => match app.restore_phase {
+            RestorePhase::EnterFilePath => "Enter confirms the file   Esc back",
+            RestorePhase::SelectDestInstance => "↑↓ move   Enter picks the destination   Esc back",
+            RestorePhase::EnterDestDbName => "Enter starts the restore   Esc back",
+            RestorePhase::PreviewBundle => {
+                "c changes the conflict policy   Enter restores   Esc back"
+            }
+            RestorePhase::Running => "Restore keeps running. You can leave this screen.",
+        },
+        Screen::ViewSavedConnections => {
+            if app.confirming_delete {
+                "y deletes this connection   Esc leaves   any other key cancels"
+            } else if app.search_active {
+                "Type to filter   Enter stops filtering   Esc back"
+            } else {
+                "/ filter   Enter reveals   e renames   Delete removes   r checks health   Esc back"
+            }
+        }
+        Screen::About => "Esc back",
+        Screen::Settings => "Enter opens   Esc back",
+        Screen::ChangePassword => "Enter re-encrypts the vault   Tab changes field   Esc back",
+        Screen::ManageInstances => {
+            if app.confirming_delete_instance {
+                "y removes this instance   any other key cancels"
+            } else {
+                "a add   e edit   Enter picks it and returns   Delete removes   m queries   r health   Esc back"
+            }
+        }
+        Screen::AddInstance => "Enter saves   Tab changes field   Esc cancels",
+        Screen::EditConnectionAppName => "Enter saves   Esc cancels",
+        Screen::ManageBackups => {
+            if app.confirming_delete_backup {
+                "y deletes this file   any other key cancels"
+            } else {
+                "↑↓ move   Enter restores   Delete removes   r refreshes   Esc back"
+            }
+        }
+        Screen::ActiveQueries => {
+            if app.confirming_kill_query {
+                "y stops this query   any other key cancels"
+            } else if app.active_queries.is_empty() {
+                "Esc back"
+            } else {
+                "↑↓ move   r refreshes   k stops the query   Esc back"
+            }
+        }
+        Screen::ConnectionWizard => {
+            "Enter saves the instance   Tab/↑↓ change field   F5 tests the URL   Esc back"
+        }
+    }
+}
+
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
+    frame.render_widget(Block::default().style(base_style()), frame.area());
     match app.screen {
         Screen::FirstRun => draw_first_run(frame, app),
         Screen::Unlock => draw_unlock(frame, app),
@@ -33,11 +217,12 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
         Screen::ManageBackups => draw_manage_backups(frame, app)?,
         Screen::EditConnectionAppName => draw_edit_connection_app_name(frame, app),
     }
+    paint_chrome(frame, app);
     Ok(())
 }
 
 fn draw_first_run(frame: &mut Frame<'_>, app: &App) {
-    let area = centered_rect(frame.area(), 70, 45);
+    let area = centered_rect(content_area(frame), 70, 45);
     frame.render_widget(Clear, area);
     let block = Block::default()
         .title("First Run Setup")
@@ -88,7 +273,7 @@ fn draw_first_run(frame: &mut Frame<'_>, app: &App) {
 }
 
 fn draw_unlock(frame: &mut Frame<'_>, app: &App) {
-    let area = centered_rect(frame.area(), 60, 35);
+    let area = centered_rect(content_area(frame), 60, 35);
     frame.render_widget(Clear, area);
     let block = Block::default().title("Unlock").borders(Borders::ALL);
     frame.render_widget(block, area);
@@ -111,22 +296,60 @@ fn draw_unlock(frame: &mut Frame<'_>, app: &App) {
 }
 
 fn draw_home(frame: &mut Frame<'_>, app: &mut App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(10), Constraint::Length(6)])
-        .split(frame.area());
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
+        .split(content_area(frame));
 
     let items: Vec<ListItem<'_>> = HomeItem::ALL
         .iter()
-        .map(|item| ListItem::new(item.label()))
+        .map(|item| ListItem::new(format!("{:<8}{}", item.section(), item.label())))
         .collect();
     let list = List::new(items)
-        .block(Block::default().title("cais").borders(Borders::ALL))
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD))
-        .highlight_symbol(">> ");
+        .block(panel("Actions"))
+        .highlight_style(selected_style())
+        .highlight_symbol("");
 
-    frame.render_stateful_widget(list, chunks[0], &mut app.home_list_state);
-    draw_footer(frame, chunks[1], app, "Use arrows and Enter. q quits.");
+    frame.render_stateful_widget(list, columns[0], &mut app.home_list_state);
+
+    let selected = app
+        .home_list_state
+        .selected()
+        .and_then(|index| HomeItem::ALL.get(index).copied())
+        .unwrap_or(HomeItem::Instances);
+    let active = match &app.selected_instance {
+        Some(name) => format!("Active instance: {name}. Provision loads its base URL with F5."),
+        None => "No active instance. Open Instances and press Enter to pick one.".to_owned(),
+    };
+    let detail = vec![
+        Line::from(Span::styled(selected.section(), Style::default().fg(BRASS))),
+        Line::from(""),
+        Line::from(Span::styled(
+            selected.label(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(selected.hint()),
+        Line::from(""),
+        Line::from(active),
+    ];
+    frame.render_widget(
+        Paragraph::new(detail)
+            .block(panel("This action"))
+            .wrap(Wrap { trim: true }),
+        columns[1],
+    );
+}
+
+fn panel(title: &str) -> Block<'_> {
+    Block::default()
+        .title(Line::from(Span::styled(
+            format!(" {title} "),
+            Style::default().fg(BRASS),
+        )))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(LINE))
+        .style(base_style())
 }
 
 fn draw_provision_full(frame: &mut Frame<'_>, app: &App) {
@@ -140,9 +363,9 @@ fn draw_provision_full(frame: &mut Frame<'_>, app: &App) {
             Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Min(4),
-            Constraint::Length(5),
+            Constraint::Length(0),
         ])
-        .split(frame.area());
+        .split(content_area(frame));
 
     let instance_label = match &app.selected_instance {
         Some(name) => format!("Instance: {}  F5: load saved URI", name),
@@ -221,12 +444,14 @@ fn draw_migrate_database(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
         MigratePhase::SelectSource => {
             let layout = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(8), Constraint::Length(5)])
-                .split(frame.area());
+                .constraints([Constraint::Min(8), Constraint::Length(0)])
+                .split(content_area(frame));
 
             let records = app.migrate_sources()?;
             let items: Vec<ListItem<'_>> = if records.is_empty() {
-                vec![ListItem::new("No saved connections to migrate")]
+                vec![ListItem::new(
+                    "No saved connections to migrate. Provision a database first.",
+                )]
             } else {
                 records
                     .iter()
@@ -255,7 +480,7 @@ fn draw_migrate_database(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
                         .title("Select source connection")
                         .borders(Borders::ALL),
                 )
-                .highlight_style(Style::default().add_modifier(Modifier::BOLD))
+                .highlight_style(selected_style())
                 .highlight_symbol(">> ");
 
             frame.render_stateful_widget(list, layout[0], &mut app.migrate_source_list_state);
@@ -270,22 +495,23 @@ fn draw_migrate_database(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
         MigratePhase::SelectDestInstance => {
             let layout = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(8), Constraint::Length(5)])
-                .split(frame.area());
+                .constraints([Constraint::Min(8), Constraint::Length(0)])
+                .split(content_area(frame));
 
             let items: Vec<ListItem<'_>> = if app.instances.is_empty() {
-                vec![ListItem::new("No instances defined")]
+                vec![ListItem::new(
+                    "No instances yet. Register one from Instances first.",
+                )]
             } else {
                 app.instances
                     .iter()
                     .enumerate()
                     .map(|(i, name)| {
-                        let marker = if i == app.migrate_dest_idx {
-                            ">> "
-                        } else {
-                            "   "
-                        };
-                        ListItem::new(format!("{}{}", marker, name))
+                        let mut item = ListItem::new(name.clone());
+                        if i == app.migrate_dest_idx {
+                            item = item.style(selected_style());
+                        }
+                        item
                     })
                     .collect()
             };
@@ -296,7 +522,7 @@ fn draw_migrate_database(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
                         .title("Select destination instance")
                         .borders(Borders::ALL),
                 )
-                .highlight_style(Style::default().add_modifier(Modifier::BOLD))
+                .highlight_style(selected_style())
                 .highlight_symbol("");
 
             frame.render_widget(list, layout[0]);
@@ -314,10 +540,10 @@ fn draw_migrate_database(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
                 .constraints([
                     Constraint::Length(3),
                     Constraint::Length(3),
-                    Constraint::Length(3),
                     Constraint::Min(3),
+                    Constraint::Length(0),
                 ])
-                .split(frame.area());
+                .split(content_area(frame));
 
             let src_label = match &app.migrate_source_record {
                 Some(SavedConnectionRecord::Database(r)) => {
@@ -369,8 +595,8 @@ fn draw_migrate_database(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
         MigratePhase::Running => {
             let layout = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(3), Constraint::Length(5)])
-                .split(frame.area());
+                .constraints([Constraint::Min(3), Constraint::Length(0)])
+                .split(content_area(frame));
 
             render_log_panel(frame, layout[0], app, "Migration Progress");
 
@@ -389,12 +615,12 @@ fn draw_view_saved_connections(frame: &mut Frame<'_>, app: &mut App) -> Result<(
     let mut constraints = vec![Constraint::Length(3)];
     constraints.push(Constraint::Min(10));
     constraints.push(Constraint::Length(10));
-    constraints.push(Constraint::Length(5));
+    constraints.push(Constraint::Length(0));
 
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
-        .split(frame.area());
+        .split(content_area(frame));
 
     let all_records = app.saved_connections()?;
     let status_map = app.health_status.lock().unwrap();
@@ -433,7 +659,9 @@ fn draw_view_saved_connections(frame: &mut Frame<'_>, app: &mut App) -> Result<(
     }
 
     let items: Vec<ListItem<'_>> = if filtered_records.is_empty() {
-        vec![ListItem::new("No saved connections yet")]
+        vec![ListItem::new(
+            "No saved connections yet. Provision a database or add an instance.",
+        )]
     } else {
         filtered_records
             .iter()
@@ -485,7 +713,7 @@ fn draw_view_saved_connections(frame: &mut Frame<'_>, app: &mut App) -> Result<(
                 .title("Saved Connections")
                 .borders(Borders::ALL),
         )
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD))
+        .highlight_style(selected_style())
         .highlight_symbol(">> ");
 
     frame.render_stateful_widget(
@@ -559,13 +787,13 @@ fn draw_about(frame: &mut Frame<'_>, app: &App) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),
+            Constraint::Min(5),
             Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(3),
-            Constraint::Min(3),
+            Constraint::Length(0),
         ])
-        .split(frame.area());
+        .split(content_area(frame));
 
     let info = vec![
         Line::from(format!("Version: {}", env!("CARGO_PKG_VERSION"))),
@@ -639,36 +867,37 @@ fn draw_about(frame: &mut Frame<'_>, app: &App) {
 fn draw_manage_instances(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(8), Constraint::Length(7)])
-        .split(frame.area());
+        .constraints([Constraint::Min(8), Constraint::Length(0)])
+        .split(content_area(frame));
 
     let items: Vec<ListItem<'_>> = if app.instances.is_empty() {
-        vec![ListItem::new("No instances defined")]
+        vec![ListItem::new(
+            "No instances yet. Press a to register a base URL.",
+        )]
     } else {
         let status_map = app.health_status.lock().unwrap();
         app.instances
             .iter()
             .enumerate()
             .map(|(i, name)| {
-                let marker = if i == app.selected_instance_idx {
-                    ">> "
-                } else {
-                    "   "
-                };
                 let suffix = if app.selected_instance.as_deref() == Some(name) {
-                    " [selected]"
+                    "  active"
                 } else {
                     ""
                 };
                 let badge = match status_map.get(&format!("instance:{name}")) {
                     Some(HealthStatus::Ok { latency_ms, .. }) => {
-                        format!(" [OK {}ms]", latency_ms)
+                        format!("  OK {latency_ms}ms")
                     }
-                    Some(HealthStatus::Error(_)) => " [ERR]".to_owned(),
-                    Some(HealthStatus::Checking) => " [...]".to_owned(),
+                    Some(HealthStatus::Error(_)) => "  error".to_owned(),
+                    Some(HealthStatus::Checking) => "  checking".to_owned(),
                     None | Some(HealthStatus::Unknown) => String::new(),
                 };
-                ListItem::new(format!("{}{}{}{}", marker, name, suffix, badge))
+                let mut item = ListItem::new(format!("{name}{suffix}{badge}"));
+                if i == app.selected_instance_idx {
+                    item = item.style(selected_style());
+                }
+                item
             })
             .collect()
     };
@@ -679,7 +908,7 @@ fn draw_manage_instances(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
                 .title("Manage Instances")
                 .borders(Borders::ALL),
         )
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD))
+        .highlight_style(selected_style())
         .highlight_symbol("");
 
     frame.render_widget(list, layout[0]);
@@ -694,7 +923,7 @@ fn draw_manage_instances(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
 }
 
 fn draw_add_instance(frame: &mut Frame<'_>, app: &App) {
-    let area = centered_rect(frame.area(), 70, 35);
+    let area = centered_rect(content_area(frame), 70, 35);
     frame.render_widget(Clear, area);
     let title = if app.editing_instance.is_some() {
         "Edit Instance"
@@ -747,11 +976,11 @@ fn draw_settings(frame: &mut Frame<'_>, app: &mut App) {
         .collect();
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(8), Constraint::Length(5)])
-        .split(frame.area());
+        .constraints([Constraint::Min(8), Constraint::Length(0)])
+        .split(content_area(frame));
     let list = List::new(items)
         .block(Block::default().title("Settings").borders(Borders::ALL))
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD))
+        .highlight_style(selected_style())
         .highlight_symbol(">> ");
     frame.render_stateful_widget(list, layout[0], &mut app.settings_list_state);
     draw_footer(frame, layout[1], app, "Enter opens. Esc goes back.");
@@ -764,9 +993,9 @@ fn draw_change_password(frame: &mut Frame<'_>, app: &App) {
             Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(3),
-            Constraint::Min(5),
+            Constraint::Length(0),
         ])
-        .split(frame.area());
+        .split(content_area(frame));
 
     render_field(
         frame,
@@ -847,25 +1076,26 @@ fn set_cursor(frame: &mut Frame<'_>, area: Rect, field: &TextField, focused: boo
 }
 
 fn render_field(frame: &mut Frame<'_>, area: Rect, field: &TextField, focused: bool) {
-    let title = if focused {
-        format!("> {}", field.label)
+    let border = if focused {
+        Style::default().fg(BRASS)
     } else {
-        field.label.to_owned()
+        Style::default().fg(LINE)
     };
     frame.render_widget(
         Paragraph::new(field.display_value())
-            .block(Block::default().title(title).borders(Borders::ALL)),
+            .style(base_style())
+            .block(
+                Block::default()
+                    .title(field.label)
+                    .borders(Borders::ALL)
+                    .border_style(border),
+            ),
         area,
     );
 }
 
 fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App, help: &str) {
-    frame.render_widget(
-        Paragraph::new(vec![Line::from(help), Line::from(app.status.clone())])
-            .block(Block::default().title("Status").borders(Borders::ALL))
-            .wrap(Wrap { trim: true }),
-        area,
-    );
+    let _ = (frame, area, app, help);
 }
 
 fn draw_connection_wizard(frame: &mut Frame<'_>, app: &App) {
@@ -882,7 +1112,7 @@ fn draw_connection_wizard(frame: &mut Frame<'_>, app: &App) {
             Constraint::Length(3),
             Constraint::Min(3),
         ])
-        .split(frame.area());
+        .split(content_area(frame));
 
     frame.render_widget(
         Paragraph::new("Connection Wizard — fill in the fields to build a DATABASE_URL").block(
@@ -966,9 +1196,9 @@ fn draw_active_queries(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
             Constraint::Length(3),
             Constraint::Min(6),
             Constraint::Length(8),
-            Constraint::Length(5),
+            Constraint::Length(0),
         ])
-        .split(frame.area());
+        .split(content_area(frame));
 
     let header = format!(
         "Instance: {}  Queries: {}",
@@ -985,7 +1215,7 @@ fn draw_active_queries(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
     );
 
     let items: Vec<ListItem<'_>> = if app.active_queries.is_empty() {
-        vec![ListItem::new("No active queries")]
+        vec![ListItem::new("No active queries on this instance.")]
     } else {
         app.active_queries
             .iter()
@@ -1009,7 +1239,7 @@ fn draw_active_queries(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
                 .title("PID  | User     | Duration     | State     | Database")
                 .borders(Borders::ALL),
         )
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD))
+        .highlight_style(selected_style())
         .highlight_symbol(">> ");
 
     frame.render_stateful_widget(list, layout[1], &mut app.queries_list_state);
@@ -1057,11 +1287,13 @@ fn draw_active_queries(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
 fn draw_manage_backups(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(8), Constraint::Length(7)])
-        .split(frame.area());
+        .constraints([Constraint::Min(8), Constraint::Length(0)])
+        .split(content_area(frame));
 
     let items: Vec<ListItem<'_>> = if app.backups_list.is_empty() {
-        vec![ListItem::new("No backups found")]
+        vec![ListItem::new(
+            "No backup files yet. Run Backup database to create one.",
+        )]
     } else {
         app.backups_list
             .iter()
@@ -1084,7 +1316,7 @@ fn draw_manage_backups(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
                 .title("Manage Backups")
                 .borders(Borders::ALL),
         )
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD))
+        .highlight_style(selected_style())
         .highlight_symbol(">> ");
 
     frame.render_stateful_widget(list, layout[0], &mut app.backups_list_state);
@@ -1100,7 +1332,7 @@ fn draw_manage_backups(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
 }
 
 fn draw_edit_connection_app_name(frame: &mut Frame<'_>, app: &mut App) {
-    let area = centered_rect(frame.area(), 60, 25);
+    let area = centered_rect(content_area(frame), 60, 25);
     frame.render_widget(Clear, area);
     let block = Block::default()
         .title("Edit Application Name")
@@ -1128,13 +1360,15 @@ fn draw_backup_database(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
         BackupPhase::SelectSource => {
             let layout = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(8), Constraint::Length(5)])
-                .split(frame.area());
+                .constraints([Constraint::Min(8), Constraint::Length(0)])
+                .split(content_area(frame));
 
             app.sync_backup_source_selection()?;
             let records = app.backup_sources()?;
             let items: Vec<ListItem<'_>> = if records.is_empty() {
-                vec![ListItem::new("No saved connections to backup")]
+                vec![ListItem::new(
+                    "No saved connections to back up. Provision a database first.",
+                )]
             } else {
                 records
                     .iter()
@@ -1163,7 +1397,7 @@ fn draw_backup_database(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
                         .title("Select a connection to backup")
                         .borders(Borders::ALL),
                 )
-                .highlight_style(Style::default().add_modifier(Modifier::BOLD))
+                .highlight_style(selected_style())
                 .highlight_symbol(">> ");
 
             frame.render_stateful_widget(list, layout[0], &mut app.backup_source_list_state);
@@ -1178,8 +1412,8 @@ fn draw_backup_database(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
         BackupPhase::Running => {
             let layout = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(3), Constraint::Length(5)])
-                .split(frame.area());
+                .constraints([Constraint::Min(3), Constraint::Length(0)])
+                .split(content_area(frame));
 
             render_log_panel(frame, layout[0], app, "Backup Progress");
 
@@ -1193,8 +1427,8 @@ fn draw_backup_database(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
         BackupPhase::SelectDatabases => {
             let layout = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(8), Constraint::Length(5)])
-                .split(frame.area());
+                .constraints([Constraint::Min(8), Constraint::Length(0)])
+                .split(content_area(frame));
             let items: Vec<ListItem<'_>> = app
                 .backup_databases
                 .iter()
@@ -1217,7 +1451,7 @@ fn draw_backup_database(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
                         .title("Select databases for instance backup")
                         .borders(Borders::ALL),
                 )
-                .highlight_style(Style::default().add_modifier(Modifier::BOLD))
+                .highlight_style(selected_style())
                 .highlight_symbol(">> ");
             frame.render_stateful_widget(list, layout[0], &mut app.backup_database_list_state);
             draw_footer(
@@ -1230,8 +1464,8 @@ fn draw_backup_database(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
         BackupPhase::ConfigureBackup => {
             let layout = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(8), Constraint::Length(5)])
-                .split(frame.area());
+                .constraints([Constraint::Min(8), Constraint::Length(0)])
+                .split(content_area(frame));
             let selected_db_count = app.backup_selected_databases.iter().filter(|s| **s).count();
             let globals_label = if app.backup_config.include_globals {
                 "[x]"
@@ -1267,7 +1501,7 @@ fn draw_backup_database(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
                         .title("Instance backup summary")
                         .borders(Borders::ALL),
                 )
-                .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+                .highlight_style(selected_style());
             frame.render_widget(list, layout[0]);
             draw_footer(
                 frame,
@@ -1286,7 +1520,7 @@ fn draw_restore_database(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
             let layout = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(3), Constraint::Min(3)])
-                .split(frame.area());
+                .split(content_area(frame));
 
             render_field(
                 frame,
@@ -1307,22 +1541,23 @@ fn draw_restore_database(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
         RestorePhase::SelectDestInstance => {
             let layout = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(8), Constraint::Length(5)])
-                .split(frame.area());
+                .constraints([Constraint::Min(8), Constraint::Length(0)])
+                .split(content_area(frame));
 
             let items: Vec<ListItem<'_>> = if app.instances.is_empty() {
-                vec![ListItem::new("No instances defined")]
+                vec![ListItem::new(
+                    "No instances yet. Register one from Instances first.",
+                )]
             } else {
                 app.instances
                     .iter()
                     .enumerate()
                     .map(|(i, name)| {
-                        let marker = if i == app.restore_dest_idx {
-                            ">> "
-                        } else {
-                            "   "
-                        };
-                        ListItem::new(format!("{}{}", marker, name))
+                        let mut item = ListItem::new(name.clone());
+                        if i == app.restore_dest_idx {
+                            item = item.style(selected_style());
+                        }
+                        item
                     })
                     .collect()
             };
@@ -1333,7 +1568,7 @@ fn draw_restore_database(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
                         .title("Select destination instance")
                         .borders(Borders::ALL),
                 )
-                .highlight_style(Style::default().add_modifier(Modifier::BOLD))
+                .highlight_style(selected_style())
                 .highlight_symbol("");
 
             frame.render_widget(list, layout[0]);
@@ -1353,7 +1588,7 @@ fn draw_restore_database(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
                     Constraint::Length(3),
                     Constraint::Min(3),
                 ])
-                .split(frame.area());
+                .split(content_area(frame));
 
             let dest = app.restore_dest_instance.as_deref().unwrap_or("<none>");
             let info = Paragraph::new(vec![Line::from(format!("Destination instance: {dest}"))])
@@ -1377,7 +1612,7 @@ fn draw_restore_database(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
 
             draw_footer(
                 frame,
-                centered_rect(frame.area(), 80, 100),
+                centered_rect(content_area(frame), 80, 100),
                 app,
                 "Enter DB name and press Enter to start restore. Esc back.",
             );
@@ -1385,8 +1620,8 @@ fn draw_restore_database(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
         RestorePhase::PreviewBundle => {
             let layout = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(8), Constraint::Length(5)])
-                .split(frame.area());
+                .constraints([Constraint::Min(8), Constraint::Length(0)])
+                .split(content_area(frame));
 
             let conflict_label = match app.restore_conflict_policy {
                 ConflictPolicy::Fail => "Fail",
@@ -1439,8 +1674,8 @@ fn draw_restore_database(frame: &mut Frame<'_>, app: &mut App) -> Result<()> {
         RestorePhase::Running => {
             let layout = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(3), Constraint::Length(5)])
-                .split(frame.area());
+                .constraints([Constraint::Min(3), Constraint::Length(0)])
+                .split(content_area(frame));
 
             render_log_panel(frame, layout[0], app, "Restore Progress");
 
